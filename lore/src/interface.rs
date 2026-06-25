@@ -7209,3 +7209,61 @@ pub extern "C" fn lore_repository_config_get_async(
 ) {
     run_asynchronously(globals, args, callback, crate::repository::config_get);
 }
+
+pub type LoreRevisionTreeLoadArgs = crate::revision_tree::load::LoreRevisionTreeLoadArgs;
+
+/// Open a memory-based revision tree handle on the given
+/// `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
+/// empty tree suitable for committing an initial revision.
+///
+/// | Terminal event                       | Payload                                | Notes                                              |
+/// |--------------------------------------|----------------------------------------|----------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_load(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeLoadArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::revision_tree::load::load)
+}
+
+/// Open a memory-based revision tree handle (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_load_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeLoadArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::revision_tree::load::load);
+}
+
+pub type LoreRevisionTreeCloseArgs = crate::revision_tree::close::LoreRevisionTreeCloseArgs;
+
+/// Release a memory-based revision tree handle.
+///
+/// Subsequent calls against the same handle return `InvalidArguments`. The
+/// call blocks until every in-flight op on the handle has paired its
+/// decrement.
+///
+/// | Terminal event                              | Payload                                       | Notes                                              |
+/// |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE`   | `lore_revision_tree_close_complete_event_data_t` | Emitted on success carrying the caller id       |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_close(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCloseArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::revision_tree::close::close)
+}
+
+/// Release a memory-based revision tree handle (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_close_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCloseArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::revision_tree::close::close);
+}

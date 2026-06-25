@@ -4981,16 +4981,6 @@ typedef struct lore_repository_config_get_args_t {
   struct lore_string_t key;
 } lore_repository_config_get_args_t;
 
-// Opaque handle to an open memory-based revision tree instance.
-//
-// Treat this as an opaque value; never cast it directly to or from raw
-// pointers.
-typedef struct lore_revision_tree_t {
-  // Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
-  uint64_t handle_id;
-} lore_revision_tree_t;
-#define LORE_REVISION_TREE_INVALID (lore_revision_tree_t){ .handle_id = 0 }
-
 // Arguments for `lore_revision_tree_load`.
 typedef struct lore_revision_tree_load_args_t {
   // Open storage handle the revision tree is loaded against
@@ -5000,6 +4990,16 @@ typedef struct lore_revision_tree_load_args_t {
   // Revision to open; `0` opens an empty tree for an initial commit
   struct lore_hash_t revision_hash;
 } lore_revision_tree_load_args_t;
+
+// Opaque handle to an open memory-based revision tree instance.
+//
+// Treat this as an opaque value; never cast it directly to or from raw
+// pointers.
+typedef struct lore_revision_tree_t {
+  // Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
+  uint64_t handle_id;
+} lore_revision_tree_t;
+#define LORE_REVISION_TREE_INVALID (lore_revision_tree_t){ .handle_id = 0 }
 
 // Arguments for `lore_revision_tree_close`.
 typedef struct lore_revision_tree_close_args_t {
@@ -10647,3 +10647,37 @@ int32_t lore_repository_config_get(const struct lore_global_args_t *globals,
 void lore_repository_config_get_async(const struct lore_global_args_t *globals,
                                       const struct lore_repository_config_get_args_t *args,
                                       struct lore_event_callback_config_t callback);
+
+// Open a memory-based revision tree handle on the given
+// `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
+// empty tree suitable for committing an initial revision.
+//
+// | Terminal event                       | Payload                                | Notes                                              |
+// |--------------------------------------|----------------------------------------|----------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
+int32_t lore_revision_tree_load(const struct lore_global_args_t *globals,
+                                const struct lore_revision_tree_load_args_t *args,
+                                struct lore_event_callback_config_t callback);
+
+// Open a memory-based revision tree handle (async variant).
+void lore_revision_tree_load_async(const struct lore_global_args_t *globals,
+                                   const struct lore_revision_tree_load_args_t *args,
+                                   struct lore_event_callback_config_t callback);
+
+// Release a memory-based revision tree handle.
+//
+// Subsequent calls against the same handle return `InvalidArguments`. The
+// call blocks until every in-flight op on the handle has paired its
+// decrement.
+//
+// | Terminal event                              | Payload                                       | Notes                                              |
+// |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE`   | `lore_revision_tree_close_complete_event_data_t` | Emitted on success carrying the caller id       |
+int32_t lore_revision_tree_close(const struct lore_global_args_t *globals,
+                                 const struct lore_revision_tree_close_args_t *args,
+                                 struct lore_event_callback_config_t callback);
+
+// Release a memory-based revision tree handle (async variant).
+void lore_revision_tree_close_async(const struct lore_global_args_t *globals,
+                                    const struct lore_revision_tree_close_args_t *args,
+                                    struct lore_event_callback_config_t callback);

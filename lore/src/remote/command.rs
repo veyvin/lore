@@ -143,4 +143,6 @@ pub enum LoreCommand {
         crate::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs,
     ),
     StorageMutableList(crate::storage::mutable_list::LoreStorageMutableListArgs),
+    RevisionTreeLoad(crate::revision_tree::load::LoreRevisionTreeLoadArgs),
+    RevisionTreeClose(crate::revision_tree::close::LoreRevisionTreeCloseArgs),
 }
