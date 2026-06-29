@@ -1,6 +1,101 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <a id="readme-top"></a>
 
+## Docker 部署指南
+
+### 使用预构建镜像
+
+Lore 提供了预构建的 Docker 镜像，托管在 GitHub Container Registry (ghcr.io)。
+
+**拉取镜像：**
+
+```bash
+docker pull ghcr.io/veyvin/lore:latest
+```
+
+**运行容器：**
+
+```bash
+docker run -d \
+  --name lore-server \
+  -p 41337:41337 \
+  -p 41339:41339 \
+  -v lore-data:/data \
+  --restart unless-stopped \
+  ghcr.io/veyvin/lore:latest
+```
+
+**端口说明：**
+- `41337`: QUIC + gRPC 端口
+- `41339`: HTTP 端口
+
+**数据持久化：**
+容器内的 `/data` 目录用于存储 Lore 数据，建议通过数据卷进行持久化。
+
+**访问服务：**
+容器启动后，可通过以下地址访问：
+- HTTP API: `http://localhost:41339`
+
+### 编译 Docker 镜像
+
+如果需要自行编译 Docker 镜像，可使用以下命令：
+
+```bash
+# 克隆仓库
+git clone https://github.com/EpicGames/lore.git
+cd lore
+
+# 编译镜像
+docker build -f lore-server/Dockerfile -t lore-server:latest .
+
+# 运行自定义镜像
+docker run -d \
+  --name lore-server \
+  -p 41337:41337 \
+  -p 41339:41339 \
+  -v lore-data:/data \
+  --restart unless-stopped \
+  lore-server:latest
+```
+
+### 在绿联 NAS 上部署
+
+绿联 NAS 支持 Docker 功能，可通过以下方式部署：
+
+1. **启用 Docker 和 SSH**
+   - 进入「应用中心」安装 Docker 应用
+   - 在「控制面板」→「终端机」启用 SSH
+
+2. **SSH 连接到 NAS**
+   ```bash
+   ssh admin@你的NAS_IP地址
+   ```
+
+3. **拉取并运行镜像**
+   ```bash
+   docker pull ghcr.io/veyvin/lore:latest
+   mkdir -p /docker/lore-data
+   docker run -d \
+     --name lore-server \
+     -p 41337:41337 \
+     -p 41339:41339 \
+     -v /docker/lore-data:/data \
+     --restart unless-stopped \
+     ghcr.io/veyvin/lore:latest
+   ```
+
+4. **验证运行状态**
+   ```bash
+   docker ps
+   docker logs lore-server
+   ```
+
+**注意事项：**
+- 确保 41337 和 41339 端口未被占用
+- 如遇权限问题，执行 `chmod -R 777 /docker/lore-data`
+
+---
+
 <div align="center">
 
 <picture>
