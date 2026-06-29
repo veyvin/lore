@@ -49,10 +49,11 @@ services:
     container_name: lore-server
     restart: unless-stopped
     ports:
-      - "41337:41337"  # QUIC + gRPC
+      - "41337:41337/tcp"   # gRPC
+      - "41337:41337/udp"   # QUIC（push/clone 必需）
       - "41339:41339"  # HTTP
     volumes:
-      - lore-data:/data
+      - ./lore-data:/data
     environment:
       - RUST_LOG=info
 
