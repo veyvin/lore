@@ -36,6 +36,44 @@ docker run -d \
 容器启动后，可通过以下地址访问：
 - HTTP API: `http://localhost:41339`
 
+### 使用 Docker Compose
+
+创建 `docker-compose.yml` 文件：
+
+```yaml
+version: '3.8'
+
+services:
+  lore-server:
+    image: ghcr.io/veyvin/lore:latest
+    container_name: lore-server
+    restart: unless-stopped
+    ports:
+      - "41337:41337"  # QUIC + gRPC
+      - "41339:41339"  # HTTP
+    volumes:
+      - lore-data:/data
+    environment:
+      - RUST_LOG=info
+
+volumes:
+  lore-data:
+    driver: local
+```
+
+**启动服务：**
+
+```bash
+# 启动容器
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f lore-server
+
+# 停止服务
+docker-compose down
+```
+
 ### 编译 Docker 镜像
 
 如果需要自行编译 Docker 镜像，可使用以下命令：
