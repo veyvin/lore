@@ -29,11 +29,13 @@ use crate::lore_info;
 use crate::metadata;
 use crate::repository;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
 use crate::store;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::query_one;
 
 // Backward compatibility aliases
 #[error_set]
@@ -105,16 +107,9 @@ async fn migrate_initial_to_typed(
     // repository and branch metadata upgrade path.
     lore_info!("Upgrading mutable store from initial to typed items");
 
-    let mut old_store = MutableStore {
-        path: Some(Arc::new(path.to_path_buf())),
-        lock: None,
-        group: Vec::with_capacity(GROUP_COUNT),
-        flush_delay_seconds: 0,
-        needs_upgrade: AtomicBool::new(false),
-    };
-
+    let mut groups = Vec::with_capacity(GROUP_COUNT);
     for _ in 0..GROUP_COUNT {
-        old_store.group.push(Arc::new(MutableStoreGroup {
+        groups.push(Arc::new(MutableStoreGroup {
             bucket: [const { OnceLock::new() }; BUCKET_COUNT],
             dirty: std::array::from_fn(|_| AtomicBool::new(false)),
             bucket_count: std::sync::atomic::AtomicUsize::new(
@@ -127,10 +122,16 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            pending_level: std::sync::atomic::AtomicUsize::new(0),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            layout: tokio::sync::RwLock::new(()),
+            writes: Arc::default(),
+            flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            scheduled: AtomicBool::new(false),
         }));
     }
 
-    let old_store = Arc::new(old_store);
+    let old_store = Arc::new(MutableStore::for_migration(path.to_path_buf(), groups));
 
     // Deserialize all old data, since migrations will require to look up dependent data
     let mut tasks = JoinSet::new();
@@ -142,7 +143,7 @@ async fn migrate_initial_to_typed(
                 let bucket = group.bucket(bucket_index).clone();
                 let mut bucket = bucket.write().await;
                 bucket
-                    .deserialize(&path, group_index, bucket_index, false)
+                    .deserialize(&path, group_index, bucket_index, false, true)
                     .await
                     .map_err(|e| {
                         MutableStoreError::internal_with_context(e, "deserialize failed")
@@ -173,6 +174,12 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            pending_level: std::sync::atomic::AtomicUsize::new(0),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            layout: tokio::sync::RwLock::new(()),
+            writes: Arc::default(),
+            flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            scheduled: AtomicBool::new(false),
         }));
     }
 
@@ -267,15 +274,12 @@ async fn migrate_bucket_initial_to_typed(
             context: Context::default(),
         };
 
-        let is_local_immutable = if let Ok(result) = immutable_store
-            .clone()
-            .query(entry.partition, address, StoreMatch::MatchFull)
-            .await
-        {
-            result.match_made != StoreMatch::MatchNone
-        } else {
-            false
-        };
+        let is_local_immutable =
+            if let Ok(result) = query_one(&immutable_store, entry.partition, address).await {
+                result.match_made != StoreMatch::MatchNone
+            } else {
+                false
+            };
 
         if is_local_immutable {
             migrate_immutable_value_to_typed(
@@ -407,16 +411,16 @@ async fn migrate_immutable_value_to_typed(
     mutable_store: Arc<MutableStore>,
     remote: &Arc<Connection>,
 ) -> Result<(), MutableStoreError> {
-    let repository = Arc::new(RepositoryContext::new(
-        None,
-        immutable_store.clone(),
-        mutable_store as Arc<dyn store::MutableStore>,
-        entry.partition,
-        crate::instance::InstanceId::default(),
-        Ok(remote.clone()),
-        Arc::default(),
-        crate::repository::RepositoryFormat::Lore,
-    ));
+    let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        paths: None,
+        immutable_store: immutable_store.clone(),
+        mutable_store: mutable_store as Arc<dyn store::MutableStore>,
+        id: entry.partition,
+        instance_id: crate::instance::InstanceId::default(),
+        remote: Ok(remote.clone()),
+        filter: Arc::default(),
+        filesystem_provider: None,
+    }));
     let hash = entry.value;
 
     if let Ok(metadata) = metadata::Metadata::deserialize(repository.clone(), hash).await {

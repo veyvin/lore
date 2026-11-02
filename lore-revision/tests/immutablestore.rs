@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_revision::lore::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::*;
 
 #[cfg(test)]
@@ -54,42 +55,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_missing_payload() {
-        let execution = setup_test_execution();
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let store = LocalImmutableStore::new(
-                    None,
-                    lore_storage::local::immutable_store::ImmutableStoreSettings {
-                        allow_partial_fragment: false,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("Failed to create store");
-
-                let repository = RepositoryId::from([0; 16]);
-                let address = Address {
-                    context: repository.into(),
-                    hash: Hash::default(),
-                };
-                let fragment = Fragment {
-                    flags: 0,
-                    size_payload: 100,
-                    size_content: 1000,
-                };
-                let entry = store
-                    .store(repository, address, fragment, None, false)
-                    .await;
-                assert!(
-                    entry.is_err(),
-                    "Store in empty store with no payload did not fail with expected error"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test]
     async fn store_single_item() {
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -134,7 +99,7 @@ mod tests {
                     .await
                     .expect("Failed to store entry");
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                     .await
                     .expect("Failed query after store");
                 assert_eq!(
@@ -153,7 +118,6 @@ mod tests {
             .scope(execution, async move {
                 let mut rng = rand::rng();
                 let store = LocalImmutableStore::new(None, lore_storage::local::immutable_store::ImmutableStoreSettings{
-                        allow_partial_fragment: false,
                         protect_local_fragment: false,
                         ..Default::default()
                     })
@@ -161,6 +125,8 @@ mod tests {
                     .expect("Failed to create store");
 
                 let repository = random::<RepositoryId>();
+                // Every entry holds a payload the store has, and the store says so.
+                let local = FragmentFlags::PayloadStoredLocal.bits();
 
                 // Stress test, put 10000 items in the same bucket
                 for i in 0..10000 {
@@ -198,7 +164,7 @@ mod tests {
                         .expect("Failed to store entry");
 
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -215,7 +181,7 @@ mod tests {
                         "Store unique did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store unique did not return same fragment details"
                     );
 
@@ -231,7 +197,7 @@ mod tests {
                         .await
                         .expect("Failed to store entry");
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after second store");
                     assert_eq!(
@@ -248,7 +214,7 @@ mod tests {
                         "Store repeated did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store repeated did not return same fragment details"
                     );
 
@@ -284,7 +250,7 @@ mod tests {
                         size_content: (1000 + i) as u64,
                     };
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -301,7 +267,7 @@ mod tests {
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
 
@@ -325,19 +291,18 @@ mod tests {
                     let result = store.clone()
                         .store(other_repository, address, fragment, None, false)
                         .await;
-                    assert!(result.is_err());
                     assert!(
-                    result.is_err(),
-                    "Repeated store with different repository and no payload did not give expected payload needed error");
+                    result.is_ok(),
+                    "Repeated store with different repository and no payload should succeed");
 
                     let entry = store
-                        .find(other_repository, address, StoreMatch::MatchFull)
+                        .find(other_repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchHash,
-                    "Repeated store with different repository and payload did not match hash only as expected");
+                    StoreMatch::MatchFull,
+                    "Repeated store with different repository and payload did not MatchFull as expected");
                     assert_eq!(
                         entry.data.size_payload, fragment.size_payload,
                         "Repository deduplication did not return identical fragment details as expected"
@@ -347,7 +312,7 @@ mod tests {
                         "Repository deduplication did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication did not return identical fragment details as expected"
                     );
 
@@ -371,7 +336,7 @@ mod tests {
                     };
 
                     let entry = store
-                        .find(other_repository, address, StoreMatch::MatchFull)
+                        .find(other_repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -387,7 +352,7 @@ mod tests {
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
 
@@ -478,13 +443,18 @@ mod tests {
                         .expect("Failed to store entry");
                 }
 
-                // Try various query combinations
+                // The level is the one found, so what varies is which partition and context the
+                // address is asked about rather than which level is requested.
                 let address = Address {
                     context: context[0],
                     hash: rand::random::<Hash>(),
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -498,7 +468,11 @@ mod tests {
                     hash: hash[8],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -517,13 +491,17 @@ mod tests {
                     hash: hash[0],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchHash)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
+                    StoreMatch::MatchFull,
+                    "the storing partition and context is a full match"
                 );
 
                 let address = Address {
@@ -531,13 +509,17 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchPartition)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchPartition,
-                    "Query did not match expected hash"
+                    StoreMatch::MatchFull,
+                    "the storing partition and context is a full match"
                 );
 
                 let address = Address {
@@ -545,7 +527,11 @@ mod tests {
                     hash: hash[7],
                 };
                 let entry = store
-                    .find(repository_other, address, StoreMatch::MatchFull)
+                    .find(
+                        repository_other,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -559,41 +545,31 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchHash)
-                    .await
-                    .expect("Failed to query store entry");
-                assert_eq!(
-                    entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
-                );
-
-                let address = Address {
-                    context: context[0],
-                    hash: hash[1],
-                };
-                let entry = store
-                    .find(repository_other, address, StoreMatch::MatchPartition)
-                    .await
-                    .expect("Failed to query store entry");
-                assert_eq!(
-                    entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
-                );
-
-                let address = Address {
-                    context: context[0],
-                    hash: hash[1],
-                };
-                let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
                     StoreMatch::MatchPartition,
-                    "Query did not match expected hash"
+                    "a sibling context in the storing partition is a partition match"
+                );
+
+                let entry = store
+                    .find(
+                        repository_other,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
+                    .await
+                    .expect("Failed to query store entry");
+                assert_eq!(
+                    entry.matching,
+                    StoreMatch::MatchHash,
+                    "the same hash from another partition is a hash match"
                 );
             })
             .await;
@@ -660,12 +636,16 @@ mod tests {
                         hash: hash[i],
                     };
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -686,12 +666,16 @@ mod tests {
                     };
                     let repository = random::<RepositoryId>();
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchHash)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -707,7 +691,11 @@ mod tests {
 
                     // Should fail, repository don't match
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchPartition)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
                     assert_eq!(
@@ -724,7 +712,6 @@ mod tests {
     async fn store_serialize_deserialize() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -797,7 +784,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -805,10 +796,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,
@@ -823,8 +816,6 @@ mod tests {
                         );
                     }
                 }
-
-                let _ = std::fs::remove_dir_all(dir.as_path());
             })
             .await;
     }
@@ -833,7 +824,6 @@ mod tests {
     async fn store_and_update() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -900,7 +890,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -946,7 +940,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -954,10 +952,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,
@@ -972,8 +972,6 @@ mod tests {
                         );
                     }
                 }
-
-                let _ = std::fs::remove_dir_all(dir.as_path());
             })
             .await;
     }
@@ -986,7 +984,6 @@ mod tests {
                 let store = LocalImmutableStore::new(
                     None,
                     lore_storage::local::immutable_store::ImmutableStoreSettings {
-                        allow_partial_fragment: true,
                         ..Default::default()
                     },
                 )
@@ -1047,26 +1044,20 @@ mod tests {
                     .expect("Failed to store full fragment");
 
                 // Lookup using the previous address with full match and ensure we got the full thing
-                let (_fragment_found, payload_found) = ImmutableStoreTrait::get(
-                    store.clone(),
-                    repository,
-                    address,
-                    StoreMatch::MatchFull,
-                )
-                .await
-                .expect("Failed to get back first fragment on full match");
+                let (_fragment_found, payload_found) =
+                    ImmutableStoreTrait::get(store.clone(), repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("Failed to get back first fragment on full match");
 
                 assert_eq!(payload_found.as_bytes(), payload.as_bytes());
 
                 // Lookup using the previous address with hash match and ensure we got the full thing
-                let (_fragment_found, payload_found) = ImmutableStoreTrait::get(
-                    store.clone(),
-                    repository,
-                    address,
-                    StoreMatch::MatchHash,
-                )
-                .await
-                .expect("Failed to get back first fragment on hash match");
+                let (_fragment_found, payload_found) =
+                    ImmutableStoreTrait::get(store.clone(), repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("Failed to get back first fragment on hash match");
 
                 assert_eq!(payload_found.as_bytes(), payload.as_bytes());
             })
@@ -1113,15 +1104,25 @@ mod tests {
                 // legacy cross-partition behavior).
                 store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await
                     .expect("Failed to copy fragment from repo A to repo B");
 
                 // Fragment must be retrievable from repo B
                 let (retrieved_fragment, retrieved_payload) = store
                     .clone()
-                    .get(repo_b, address, StoreMatch::MatchFull)
+                    .get(repo_b, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get fragment from repo B after copy");
 
                 assert_eq!(
@@ -1137,8 +1138,9 @@ mod tests {
                 // Source in repo A must still be retrievable
                 let (_, src_payload) = store
                     .clone()
-                    .get(repo_a, address, StoreMatch::MatchFull)
+                    .get(repo_a, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Fragment in repo A should still be accessible after copy");
                 assert_eq!(
                     src_payload.as_ref(),
@@ -1149,7 +1151,16 @@ mod tests {
                 // Second copy call must be idempotent (Ok)
                 store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await
                     .expect("Second copy call should return Ok(()) (idempotent)");
             })
@@ -1179,7 +1190,16 @@ mod tests {
 
                 let result = store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await;
                 assert!(
                     result.as_ref().is_err_and(|e| e.is_address_not_found()),
@@ -1231,7 +1251,7 @@ mod tests {
                 // Copy using repo_b as source should fail — fragment is not in repo_b.
                 let result = store
                     .clone()
-                    .copy(repo_b, address, repo_c, address.context, false)
+                    .copy(repo_b, address, repo_c, address.context, CopyBehavior { durable: false, do_not_replicate: false })
                     .await;
                 assert!(
                     result.as_ref().is_err_and(|e| e.is_address_not_found()),
@@ -1430,7 +1450,7 @@ mod tests {
                     payload,
                     false,
                     None,
-                    None,
+                    lore_storage::WriteContext::none(),
                     None,
                 )
                 .await;
@@ -1476,7 +1496,7 @@ mod tests {
                     payload,
                     false,
                     None,
-                    None,
+                    lore_storage::WriteContext::none(),
                     None,
                 )
                 .await;

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
@@ -10,19 +11,33 @@ use tokio::task::JoinSet;
 use crate::change;
 use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
+use crate::errors::SlowDown;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::lore_debug;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::state;
-use crate::state::ChangeSink;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum DiffError {
     InvalidArguments,
+    SlowDown,
 }
+
+/// How many changes one path's walk may run ahead of the task forwarding them on.
+///
+/// Shallower than a walk read directly would take, on two counts: there is one of these per
+/// requested path, and every change one holds is held a second time in the shared channel it is
+/// forwarded to. What depth is for is keeping a walk's parallelism busy, and a walk that is
+/// already running behind a second channel has that.
+const PATH_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(256).expect("a nonzero literal");
 
 /// Calculate the difference between two revisions, as the set of changes
 /// that describe going from revision 'source' to revision 'target',
@@ -31,7 +46,8 @@ pub enum DiffError {
 /// interleave their items on the channel.
 ///
 /// Each per-path task streams its `state::diff` output directly into the
-/// shared sender — there is no per-path-task buffering. Items arrive in
+/// shared sender, buffering no more than `PATH_LOOKAHEAD`, so a slow
+/// consumer holds its walk back rather than being outrun by it. Items arrive in
 /// `state::diff`'s natural walk order (sorted by name-hash within each
 /// subtree pair) and per-path blocks may interleave by completion order.
 /// Callers that need a globally-sorted `Vec` drain via `collect_stream`
@@ -58,48 +74,45 @@ pub async fn diff_revision_paths(
         let task_tx = tx.clone();
 
         lore_spawn!(tasks, async move {
-            // Stream straight from `state::diff`'s walker through a thin
-            // per-task adapter into the shared sender — no per-path
-            // buffering. `state::diff` emits `Result<NodeChange, StateError>`
-            // on its inner channel; the adapter loop converts each item to
-            // `Result<NodeChange, DiffError>` and forwards to the shared
-            // `task_tx`. The inner channel is bounded so the engine
-            // backpressures on a slow downstream consumer the same way
-            // the outer channel does.
-            let (state_tx, mut state_rx) =
-                mpsc::channel::<Result<NodeChange, crate::state::StateError>>(256);
             let walker_repo = repository.clone();
-            let walker = lore_spawn!(async move {
-                let mut sink = ChangeSink::Channel(&state_tx);
-                state::diff(
-                    walker_repo.clone(),
-                    state_source,
-                    walker_repo,
-                    state_target,
-                    path,
-                    &mut sink,
-                    FilterMode::View,
-                )
-                .await
-            });
-            while let Some(item) = state_rx.recv().await {
-                let item = item.internal("calculating revision diff")?;
-                task_tx
-                    .send(Ok(item))
+            let mut walk =
+                state::ChangeStream::spawn_with_lookahead(PATH_LOOKAHEAD, async move |changes| {
+                    state::diff(
+                        walker_repo.clone(),
+                        state_source,
+                        walker_repo,
+                        state_target,
+                        path,
+                        None,
+                        &changes,
+                        FilterMode::View,
+                    )
                     .await
-                    .internal("revision diff receiver dropped")?;
+                });
+            loop {
+                let Some(change) = walk.next().await else {
+                    break;
+                };
+                let permit = match task_tx
+                    .reserve()
+                    .await
+                    .internal("revision diff receiver dropped")
+                {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        // Abandoned rather than dropped, so the walk is joined on every path:
+                        // closing its channel stops it at its next emit, and this task reports
+                        // once it has. The walk's complaint that its receiver went away is this
+                        // task's own doing, so the failure that caused it is the one reported.
+                        walk.abandon().await;
+                        return Err(DiffError::from(err));
+                    }
+                };
+                permit.send(Ok(change));
             }
-            // Surface any error from the walker task itself.
-            match walker.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => Err(err).internal("calculating revision diff")?,
-                Err(join_err) => {
-                    return Err(DiffError::internal_with_context(
-                        join_err,
-                        "revision diff walker task failed",
-                    ));
-                }
-            }
+            walk.finish()
+                .await
+                .forward_any::<DiffError>("calculating revision diff")?;
             Ok(())
         });
     }
@@ -136,6 +149,22 @@ pub async fn diff_filesystem_paths(
     state_current: Arc<State>,
     paths: Option<Vec<RelativePath>>,
 ) -> Result<Vec<NodeChange>, DiffError> {
+    let filesystem = repository.file_system();
+    with_operation(filesystem, async |operation| {
+        diff_filesystem_paths_in(operation, repository, state_from, state_current, paths).await
+    })
+    .await
+}
+
+/// The changes every path in `paths` shows against the filesystem, walked concurrently
+/// through one operation.
+async fn diff_filesystem_paths_in(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_current: Arc<State>,
+    paths: Option<Vec<RelativePath>>,
+) -> Result<Vec<NodeChange>, DiffError> {
     let mut tasks: JoinSet<Result<Vec<NodeChange>, DiffError>> = JoinSet::new();
     let paths = paths.unwrap_or_else(|| vec![RelativePath::new()]);
     for path in paths.iter() {
@@ -143,6 +172,7 @@ pub async fn diff_filesystem_paths(
         let state_from = state_from.clone();
         let state_current = state_current.clone();
         let path = path.clone();
+        let operation = operation.clone();
         let exists = if !path.is_empty() {
             let mut exists_in_state = false;
             let mut exists_in_filesystem = false;
@@ -154,8 +184,11 @@ pub async fn diff_filesystem_paths(
             if node_link.is_valid() {
                 exists_in_state = true;
             } else {
-                let absolute_path = path.to_absolute_path(repository.require_path()?);
-                exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
+                let repository_path = path.clone();
+                exists_in_filesystem = operation
+                    .file_info(&repository_path)
+                    .await
+                    .is_ok_and(|info| info.exists());
             }
 
             if !exists_in_state && !exists_in_filesystem {
@@ -180,17 +213,26 @@ pub async fn diff_filesystem_paths(
                         lore_debug!("Calculating deltas against filesystem for full repository");
                     }
 
-                    let (mut changes, _) = state::diff_filesystem(
-                        repository.clone(),
-                        state_from,
-                        repository.clone(),
-                        state_current,
+                    let mut changes = state::diff_filesystem(
+                        &operation,
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_from,
+                        },
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_current,
+                        },
                         if !path.is_empty() { Some(path) } else { None },
                         FilterMode::Full,
+                        FilesystemDiffIntent::Report,
                         std::sync::Arc::new(Vec::new()),
                     )
                     .await
-                    .internal("calculating filesystem diff")?;
+                    .forward_any::<DiffError>("calculating filesystem diff")?
+                    .collect()
+                    .await
+                    .forward_any::<DiffError>("calculating filesystem diff")?;
 
                     lore_debug!("Found {} file system changes", changes.len());
 

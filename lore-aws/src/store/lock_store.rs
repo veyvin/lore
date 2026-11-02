@@ -420,7 +420,7 @@ impl LockStore for DynamoDbLockStore {
         loop {
             let result = self
                 .dynamodb
-                .transact_write_items(write_items.values().cloned().collect())
+                .transact_write_items(&self.table_name, write_items.values().cloned().collect())
                 .await;
 
             // If the transaction failed because of locks already exist
@@ -622,7 +622,11 @@ impl LockStore for DynamoDbLockStore {
             write_items.push(TransactWriteItem::builder().delete(delete_item).build());
         }
 
-        match self.dynamodb.transact_write_items(write_items).await {
+        match self
+            .dynamodb
+            .transact_write_items(&self.table_name, write_items)
+            .await
+        {
             Ok(_) => Ok(resources),
             Err(AwsError::AwsSdkError(error)) => {
                 let span = info_span!(
@@ -757,7 +761,7 @@ mod test {
 
         dynamodb_mock
             .expect_transact_write_items()
-            .withf(move |items: &Vec<TransactWriteItem>| {
+            .withf(move |_: &Arc<str>, items: &Vec<TransactWriteItem>| {
                 if items.len() != 1 {
                     println!("Wrong item count: {}", items.len());
                     return false;
@@ -780,7 +784,7 @@ mod test {
 
                 put_item.table_name == TABLE_NAME && item_hash.as_ref() == hash_clone.as_bytes()
             })
-            .return_once(move |_| Ok(TransactWriteItemsOutput::builder().build()));
+            .return_once(move |_, _| Ok(TransactWriteItemsOutput::builder().build()));
 
         let lock_store = DynamoDbLockStore {
             dynamodb: dynamodb_mock,
@@ -820,8 +824,8 @@ mod test {
 
         dynamodb_mock
             .expect_transact_write_items()
-            .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            .return_once(move |_, _| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -898,8 +902,8 @@ mod test {
 
         dynamodb_mock
             .expect_transact_write_items()
-            .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            .return_once(move |_, _| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -951,7 +955,7 @@ mod test {
 
         dynamodb_mock
             .expect_transact_write_items()
-            .withf(move |items: &Vec<TransactWriteItem>| {
+            .withf(move |_: &Arc<str>, items: &Vec<TransactWriteItem>| {
                 if items.len() != 1 {
                     println!("Wrong item count: {}", items.len());
                     return false;
@@ -974,7 +978,7 @@ mod test {
 
                 delete_item.table_name == TABLE_NAME && item_hash.as_ref() == hash_clone.as_bytes()
             })
-            .return_once(move |_| Ok(TransactWriteItemsOutput::builder().build()));
+            .return_once(move |_, _| Ok(TransactWriteItemsOutput::builder().build()));
 
         let lock_store = DynamoDbLockStore {
             dynamodb: dynamodb_mock,
@@ -1005,8 +1009,8 @@ mod test {
 
         dynamodb_mock
             .expect_transact_write_items()
-            .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            .return_once(move |_, _| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -1734,7 +1738,7 @@ mod test {
         dynamodb_mock
             .expect_query_paginated()
             .return_once(move |_, _: LockQuery| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(QueryError::ResourceNotFoundException(
                             ResourceNotFoundException::builder()
@@ -1792,8 +1796,8 @@ mod test {
         };
 
         dynamodb_mock.expect_transact_write_items().return_once(
-            move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            move |_: &Arc<str>, _: Vec<TransactWriteItem>| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -1849,8 +1853,8 @@ mod test {
         let hash: Hash = rand::random();
 
         dynamodb_mock.expect_transact_write_items().return_once(
-            move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            move |_: &Arc<str>, _: Vec<TransactWriteItem>| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::ResourceNotFoundException(
                             ResourceNotFoundException::builder()
@@ -1898,8 +1902,8 @@ mod test {
         let hash: Hash = rand::random();
 
         dynamodb_mock.expect_transact_write_items().return_once(
-            move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+            move |_: &Arc<str>, _: Vec<TransactWriteItem>| {
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()

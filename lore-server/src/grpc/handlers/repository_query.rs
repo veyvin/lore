@@ -9,42 +9,35 @@ use lore_base::types::Context;
 use lore_error_set::prelude::*;
 use lore_proto::RepositoryQueryRequest;
 use lore_proto::RepositoryQueryResponse;
-use lore_proto::auth::CheckUserPermissionRequest;
 use lore_revision::lore::RepositoryId;
-use lore_revision::lore_debug;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 use lore_transport::RepositoryData;
-use tonic::Code;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
-use crate::authnz::auth::grpc_get_auth_client;
-use crate::authnz::common::create_request_with_authorization;
-use crate::grpc::ServerResultExt;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryQuery::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryQueryRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryQueryResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let Some(query) = req.query else {
         return Err(Status::invalid_argument("Invalid query"));
@@ -60,23 +53,31 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let token = get_verified_token(&extensions);
             let repository = match query {
                 lore_proto::repository_query_request::Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
-                    repository_query_id(repository.clone(), id, auth_url, authorization)
-                        .await
-                        .map_err(|err| {
-                            warn!("Repository ID {id} not known: {err}",);
-                            Status::not_found(err.to_string())
-                        })?
+                    repository_query_id(
+                        repository.clone(),
+                        id,
+                        Some(authorizer.as_ref()),
+                        token.as_ref(),
+                    )
+                    .await
+                    .filter_slow_down()?
+                    .map_err(|err| {
+                        warn!("Repository ID {id} not known: {err}",);
+                        Status::not_found(err.to_string())
+                    })?
                 }
                 lore_proto::repository_query_request::Query::Name(name) => repository_query_name(
                     repository.clone(),
                     name.as_str(),
-                    auth_url,
-                    authorization,
+                    Some(authorizer.as_ref()),
+                    token.as_ref(),
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn!("Repository name {name} not known: {err}");
                     Status::not_found(err.to_string())
@@ -97,11 +98,11 @@ pub async fn handler(
 pub async fn repository_query_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<RepositoryData, RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 warn!("User authorization failed: {status}");
@@ -138,6 +139,8 @@ pub async fn repository_query_id(
                 "Repairing missing name -> ID mapping: {} -> {}",
                 metadata.name, id
             );
+            // no filter_slow_down()? usage here: repairing the name mapping is
+            // best-effort, and the repository has already been resolved.
             let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
                 .await
                 .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));
@@ -157,19 +160,19 @@ pub async fn repository_query_id(
 pub async fn repository_query_name(
     repository: Arc<RepositoryContext>,
     name: &str,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<RepositoryData, RepositoryError> {
     // If the name is a parseable context ID, use the query-by-ID path directly
     if let Ok(id) = RepositoryId::from_str(name) {
-        return repository_query_id(repository, id, auth_url, authorization).await;
+        return repository_query_id(repository, id, authorizer, token).await;
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 warn!("User authorization failed: {status}");
@@ -211,45 +214,18 @@ pub async fn repository_query_name(
     })
 }
 
+/// The repository-query lookup check, on the configured authorizer.
+///
+/// Callers map a denial to `RepositoryNotFound` rather than
+/// `permission_denied`, deliberately: answering the two cases apart would
+/// let an unauthorized caller distinguish a partition that exists from one
+/// that does not.
 pub(crate) async fn check_repository_query_authorization(
-    auth_url: String,
-    authorization: Option<String>,
+    authorizer: &dyn RepositoryAuthorizer,
+    token: Option<&VerifiedToken<'_>>,
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
-    lore_debug!("Repository query authorization check for {}", repository_id,);
-
-    let mut client = grpc_get_auth_client(auth_url).await?;
-    let resource_id = format!("urc-{repository_id}");
-    let request = create_request_with_authorization(
-        CheckUserPermissionRequest {
-            resource_id: vec![resource_id.clone()],
-            target_user: None,
-        },
-        authorization,
-    )?;
-
-    let permissions = client
-        .check_user_permission(request)
+    authorizer
+        .check_repository_lookup(token, repository_id)
         .await
-        .warn_map_err(|err| {
-            if err.code() == Code::PermissionDenied {
-                return Status::permission_denied("Query resource denied");
-            } else if err.code() == Code::Unauthenticated {
-                return Status::unauthenticated("Query resource failed - unauthenticated");
-            }
-            Status::internal(format!("Failed to call auth check_user_permission: {err}"))
-        })?;
-
-    if permissions
-        .into_inner()
-        .allowed_resource_permission
-        .first()
-        .ok_or(Status::internal("No permissions for resource"))?
-        .resource_id
-        == resource_id
-    {
-        Ok(())
-    } else {
-        Err(Status::internal("Unexpected resource_id"))
-    }
 }

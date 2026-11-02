@@ -1,20 +1,26 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_error_set::prelude::*;
 
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
+use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
 use crate::event::EventError;
@@ -25,10 +31,9 @@ use crate::lore::Context;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
+use crate::metadata::store_binary_payload;
 use crate::repository;
 use crate::repository::RepositoryContext;
-use crate::store;
-use crate::util::path::RelativePath;
 
 /// Keys that cannot be modified or removed via the metadata API.
 pub const READ_ONLY_KEYS: &[&str] = &[
@@ -62,6 +67,14 @@ pub enum RepositoryMetadataError {
     InvalidPath,
     AddressNotFound,
     PayloadNotFound,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
+    FileNotFound,
 }
 
 impl EventError for RepositoryMetadataError {
@@ -113,9 +126,9 @@ async fn fetch_metadata_hash(
         return Ok(hash);
     }
 
-    Ok(repository::metadata_hash(repo)
+    repository::metadata_hash(repo)
         .await
-        .internal("loading repository metadata hash")?)
+        .forward_any::<RepositoryMetadataError>("loading repository metadata hash")
 }
 
 /// Collect all addresses referenced by a metadata blob: the blob itself plus any binary
@@ -126,7 +139,7 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
         context: Context::default(),
     }];
 
-    let _ = metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
+    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
         if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
             addresses.push(value.into());
         }
@@ -150,7 +163,7 @@ async fn ensure_remote_blobs(
     let status = storage
         .query(addresses)
         .await
-        .internal("querying server for metadata blob existence")?;
+        .forward::<RepositoryMetadataError>("querying server for metadata blob existence")?;
 
     let mut missing = vec![];
     for (index, value) in status.iter().enumerate() {
@@ -160,18 +173,16 @@ async fn ensure_remote_blobs(
     }
 
     for address in missing {
-        let (fragment, payload) = immutable::load_raw_store_retry(
-            repo.immutable_store(),
-            repo.id,
-            address,
-            store::StoreMatch::MatchFull,
-        )
-        .await
-        .internal("loading metadata blob from local store for upload")?;
+        let (fragment, payload) =
+            immutable::load_raw_store_retry(repo.immutable_store(), repo.id, address)
+                .await
+                .forward::<RepositoryMetadataError>(
+                    "loading metadata blob from local store for upload",
+                )?;
 
         immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
             .await
-            .internal("uploading metadata blob to server")?;
+            .forward::<RepositoryMetadataError>("uploading metadata blob to server")?;
     }
 
     Ok(())
@@ -190,7 +201,15 @@ async fn commit_metadata_hash(
     expected: Hash,
     new: Hash,
 ) -> Result<(), RepositoryMetadataError> {
-    let remote = repo.remote().await.internal("remote connection required")?;
+    let remote = repo
+        .remote()
+        .await
+        .forward::<RepositoryMetadataError>("remote connection required")?;
+
+    // The upload and the swap below change the remote, which no dry run may.
+    if crate::lore::execution_context().globals().dry_run() {
+        return Ok(());
+    }
 
     let correlation_id = crate::lore::execution_context()
         .globals()
@@ -199,7 +218,7 @@ async fn commit_metadata_hash(
     let storage = remote
         .session(repo.id, &correlation_id)
         .await
-        .internal("connecting to storage service")?;
+        .forward::<RepositoryMetadataError>("connecting to storage service")?;
 
     let addresses = collect_metadata_addresses(metadata, new);
     ensure_remote_blobs(repo.clone(), storage, &addresses).await?;
@@ -207,11 +226,11 @@ async fn commit_metadata_hash(
     let repository_service = remote
         .repository()
         .await
-        .internal("connecting to repository service")?;
+        .forward::<RepositoryMetadataError>("connecting to repository service")?;
     let result = repository_service
         .metadata_set(repo.id, expected, new)
         .await
-        .internal("repository metadata CAS")?;
+        .forward::<RepositoryMetadataError>("repository metadata CAS")?;
 
     if !result.success {
         return Err(RepositoryMetadataError::internal(
@@ -227,7 +246,7 @@ async fn commit_metadata_hash(
 /// is `None`, emits all metadata entries.
 ///
 /// When `local` is true, reads from the local mutable store cache without contacting the remote.
-pub async fn get(
+pub(crate) async fn get(
     repo: Arc<RepositoryContext>,
     key: Option<&str>,
     local: bool,
@@ -239,22 +258,31 @@ pub async fn get(
 
     let metadata = Metadata::deserialize(repo, hash)
         .await
-        .internal("deserializing repository metadata")?;
+        .forward::<RepositoryMetadataError>("deserializing repository metadata")?;
 
     if let Some(key) = key {
-        event::metadata::send_keyed(&metadata, key).internal("sending metadata event")?;
+        event::metadata::send_keyed(&metadata, key);
     } else {
-        event::metadata::send(&metadata).internal("sending metadata event")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
+}
+
+/// Boxed version of [`get`] for cross-crate use.
+pub fn get_boxed(
+    repo: Arc<RepositoryContext>,
+    key: Option<&str>,
+    local: bool,
+) -> crate::BoxFuture<'_, Result<(), RepositoryMetadataError>> {
+    Box::pin(get(repo, key, local))
 }
 
 /// Set one or more metadata key-value pairs on the current repository. Always contacts the remote.
 ///
 /// `keys`, `values`, and `formats` must be parallel slices of equal length. For binary values,
 /// the value is treated as a file path whose contents are stored in the immutable store.
-pub async fn set(
+pub(crate) async fn set(
     repo: Arc<RepositoryContext>,
     keys: &[&[u8]],
     values: &[&[u8]],
@@ -289,7 +317,7 @@ pub async fn set(
     } else {
         Metadata::deserialize(repo.clone(), old_hash)
             .await
-            .internal("deserializing repository metadata")?
+            .forward::<RepositoryMetadataError>("deserializing repository metadata")?
     };
 
     for i in 0..keys.len() {
@@ -298,62 +326,48 @@ pub async fn set(
         let format = formats[i];
 
         if format == MetadataType::Binary {
-            let payload = {
-                let user_path = String::from_utf8_lossy(value).to_string();
-                let given_path = PathBuf::from(&user_path);
-                let input_path = if given_path.is_absolute() {
-                    given_path
-                } else {
-                    let repo_path = repo.require_path()?;
-                    let relative_path = RelativePath::new_from_user_path(repo_path, &user_path)
-                        .internal("resolving binary metadata path")?;
-                    relative_path.to_absolute_path(repo_path)
-                };
-
-                tokio::fs::read(input_path)
-                    .await
-                    .internal("reading binary metadata file")?
-            };
-
-            let (address, _) = immutable::write(
-                repo.clone(),
-                Context::default(),
-                Bytes::from_owner(payload),
-                immutable::write_options_from_repository(repo.clone()),
-            )
-            .await
-            .internal("writing binary metadata to immutable store")?;
+            let address = store_binary_payload::<RepositoryMetadataError>(&repo, value).await?;
 
             metadata
                 .set_address(
                     std::str::from_utf8(key).internal("invalid key encoding")?,
                     address,
                 )
-                .internal("setting binary metadata")?;
+                .forward::<RepositoryMetadataError>("setting binary metadata")?;
         } else {
             metadata
                 .set(key, value, format)
-                .internal("setting metadata")?;
+                .forward::<RepositoryMetadataError>("setting metadata")?;
         }
     }
 
     let new_hash = metadata
         .serialize(repo.clone())
         .await
-        .internal("serializing repository metadata")?;
+        .forward::<RepositoryMetadataError>("serializing repository metadata")?;
 
     commit_metadata_hash(repo, &metadata, old_hash, new_hash).await?;
 
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
+}
+
+/// Boxed version of [`set`] for cross-crate use.
+pub fn set_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), RepositoryMetadataError>> {
+    Box::pin(set(repo, keys, values, formats))
 }
 
 /// Remove metadata keys from the current repository. Always contacts the remote.
 ///
 /// If `keys` is non-empty, removes only those keys (rejecting built-in keys). If `keys` is
 /// empty, removes all non-built-in keys.
-pub async fn clear(
+pub(crate) async fn clear(
     repo: Arc<RepositoryContext>,
     keys: &[&str],
 ) -> Result<(), RepositoryMetadataError> {
@@ -373,21 +387,19 @@ pub async fn clear(
 
     let mut metadata = Metadata::deserialize(repo.clone(), old_hash)
         .await
-        .internal("deserializing repository metadata")?;
+        .forward::<RepositoryMetadataError>("deserializing repository metadata")?;
 
     if keys.is_empty() {
         let mut to_remove = vec![];
-        metadata
-            .walk(
-                |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
-                    if let Ok(key) = std::str::from_utf8(key_slice)
-                        && !is_built_in_key(key)
-                    {
-                        to_remove.push(key.to_string());
-                    }
-                },
-            )
-            .internal("walking metadata for clear")?;
+        metadata.walk(
+            |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
+                if let Ok(key) = std::str::from_utf8(key_slice)
+                    && !is_built_in_key(key)
+                {
+                    to_remove.push(key.to_string());
+                }
+            },
+        );
         for key in &to_remove {
             metadata.remove_key(key);
         }
@@ -400,9 +412,17 @@ pub async fn clear(
     let new_hash = metadata
         .serialize(repo.clone())
         .await
-        .internal("serializing repository metadata")?;
+        .forward::<RepositoryMetadataError>("serializing repository metadata")?;
 
     commit_metadata_hash(repo, &metadata, old_hash, new_hash).await?;
 
     Ok(())
+}
+
+/// Boxed version of [`clear`] for cross-crate use.
+pub fn clear_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    keys: &'a [&'a str],
+) -> crate::BoxFuture<'a, Result<(), RepositoryMetadataError>> {
+    Box::pin(clear(repo, keys))
 }

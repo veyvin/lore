@@ -1,28 +1,25 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lore_error_set::Internal;
 use lore_error_set::prelude::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use lore_storage::read::heal_on_receipt;
+use lore_storage::read::verify_receipt;
 use lore_transport::Admin;
-use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
-use tokio::sync::Mutex;
 
 use super::StoreObliterateStats;
-use crate::error::LoreResultExt;
 use crate::errors::AddressNotFound;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::Partition;
-use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_warn;
 use crate::protocol;
@@ -30,202 +27,246 @@ use crate::store;
 use crate::store::KeyType;
 use crate::store::KeyValueStream;
 use crate::store::StoreError;
+use crate::store::StoreGetData;
 use crate::store::StoreMatch;
-use crate::store::StoreQueryResult;
+use crate::store::StoreMatchResult;
 
+/// An immutable store served by a remote over the storage protocol. The remote is an untrusted
+/// source: a payload it serves is checked against its address on receipt.
 pub struct RemoteImmutableStore {
-    /// Remote address
-    remote_url: String,
-    /// Identity
-    identity: Option<String>,
-    /// Cached connections
-    connections: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
-    /// Cached admin connections
-    admin: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
+    connections: protocol::RemoteConnections,
 }
 
 impl RemoteImmutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteImmutableStore {
-            remote_url: remote_url.to_string(),
-            identity: identity.map(|url| url.to_string()),
-            connections: Mutex::new(HashMap::new()),
-            admin: Mutex::new(HashMap::new()),
+            connections: protocol::RemoteConnections::new(remote_url, identity),
         }
     }
 
-    async fn connection(&self, repository: RepositoryId) -> Result<Arc<Connection>, StoreError> {
-        let mut lock = self.connections.lock().await;
-        if let Some(connection) = lock.get(&repository) {
-            return Ok(connection.clone());
+    /// A store whose connection for `partition` is `connection`.
+    #[cfg(feature = "test-util")]
+    pub fn with_connection(
+        partition: Partition,
+        connection: Arc<lore_transport::Connection>,
+    ) -> Self {
+        RemoteImmutableStore {
+            connections: protocol::RemoteConnections::with_connection(partition, connection),
         }
-        let connection = protocol::connect(
-            self.remote_url.as_str(),
-            self.identity.as_deref().unwrap_or_default(),
-            repository,
-        )
-        .await
-        .emit_map_err(Internal::msg(format!(
-            "Unable to connect to remote store at {}",
-            self.remote_url
-        )))?;
-        lock.insert(repository, connection.clone());
-        Ok(connection)
     }
 
-    pub async fn session(
+    /// A session for ops on `partition`, from the pool pinned under the call's correlation id on
+    /// the connection held for the partition.
+    pub fn session(
         &self,
-        repository: RepositoryId,
-    ) -> Result<Arc<StorageSession>, StoreError> {
-        let connection = self.connection(repository).await?;
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        connection
-            .session(repository, &correlation_id)
-            .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to create session to remote store at {}",
-                self.remote_url
-            )))
-            .map_err(StoreError::from)
+        partition: Partition,
+    ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
+        remote_session(&self.connections, partition)
     }
 
-    pub async fn admin(&self, repository: RepositoryId) -> Result<Arc<dyn Admin>, StoreError> {
-        let mut lock = self.admin.lock().await;
-        if let Some(connection) = lock.get(&repository) {
-            connection
-                .admin(repository)
+    /// The remote's admin service for `partition`.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub fn admin(
+        &self,
+        partition: Partition,
+    ) -> impl Future<Output = Result<Arc<dyn Admin>, StoreError>> + '_ {
+        async move {
+            self.connections
+                .connection(partition)
                 .await
-                .emit_map_err(Internal::msg(format!(
-                    "Unable to connect to remote store at {}",
-                    self.remote_url
-                )))
-                .map_err(StoreError::from)
-        } else {
-            let connection = protocol::connect(
-                self.remote_url.as_str(),
-                self.identity.as_deref().unwrap_or_default(),
-                repository,
-            )
-            .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to connect to remote store at {}",
-                self.remote_url
-            )))?;
-            lock.insert(repository, connection.clone());
-            connection
-                .admin(repository)
+                .forward_with::<StoreError, _>(|| {
+                    format!(
+                        "connecting to remote store at {}",
+                        self.connections.remote_url()
+                    )
+                })?
+                .admin(partition)
                 .await
-                .emit_map_err(Internal::msg(format!(
-                    "Unable to connect to remote store at {}",
-                    self.remote_url
-                )))
-                .map_err(StoreError::from)
+                .forward_with(|| {
+                    format!(
+                        "connecting to remote store at {}",
+                        self.connections.remote_url()
+                    )
+                })
         }
     }
 }
 
+/// A session for ops on `partition`, from the pool pinned under the call's correlation id on the
+/// connection `connections` holds for the partition.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn remote_session(
+    connections: &protocol::RemoteConnections,
+    partition: Partition,
+) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
+    async move {
+        let connection = connections
+            .connection(partition)
+            .await
+            .forward_with::<StoreError, _>(|| {
+                format!("connecting to remote store at {}", connections.remote_url())
+            })?;
+        let execution = execution_context();
+        connection
+            .session_pool(partition, execution.globals().correlation_id.as_str())
+            .await
+            .map(|pool| pool.pick())
+            .forward_with(|| {
+                format!(
+                    "creating session to remote store at {}",
+                    connections.remote_url()
+                )
+            })
+    }
+}
+
+/// `err` as an internal failure where the remote refused the connection or the request as
+/// unsupported. A read takes an internal failure as a miss, as it takes a remote it cannot reach,
+/// and fails on `NotSupported`, which it takes as a payload this build cannot decode.
+fn unsupported_as_internal(err: StoreError) -> StoreError {
+    if err.is_not_supported() {
+        return StoreError::internal_with_context(err, "remote refused the request as unsupported");
+    }
+    err
+}
+
 #[async_trait]
 impl store::ImmutableStore for RemoteImmutableStore {
-    async fn exist(
-        self: Arc<Self>,
-        repository: Partition,
-        address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
-        let status = session.query(&[address]).await.unwrap_or_default();
-        if !status.is_empty() {
-            if status[0] == 0 {
-                Ok(StoreMatch::MatchFull)
-            } else if status[0] == 1 {
-                Ok(StoreMatch::MatchHash)
-            } else {
-                Ok(StoreMatch::MatchNone)
-            }
-        } else {
-            Ok(StoreMatch::MatchNone)
-        }
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
     }
 
-    async fn exist_batch(
-        self: Arc<Self>,
-        repository: Partition,
-        addresses: &[Address],
-        _match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
-
-        let bytes = session
-            .query(addresses)
-            .await
-            .emit_map_err(Internal::msg("Remote store failed"))?;
-
-        if bytes.len() != addresses.len() {
-            lore_warn!(
-                "Query returned incorrect number of results, expected {}, but got {}",
-                addresses.len(),
-                bytes.len()
-            );
-            return Err(StoreError::internal("Remote store failed"));
-        }
-
-        Ok(bytes
-            .iter()
-            .map(|byte| match byte {
-                0 => StoreMatch::MatchFull,
-                1 => StoreMatch::MatchHash,
-                _ => StoreMatch::MatchNone,
-            })
-            .collect())
+    /// The peer answers exact addresses only, so nothing it returns can have come from another
+    /// partition.
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     async fn query(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+
+        let session = self.session(partition).await?;
+        let status = session
+            .query(addresses)
+            .await
+            .forward::<StoreError>("querying remote store")?;
+
+        if status.len() != addresses.len() {
+            lore_warn!(
+                "Query returned incorrect number of results, expected {}, but got {}",
+                addresses.len(),
+                status.len()
+            );
+            return Err(StoreError::internal("Remote store failed"));
+        }
+
+        for ((byte, result), address) in status.iter().zip(results.iter_mut()).zip(addresses.iter())
+        {
+            let match_made = match byte {
+                0 => StoreMatch::MatchFull,
+                1 => StoreMatch::MatchPartition,
+                _ => StoreMatch::MatchNone,
+            };
+
+            *result = if match_made == StoreMatch::MatchNone {
+                StoreMatchResult::default()
+            } else {
+                StoreMatchResult {
+                    match_made,
+                    // Never anything but the partition asked about: the peer resolves within it,
+                    // and a match found anywhere else collapses to absence before it is sent.
+                    partition,
+                    context: if match_made == StoreMatch::MatchFull {
+                        address.context
+                    } else {
+                        Context::default()
+                    },
+                    stored_local: false,
+                    stored_durable: true,
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
         address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
-        let status = session.query(&[address]).await.unwrap_or_default();
-        if !status.is_empty() && status[0] == 0 {
-            let (fragment, _payload) = session
-                .get(&address)
-                .await
-                .forward::<StoreError>("Remote store query failed")?;
-            Ok(StoreQueryResult {
+    ) -> Result<StoreGetData, StoreError> {
+        let session = self.session(partition).await?;
+
+        match session.get_metadata(&address).await {
+            Ok(fragment) => Ok(StoreGetData::metadata(
                 fragment,
-                match_made: StoreMatch::MatchFull,
-            })
-        } else {
-            Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            })
+                StoreMatch::MatchFull,
+                partition,
+            )),
+            Err(ProtocolError::NotFound(_)) => Ok(StoreGetData::default()),
+            Err(error) => Err(error).forward::<StoreError>("Remote store metadata query failed"),
         }
     }
 
+    /// Serves the payload as the remote stored it, with the content its check on receipt expanded
+    /// ([`verify_receipt`]). A payload that fails the check is fetched again once where the remote
+    /// heals it ([`heal_on_receipt`]). It answers `NotSupported` only for a payload this build
+    /// cannot decode ([`unsupported_as_internal`]).
     async fn get(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         address: Address,
-        _match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
-        let (fragment, payload) = session
-            .get(&address)
+    ) -> Result<StoreGetData, StoreError> {
+        let session = self
+            .session(partition)
             .await
-            .forward::<StoreError>("Remote store get failed")?;
-        lore_storage::validate_fragment_payload(&fragment, payload.len())?;
-        Ok((fragment, payload))
+            .map_err(unsupported_as_internal)?;
+        let mut heal_attempted = false;
+        loop {
+            let (fragment, payload) = session
+                .get(&address)
+                .await
+                .forward::<StoreError>("Remote store get failed")
+                .map_err(unsupported_as_internal)?;
+            match verify_receipt(fragment, payload.clone(), address) {
+                // The peer answers exact addresses only, so anything it served was a full match.
+                Ok(content) => {
+                    return Ok(StoreGetData {
+                        fragment,
+                        match_made: StoreMatch::MatchFull,
+                        partition,
+                        payload: Some(payload),
+                        content: Some(content),
+                    });
+                }
+                Err(err) => {
+                    if !heal_on_receipt(&session, address, &err, heal_attempted).await {
+                        return Err(err).forward_any::<StoreError>("checking a remote payload");
+                    }
+                    heal_attempted = true;
+                }
+            }
+        }
     }
 
     async fn put(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         address: Address,
         mut fragment: Fragment,
         payload: Option<Bytes>,
@@ -238,8 +279,7 @@ impl store::ImmutableStore for RemoteImmutableStore {
         } else {
             lore_storage::validate_fragment_size(&fragment)?;
         }
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
+        let session = self.session(partition).await?;
         session
             .put(address, fragment, payload)
             .await
@@ -248,31 +288,29 @@ impl store::ImmutableStore for RemoteImmutableStore {
 
     async fn copy(
         self: Arc<Self>,
-        source_repository: Partition,
+        source_partition: Partition,
         source_address: Address,
-        destination_repository: Partition,
+        destination_partition: Partition,
         destination_context: Context,
-        // The remote service tracks durability on its own side; the local-flag bookkeeping that
-        // `durable` controls happens in the local-store leg of a composite copy.
-        _durable: bool,
+        // The remote service decides both for itself: durability is tracked on its own side, and
+        // it owns which of its peers the copy reaches. The local-flag bookkeeping the caller's
+        // behaviour describes happens in the local-store leg of a composite copy.
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
-        let source_repository: RepositoryId = source_repository;
-        let destination_repository: RepositoryId = destination_repository;
-        let session = self.session(destination_repository).await?;
+        let session = self.session(destination_partition).await?;
         session
-            .copy(source_repository, source_address, destination_context)
+            .copy(source_partition, source_address, destination_context)
             .await
             .forward("Remote copy failed")
     }
 
     async fn obliterate(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         address: Address,
         _stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        let repository: RepositoryId = repository;
-        let admin = self.admin(repository).await?;
+        let admin = self.admin(partition).await?;
         match admin.obliterate(address).await {
             Ok(()) => Ok(()),
             Err(ProtocolError::NotFound(_)) => Err(AddressNotFound::from(address).into()),
@@ -305,8 +343,6 @@ impl store::ImmutableStore for RemoteImmutableStore {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
     }
@@ -322,64 +358,44 @@ impl store::ImmutableStore for RemoteImmutableStore {
 }
 
 pub struct RemoteMutableStore {
-    /// Remote address
-    remote_url: String,
-    /// Identity
-    identity: Option<String>,
-    /// Cached connections
-    connections: Mutex<HashMap<RepositoryId, Arc<Connection>>>,
+    connections: protocol::RemoteConnections,
 }
 
 impl RemoteMutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteMutableStore {
-            remote_url: remote_url.to_string(),
-            identity: identity.map(|identity| identity.to_string()),
-            connections: Mutex::new(HashMap::new()),
+            connections: protocol::RemoteConnections::new(remote_url, identity),
         }
     }
 
-    async fn session(&self, repository: RepositoryId) -> Result<Arc<StorageSession>, StoreError> {
-        let mut lock = self.connections.lock().await;
-        let connection = if let Some(connection) = lock.get(&repository) {
-            connection.clone()
-        } else {
-            let connection = protocol::connect(
-                self.remote_url.as_str(),
-                self.identity.as_deref().unwrap_or_default(),
-                repository,
-            )
-            .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to connect to remote store at {}",
-                self.remote_url
-            )))?;
-            lock.insert(repository, connection.clone());
-            connection
-        };
-        drop(lock);
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        connection
-            .session(repository, &correlation_id)
-            .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to create session to remote store at {}",
-                self.remote_url
-            )))
-            .map_err(StoreError::from)
+    /// A session for ops on `partition`, as [`remote_session`] takes it.
+    fn session(
+        &self,
+        partition: Partition,
+    ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
+        remote_session(&self.connections, partition)
     }
 }
 
 #[async_trait]
 impl store::MutableStore for RemoteMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         key: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
+        let session = self.session(partition).await?;
         session
             .mutable_load(&key, key_type)
             .await
@@ -401,13 +417,12 @@ impl store::MutableStore for RemoteMutableStore {
 
     async fn store(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         key: Hash,
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
+        let session = self.session(partition).await?;
         session
             .mutable_store(key, value, key_type)
             .await
@@ -416,14 +431,13 @@ impl store::MutableStore for RemoteMutableStore {
 
     async fn compare_and_swap(
         self: Arc<Self>,
-        repository: Partition,
+        partition: Partition,
         key: Hash,
         expected: Hash,
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
-        let repository: RepositoryId = repository;
-        let session = self.session(repository).await?;
+        let session = self.session(partition).await?;
         session
             .mutable_compare_and_swap(key, expected, value, key_type)
             .await

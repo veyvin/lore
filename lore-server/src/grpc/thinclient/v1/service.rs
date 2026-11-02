@@ -22,6 +22,7 @@ use tonic::codegen::tokio_stream::Stream;
 use super::revision_diff;
 use super::revision_info;
 use super::revision_tree;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::timeout_grpc;
 
 type ContentDiffStream =
@@ -51,8 +52,11 @@ impl InstrumentProvider for ThinClientServiceInstrumentProvider {
 pub struct LoreThinClientV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     rpc_timeout: Duration,
     revision_diff_config: revision_diff::RevisionDiffConfig,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
     #[allow(dead_code)]
     instrument_provider: ThinClientServiceInstrumentProvider,
 }
@@ -61,14 +65,20 @@ impl LoreThinClientV1Service {
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         rpc_timeout: Duration,
         revision_diff_config: revision_diff::RevisionDiffConfig,
+        history_step_size: u64,
+        acceleration: crate::grpc::server::RevisionListAcceleration,
     ) -> Self {
         Self {
             immutable_store,
             mutable_store,
+            repository_authorizer,
             rpc_timeout,
             revision_diff_config,
+            history_step_size,
+            acceleration,
             instrument_provider: ThinClientServiceInstrumentProvider,
         }
     }
@@ -105,6 +115,8 @@ impl ThinClientService for LoreThinClientV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.history_step_size,
+                self.acceleration,
             ),
         )
         .await
@@ -120,7 +132,10 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.repository_authorizer.clone(),
             self.revision_diff_config,
+            self.history_step_size,
+            self.acceleration,
         )
         .await
     }
@@ -135,24 +150,10 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.repository_authorizer.clone(),
+            self.history_step_size,
+            self.acceleration,
         )
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::thin_client::v1::thin_client_service_server::ThinClientServiceServer;
-
-    use super::*;
-
-    /// Compile-time check that `LoreThinClientV1Service` fully implements
-    /// the generated `ThinClientService` trait — wrapping it in
-    /// `ThinClientServiceServer` requires the trait bound to hold.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreThinClientV1Service,
-    ) -> ThinClientServiceServer<LoreThinClientV1Service> {
-        ThinClientServiceServer::new(service)
     }
 }

@@ -3,17 +3,17 @@
 use std::path::Path;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
-use super::DOT_LORE;
-use super::DOT_URC;
 use super::FileConfig;
 use super::RepositoryConfig;
 use super::RepositoryMetadata;
 use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::StoreConfig;
+use super::VfsConfig;
+use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -30,7 +30,7 @@ use crate::util;
 
 /// Data for the event emitted when a repository is created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCreateEventData {
     /// Identifier of the created repository.
@@ -115,6 +115,8 @@ pub struct CreateOptions {
     pub description: Option<String>,
     // Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
+    // Whether to use VFS for the repository
+    pub vfs_options: VfsConfig,
 }
 
 #[derive(Clone)]
@@ -125,15 +127,32 @@ pub struct CreateMetadata {
     pub created: u64,
 }
 
-pub async fn create(
-    repository_url: &str,
-    path: impl AsRef<Path>,
-    options: CreateOptions,
-) -> Result<(), CreateError> {
-    create_with_metadata(repository_url, path, options, None).await
+/// Names a repository created without a URL after the directory it lives in.
+///
+/// The path reaching here may still be relative (`.` is the common case), so resolve it
+/// against the call's working directory before taking the final component — otherwise
+/// every repository created in the current directory would be named `.`.
+fn directory_name(path: &Path) -> Option<String> {
+    let absolute = path
+        .to_str()
+        .and_then(|path| util::path::make_absolute(path).ok())
+        .unwrap_or_else(|| path.to_path_buf());
+    absolute
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
-pub async fn create_with_metadata(
+/// Boxed version of [`create_with_metadata`] for cross-crate use, without metadata.
+pub fn create_boxed(
+    repository_url: &str,
+    path: impl AsRef<Path> + Send,
+    options: CreateOptions,
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    create_with_metadata_boxed(repository_url, path, options, None)
+}
+
+pub(crate) async fn create_with_metadata(
     repository_url: &str,
     path: impl AsRef<Path>,
     options: CreateOptions,
@@ -142,34 +161,90 @@ pub async fn create_with_metadata(
     let context = execution_context();
     let call = context.globals();
 
-    let (remote_url, name) = repository::parse_url(repository_url, call.offline_or_local())
-        .forward::<CreateError>("parsing repository URL")?;
-
-    if !repository::is_valid_name(name.as_str()) {
-        return Err(CreateError::internal("Invalid repository URL"));
-    }
-
     let path = path.as_ref();
 
-    // Check both formats for pre-existence
-    for dot_dir in [DOT_URC, DOT_LORE] {
-        let existing = path.join(dot_dir);
-        if existing.exists() {
-            if call.force() {
-                tokio::fs::remove_dir_all(existing.as_path())
-                    .await
-                    .internal_with(|| {
-                        format!("removing previous repository in path {}", path.display())
-                    })?;
-            } else {
-                return Err(CreateError::from(RepositoryAlreadyExists {
-                    path: path.display().to_string(),
-                }));
+    // A local repository is the only kind that has no remote, and `--offline` / `--local`
+    // is how the caller asks for one. Under that flag the argument names the repository
+    // rather than locating it, and may be omitted entirely for the directory's own name.
+    // Without it a URL that names a host is required, so a bare name is never silently
+    // reinterpreted as a repository name.
+    let local_only = call.offline_or_local();
+    let (remote_url, name) = if repository_url.is_empty() {
+        if !local_only {
+            return Err(InvalidArguments {
+                reason: "a repository URL is required, pass --offline to create a local \
+                         repository named after the current directory"
+                    .to_string(),
             }
+            .into());
+        }
+        let name = directory_name(path)
+            .ok_or_else(|| CreateError::internal("Unable to derive repository name from path"))?;
+        (String::default(), name)
+    } else {
+        // A bare name is only a name when the caller asked for a local repository. The
+        // check is here rather than left to `parse_url` so the message names the choice
+        // the caller has, instead of reporting their repository name as a broken URL.
+        if !local_only && !repository_url.contains("://") && !repository_url.contains('/') {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "repository URL '{repository_url}' must include a host name, pass \
+                     --offline to create a local repository named '{repository_url}'"
+                ),
+            }
+            .into());
+        }
+        repository::parse_url(repository_url, local_only)
+            .forward::<CreateError>("parsing repository URL")?
+    };
+
+    if !repository::is_valid_name(name.as_str()) {
+        // Blame whatever the name actually came from. Without an argument it came from the
+        // directory; under `--offline` the argument is the name itself, so calling it a
+        // broken URL would point the reader at a scheme they deliberately did not pass.
+        return Err(CreateError::internal(if repository_url.is_empty() {
+            format!("Directory name '{name}' is not a valid repository name, pass a name or URL")
+        } else if local_only {
+            format!(
+                "'{name}' is not a valid repository name, names may hold letters, digits, \
+                 '/', '-', '_' and '.'; include a scheme such as lore:// to name a remote"
+            )
+        } else {
+            "Invalid repository URL".to_string()
+        }));
+    }
+
+    let existing_dot_dir = get_dot_lore_path(path)?;
+    if existing_dot_dir.exists() {
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if call.force() && !existing_repository_is_swfs {
+            if call.dry_run() {
+                dry_run_created(id_or_new(&options), name, path);
+                return Ok(());
+            }
+            lore_io::IoDriver::global()
+                .remove_dir_all(existing_dot_dir.as_path())
+                .await
+                .internal_with(|| {
+                    format!("removing previous repository in path {}", path.display())
+                })?;
+        } else {
+            return Err(CreateError::from(RepositoryAlreadyExists {
+                path: path.display().to_string(),
+            }));
         }
     }
 
-    let id = options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
+    let id = id_or_new(&options);
+
+    // A dry run creates nothing, on the server or on disk: the setup below writes the
+    // repository's files directly, and its store writes would be discarded.
+    if call.dry_run() {
+        dry_run_created(id, name, path);
+        return Ok(());
+    }
 
     // TODO(mjansson): Make this configurable in arguments and command line
     let branch_name = branch::DEFAULT_DEFAULT_NAME;
@@ -181,7 +256,9 @@ pub async fn create_with_metadata(
         Context::from(uuid::Uuid::now_v7())
     };
 
-    let connection = if !call.offline_or_local() {
+    // With no remote URL there is no server to create the repository on, so skip
+    // straight to the local setup rather than failing the way an unreachable remote does.
+    let connection = if !call.offline_or_local() && !remote_url.is_empty() {
         // Try to create the repository on server
         let connection = protocol::connect(
             remote_url.as_str(),
@@ -252,9 +329,13 @@ pub async fn create_with_metadata(
         remote_url: Some(remote_url),
         identity: resolved_identity,
         shared_store_to_use: options.shared_store_options,
+        vfs: Some(options.vfs_options),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
     };
+    config
+        .validate()
+        .forward::<CreateError>("Error validating repository config")?;
 
     // `create` is a genesis-path write command that doesn't flow through
     // `repository_call`, so acquire the per-path write mutex here. The token
@@ -290,9 +371,10 @@ pub async fn create_with_metadata(
     // The create command goes through dispatch_call, not repository_call,
     // so the normal spawn_flush_stores path that flushes dirty mutable store
     // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are persisted
-    // before the process exits.
-    let _ = repository.flush(true).await;
+    // branch creation, instance registration, and metadata are written
+    // before the process exits — synced to disk only under `--sync-data`, as
+    // every other command's flush is.
+    let _ = repository.flush(call.sync_data()).await;
 
     drop(repository);
     drop(connection);
@@ -305,4 +387,33 @@ pub async fn create_with_metadata(
     .send();
 
     Ok(())
+}
+
+fn id_or_new(options: &CreateOptions) -> RepositoryId {
+    options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into())
+}
+
+fn dry_run_created(id: RepositoryId, name: String, path: &Path) {
+    event::LoreEvent::RepositoryCreate(LoreRepositoryCreateEventData {
+        id,
+        name: name.into(),
+        path: path.into(),
+    })
+    .send();
+}
+
+/// Boxed version of [`create_with_metadata`] for cross-crate use.
+pub fn create_with_metadata_boxed(
+    repository_url: &str,
+    path: impl AsRef<Path> + Send,
+    options: CreateOptions,
+    metadata: Option<CreateMetadata>,
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    let path = path.as_ref().to_path_buf();
+    Box::pin(create_with_metadata(
+        repository_url,
+        path,
+        options,
+        metadata,
+    ))
 }

@@ -10,6 +10,8 @@ use crate::errors::InvalidPath;
 use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LoreLinkChangeEventData;
@@ -20,10 +22,11 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::stage;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
-pub async fn update(
+pub(crate) async fn update(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     link_path: RelativePath,
@@ -37,8 +40,23 @@ pub async fn update(
 
     lore_debug!("Resolve link to update at path {link_path}");
 
-    let node_link = state_staged
-        .find_node_link(repository.clone(), link_path.as_str())
+    // Resolve through any parent links so mutations target the owning repo.
+    let chain = link::resolve_link_chain(
+        NodeMapping::root(repository.clone(), state_staged.clone()),
+        state_current.clone(),
+        link_path.clone(),
+        parent_branch,
+    )
+    .await?;
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
+
+    let node_link = inner_state
+        .find_relative_node_link(
+            inner_repository.clone(),
+            chain.innermost.node,
+            chain.remainder_path.as_str(),
+        )
         .await
         .forward::<LinkError>("Invalid path")?;
 
@@ -50,8 +68,8 @@ pub async fn update(
         .into());
     }
 
-    let link_node = state_staged
-        .node(repository.clone(), node_link.node)
+    let link_node = inner_state
+        .node(inner_repository.clone(), node_link.node)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
 
@@ -69,34 +87,49 @@ pub async fn update(
     let linked_node = link_node.child;
 
     // TODO(vri): Verify filesystem in any case for local modifications
+    // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
-        let (linked_changes, _changes_stats) = state::diff_filesystem_subtree(
-            repository.clone(),
-            state_staged.clone(),
-            repository.clone(),
-            state_current.clone(),
-            link_path.clone(),
-            node_link.node,
-            node_link.node,
-            FilterMode::View,
-            std::sync::Arc::new(Vec::new()),
-        )
-        .await
-        .forward::<LinkError>("Failed to diff link with filesystem")?;
+        let changed = with_operation(repository.file_system(), async |operation| {
+            let linked_changes = state::diff_filesystem_subtree(
+                &operation,
+                NodeMapping {
+                    repository: inner_repository.clone(),
+                    state: inner_state.clone(),
+                    path: link_path.clone(),
+                    node: node_link.node,
+                },
+                NodeMapping {
+                    repository: inner_repository.clone(),
+                    state: inner_state.clone(),
+                    path: link_path.clone(),
+                    node: node_link.node,
+                },
+                link_path.clone(),
+                FilterMode::View,
+                FilesystemDiffIntent::Report,
+                std::sync::Arc::new(Vec::new()),
+            )
+            .await
+            .forward::<LinkError>("Failed to diff link with filesystem")?;
+            let changed = linked_changes
+                .any(|_change| true)
+                .await
+                .forward::<LinkError>("Failed to diff link with filesystem")?;
+            Ok::<_, LinkError>(changed)
+        })
+        .await?;
 
-        if !linked_changes.is_empty() {
+        if changed {
             return Err(LinkError::internal("Link has filesystem changes"));
         }
     }
 
-    let link = Arc::new(
-        repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link = repository
+        .to_link_context(link_node.address.context.into())
+        .await;
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
-    let link_reference = state_staged
-        .link_find(repository.clone(), link.id, node_link.node)
+    let link_reference = inner_state
+        .link_find(inner_repository.clone(), link.id, node_link.node)
         .await
         .forward::<LinkError>("Failed to find link")?;
 
@@ -137,9 +170,9 @@ pub async fn update(
 
     lore_debug!("Staging link node");
     let link_node = stage::stage_single_node(
-        repository.clone(),
-        state_staged.clone(),
-        link_path.clone(),
+        inner_repository.clone(),
+        inner_state.clone(),
+        chain.remainder_path.clone().freeze(),
         node,
         Arc::default(),
         None, // No link tracking when updating links
@@ -148,9 +181,9 @@ pub async fn update(
     .await
     .forward::<LinkError>("Failed staging the link node")?;
 
-    state_staged
+    inner_state
         .link_update(
-            repository.clone(),
+            inner_repository.clone(),
             link.id,
             link_branch,
             link_revision,
@@ -159,6 +192,7 @@ pub async fn update(
         .await
         .forward::<LinkError>("Failed to update link")?;
 
+    // Filesystem realize uses the full mount path.
     link::realize_link_pin_change(
         repository.clone(),
         link.clone(),
@@ -169,14 +203,10 @@ pub async fn update(
     )
     .await?;
 
-    state_staged.set_parent_self(state_current.revision());
+    // Fold nested link revisions up into the top-level state (no-op if flat).
+    link::propagate_link_chain(&chain, token).await?;
 
-    // If staged state is the initial stage based on current state, reset other parent. Otherwise
-    // leave it as is, in case previous staged state was a merge/integrate
-    if state_staged.revision() == state_current.revision() {
-        state_staged.set_parent_other(Hash::default());
-        state_staged.set_metadata_hash(Hash::default());
-    }
+    state_staged.reparent_onto(state_current.revision());
 
     // Serialize the staged state
     let signature = state_staged
@@ -198,4 +228,14 @@ pub async fn update(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`update`] for cross-crate use.
+pub fn update_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    link_path: RelativePath,
+    pin: Option<String>,
+) -> crate::BoxFuture<'_, Result<(), LinkError>> {
+    Box::pin(update(repository, token, link_path, pin))
 }

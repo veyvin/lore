@@ -15,3 +15,32 @@ pub fn assemble_resource_for_path(path: &str, branch: BranchId) -> lock::LockRes
         description,
     }
 }
+
+/// Folds per-batch outcomes into the collected items, the count of successful
+/// batches, and the error of one failing batch, which carries the reason the
+/// remote refused it. Batches complete out of order, so which failing batch the
+/// error comes from is unspecified. `capacity` sizes the item vector up front
+/// and is an upper bound on what the batches return.
+pub fn fold_batch_results<T, E>(
+    batch_results: Vec<Result<Vec<T>, E>>,
+    capacity: usize,
+) -> (Vec<T>, usize, Option<E>) {
+    let mut items = Vec::with_capacity(capacity);
+    let mut num_success = 0;
+    let mut first_error = None;
+    for batch_result in batch_results {
+        match batch_result {
+            Ok(mut batch_items) => {
+                items.append(&mut batch_items);
+                num_success += 1;
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    (items, num_success, first_error)
+}

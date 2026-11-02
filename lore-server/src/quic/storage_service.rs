@@ -15,6 +15,7 @@ use lore_telemetry::tracing::fields::QUIC_OPCODE;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::SAMPLING_TIER_LOW;
 use lore_telemetry::tracing::fields::TRANSPORT;
+use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
@@ -29,9 +30,13 @@ use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::client_identify::UserAgentValue;
+use crate::protocol::storage::connect::connection_permits;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -52,6 +57,7 @@ use crate::telemetry::Transport;
 /// between v0 (`LoreStorageService`) and v4 (`StorageServiceV4`); the caller
 /// passes its `StorageProtocol` so v0 and v4 are distinguishable in traces via
 /// the `protocol` attribute.
+#[lore_macro::test_pub]
 pub(crate) fn build_storage_protocol_request_span(
     cmd: QuicOpCode,
     protocol: StorageProtocol,
@@ -59,6 +65,7 @@ pub(crate) fn build_storage_protocol_request_span(
     repository_id: &str,
     correlation_id: &str,
     user_id: &str,
+    user_agent: &str,
 ) -> Span {
     let command_parse = Command::try_from(cmd);
     let opcode_label = command_parse
@@ -75,6 +82,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Get) => info_span!(
             parent: None,
@@ -87,6 +95,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::GetMetadata) => info_span!(
             parent: None,
@@ -99,6 +108,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Put) => info_span!(
             parent: None,
@@ -111,6 +121,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Query) => info_span!(
             parent: None,
@@ -122,6 +133,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Verify) => info_span!(
             parent: None,
@@ -133,6 +145,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Copy) => info_span!(
             parent: None,
@@ -145,6 +158,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableLoad) => info_span!(
             parent: None,
@@ -156,6 +170,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableStore) => info_span!(
             parent: None,
@@ -167,6 +182,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableCas) => info_span!(
             parent: None,
@@ -178,6 +194,47 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
+        ),
+        Ok(Command::PutResolved) => info_span!(
+            parent: None,
+            "StoragePutResolvedTask",
+            { SAMPLING_TIER_LOW } = true,
+            { TRANSPORT } = %Transport::Quic,
+            { PROTOCOL } = %protocol,
+            { QUIC_OPCODE } = opcode_label,
+            { CONNECTION_ID } = connection_id,
+            { REPOSITORY_ID } = repository_id,
+            { CORRELATION_ID } = correlation_id,
+            { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
+        ),
+        Ok(Command::GetResolved) => info_span!(
+            parent: None,
+            "StorageGetResolvedTask",
+            { SAMPLING_TIER_LOW } = true,
+            { TRANSPORT } = %Transport::Quic,
+            { PROTOCOL } = %protocol,
+            { QUIC_OPCODE } = opcode_label,
+            { CONNECTION_ID } = connection_id,
+            { REPOSITORY_ID } = repository_id,
+            { CORRELATION_ID } = correlation_id,
+            { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
+        ),
+        // Carries no user agent itself: the value it announces is applied to the connection
+        // context after this span is built, so it lands on subsequent requests instead.
+        Ok(Command::ClientIdentify) => info_span!(
+            parent: None,
+            "StorageClientIdentifyTask",
+            { TRANSPORT } = %Transport::Quic,
+            { PROTOCOL } = %protocol,
+            { QUIC_OPCODE } = opcode_label,
+            { CONNECTION_ID } = connection_id,
+            { REPOSITORY_ID } = repository_id,
+            { CORRELATION_ID } = correlation_id,
+            { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Err(_) => info_span!(
             parent: None,
@@ -189,28 +246,34 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
     }
 }
 
 fn request_identifiers_from_context(
     context: &Arc<AttributeMap>,
-) -> (String, String, String, String) {
-    let connection_id = context
-        .get::<ConnectionId>()
-        .map_or_else(|| NO_CONNECTION_ID.to_string(), |id| id.0.to_string());
-    let repository_id = context
-        .get::<RepositoryId>()
-        .map_or_else(|| NO_REPOSITORY_ID.to_string(), |id| id.to_string());
-    let correlation_id = context
-        .get::<CorrelationId>()
-        .map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
-    let user_id = context
-        .get::<AuthorizationToken>()
-        .map(|token| token.user_id.clone())
+) -> (String, String, String, String, Option<Arc<UserAgentValue>>) {
+    let (connection_id, repository_id, correlation_id, authorization_token, user_agent) = context
+        .get_five::<ConnectionId, RepositoryId, CorrelationId, AuthorizationToken, UserAgentValue>(
+    );
+    let connection_id =
+        connection_id.map_or_else(|| NO_CONNECTION_ID.to_string(), |id| id.0.to_string());
+    let repository_id =
+        repository_id.map_or_else(|| NO_REPOSITORY_ID.to_string(), |id| id.to_string());
+    let correlation_id =
+        correlation_id.map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
+    let user_id = authorization_token
+        .map(|token| token.identity().to_string())
         .filter(|user_id| !user_id.is_empty())
         .unwrap_or_else(|| NO_USER_ID.to_string());
-    (connection_id, repository_id, correlation_id, user_id)
+    (
+        connection_id,
+        repository_id,
+        correlation_id,
+        user_id,
+        user_agent,
+    )
 }
 
 #[derive(Debug)]
@@ -222,6 +285,12 @@ pub enum ParsedStorageRequest {
     /// Wire-identical to `Get`; the dispatcher routes this to `handle_get_metadata` so the
     /// response carries fragment metadata only — no payload bytes.
     GetMetadata(crate::protocol::storage::get::GetMetadata),
+    /// Resolves a mutable key and returns the immutable blob it points at, saving the caller
+    /// the round trip a separate `MutableLoad` would cost. v4-only: it needs both stores.
+    GetResolved(requests::GetResolved),
+    /// Stores a fragment and publishes a mutable key naming it, saving the caller the round trip
+    /// a separate `MutableStore` would cost. v4-only: it needs both stores.
+    PutResolved(requests::PutResolved),
     Put(requests::Put),
     Query(requests::Query),
     Correlate(requests::Correlate),
@@ -229,6 +298,31 @@ pub enum ParsedStorageRequest {
     MutableLoad(requests::MutableLoad),
     MutableStoreOp(requests::MutableStoreOp),
     MutableCas(requests::MutableCas),
+}
+
+impl ParsedStorageRequest {
+    /// The action this command needs on the connection's partition beyond
+    /// reaching it, which connect already checked. `None` for reads, which
+    /// reaching the partition permits, and for the commands that set up the
+    /// connection. Exhaustive, so a new command cannot skip the decision.
+    pub fn required_action(&self) -> Option<Action> {
+        match self {
+            Self::Connect(_)
+            | Self::Correlate(_)
+            | Self::Get(_)
+            | Self::GetMetadata(_)
+            | Self::GetResolved(_)
+            | Self::Query(_)
+            | Self::MutableLoad(_) => None,
+            // Healing drops the server's index entries for a corrupt fragment.
+            Self::Verify(verify) => (verify.heal != 0).then_some(Action::Write),
+            Self::Put(_)
+            | Self::PutResolved(_)
+            | Self::Copy(_)
+            | Self::MutableStoreOp(_)
+            | Self::MutableCas(_) => Some(Action::Write),
+        }
+    }
 }
 
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
@@ -292,6 +386,14 @@ pub fn parse_message_for_opcode(
         Command::MutableCas => Ok(ParsedStorageRequest::MutableCas(
             requests::MutableCas::parse(bytes)?,
         )),
+        Command::GetResolved => Ok(ParsedStorageRequest::GetResolved(
+            requests::GetResolved::parse(bytes)?,
+        )),
+        Command::PutResolved => Ok(ParsedStorageRequest::PutResolved(
+            requests::PutResolved::parse(bytes)?,
+        )),
+        // ClientIdentify is handled at the connection layer, not by this service.
+        Command::ClientIdentify => Err(MessageParseError::UnknownOpcode(opcode)),
     }
 }
 
@@ -333,6 +435,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::InvalidFragment => "InvalidFragment",
         MessageHandleError::HandlerTimeout => "HandlerTimeout",
         MessageHandleError::SessionLimitReached => "SessionLimitReached",
+        MessageHandleError::InvalidArgument(_) => "InvalidArgument",
     }
 }
 
@@ -354,7 +457,8 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::Metadata
         | MessageHandleError::HashFailed
         | MessageHandleError::InvalidFragment
-        | MessageHandleError::SessionLimitReached => false,
+        | MessageHandleError::SessionLimitReached
+        | MessageHandleError::InvalidArgument(_) => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
         | MessageHandleError::NotImplemented
@@ -366,6 +470,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -374,12 +479,14 @@ pub struct StorageService {
 impl StorageService {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -410,10 +517,22 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if let Some(action) = request.required_action()
+            && connection_permits(&context, self.repository_authorizer.as_ref(), action).await
+                == Some(false)
+        {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "Action not permitted".to_string(),
+            ));
+        }
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
-                    .handle_auth(context, self.jwt_verifier.clone())
+                    .handle_auth(
+                        context,
+                        self.jwt_verifier.clone(),
+                        self.repository_authorizer.clone(),
+                    )
                     .await
             }
             ParsedStorageRequest::MutableLoad(_)
@@ -424,9 +543,23 @@ impl QuicService for StorageService {
                     .await
             }
             ParsedStorageRequest::Verify(verify) => {
-                verify.handle(context, self.local_store.clone()).await
+                verify
+                    .handle(
+                        context,
+                        self.local_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
             }
-            other => other.handle(context, self.immutable_store.clone()).await,
+            other => {
+                other
+                    .handle(
+                        context,
+                        self.immutable_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
+            }
         }?;
 
         Ok(lore_response.data())
@@ -468,7 +601,7 @@ impl QuicService for StorageService {
         _message: &Self::ParsedRequestType,
         context: &Arc<AttributeMap>,
     ) -> Span {
-        let (connection_id, repository_id, correlation_id, user_id) =
+        let (connection_id, repository_id, correlation_id, user_id, user_agent) =
             request_identifiers_from_context(context);
         build_storage_protocol_request_span(
             header.cmd,
@@ -477,6 +610,9 @@ impl QuicService for StorageService {
             &repository_id,
             &correlation_id,
             &user_id,
+            user_agent
+                .as_ref()
+                .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
     }
 }

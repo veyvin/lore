@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::types::*;
 
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::types::*;
 
@@ -15,24 +17,28 @@ use crate::types::*;
 #[async_trait]
 pub trait Protocol: Send + Sync {
     /// Connect to remote storage service
+    #[allow(clippy::too_many_arguments)]
     async fn storage(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         index: usize,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
     /// Connect to remote revision service
+    #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError>;
 
     /// Connect to remote repository service
@@ -40,28 +46,33 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
 
     /// Connect to remote admin service
+    #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Admin>, ProtocolError>;
 
     /// Connect to remote lock service
+    #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError>;
 
     /// Connect to remote environment service
@@ -75,13 +86,13 @@ pub trait Protocol: Send + Sync {
 /// Storage protocol
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Start a session for the given repository and correlation ID.
+    /// Start a session for the given partition and correlation ID.
     /// Returns a raw session ID. The caller is responsible for calling
     /// `session_stop` when done. Prefer `StorageConnector::session()` for
     /// automatic lifecycle management.
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError>;
 
@@ -140,8 +151,8 @@ pub trait Storage: Send + Sync {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError>;
 
-    /// Copy a fragment from `(source_repository, source_address)` to
-    /// `(session.repository, source_address.hash, target_context)`.
+    /// Copy a fragment from `(source_partition, source_address)` to
+    /// `(session.partition, source_address.hash, target_context)`.
     ///
     /// The hash is preserved by the transport (content-addressed); the target context lets the
     /// caller pivot the destination's dedup tag without ever transferring the payload — including
@@ -149,7 +160,7 @@ pub trait Storage: Send + Sync {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError>;
@@ -163,6 +174,47 @@ pub trait Storage: Send + Sync {
     ) -> Result<Hash, ProtocolError> {
         let _ = (session_id, key, key_type);
         Err(ProtocolError::internal("unsupported: mutable_load"))
+    }
+
+    /// `mutable_load(key)` followed by `get(Address { hash: resolved, context })`, performed
+    /// server-side in one round trip.
+    ///
+    /// The key is always read as [`KeyType::Resolve`], so no key type is sent. `context` is
+    /// required because the mutable store yields only a hash. `flags` is a `get_resolved_flags`
+    /// bitmask; 0 for default behaviour.
+    ///
+    /// Returns `(resolved_hash, fragment, payload)`; the hash permits caching the key->hash
+    /// mapping and verifying the payload.
+    async fn get_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let _ = (session_id, key, context, flags);
+        Err(ProtocolError::internal("unsupported: get_resolved"))
+    }
+
+    /// `put(address, fragment, payload)` followed by a `KeyType::Resolve` mapping of `key` to
+    /// `address.hash`, performed server-side in one round trip. The write side of
+    /// [`Storage::get_resolved`].
+    ///
+    /// The mapping lands only once the fragment is durably stored, so a key never resolves to
+    /// content the server does not hold. Only a root fragment is published this way; a fragment
+    /// list's leaves are written with ordinary [`Storage::put`] calls beforehand.
+    ///
+    /// A zero `address.hash` removes the mapping instead; `fragment` and `payload` are ignored.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let _ = (session_id, key, address, fragment, payload);
+        Err(ProtocolError::internal("unsupported: put_resolved"))
     }
 
     /// Store a mutable key-value pair.
@@ -233,6 +285,17 @@ pub trait Revision: Send + Sync {
 
     /// List all branches
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
+
+    /// List at most `limit` branches. `None` means enumeration exceeded the limit.
+    /// Implementations must stop consuming the stream when the limit is exceeded.
+    async fn branch_list_bounded(
+        &self,
+        _limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        Err(ProtocolError::from(lore_base::error::NotSupported {
+            operation: "bounded branch listing".to_string(),
+        }))
+    }
 
     async fn revision_list(
         &self,
@@ -347,14 +410,22 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError>;
 
-    /// Polls for completion of an interactive auth session.
+    /// Polls an interactive auth session once.
+    ///
+    /// Answers [`AuthSessionPoll::Pending`] while the user has yet to
+    /// approve, [`AuthSessionPoll::SlowDown`] when the backend wants the
+    /// caller to poll less often, and [`AuthSessionPoll::Complete`] with the
+    /// token once approved.
+    ///
+    /// The caller takes care of the cadence: it waits the session's `interval`
+    /// between polls, widens it on `SlowDown`, and gives up at `expires_in`.
     async fn poll_auth_session(
         &self,
         auth_url: &str,
         client_state: &str,
         session_code: &str,
         correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError>;
+    ) -> Result<AuthSessionPoll, ProtocolError>;
 
     /// Exchanges an external token for a URC authentication token.
     async fn exchange_external_token(
@@ -365,13 +436,38 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Obtains an authentication token for a confidential client registered with
+    /// the auth backend, which authenticates with its own ID and secret.
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError>;
+
     /// Refreshes the authentication token using a one-time-use refresh token.
+    ///
+    /// Fails with [`Disconnected`](lore_base::error::Disconnected) only when the refresh token
+    /// cannot have reached the backend, so the caller may present it again. After any other
+    /// failure the backend may have consumed it.
     async fn refresh_authentication(
         &self,
         auth_url: &str,
         refresh_token: &str,
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
+
+    /// Revokes the refresh token of a login at the auth backend.
+    ///
+    /// Fails with [`NotSupported`](lore_base::error::NotSupported) when the backend offers no
+    /// revocation.
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
 
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.
@@ -394,21 +490,26 @@ pub trait Authentication: Send + Sync {
         resource_id: &str,
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError>;
+}
 
+/// Client-side directory lookup between user IDs and display names.
+#[async_trait]
+pub trait UserService: Send + Sync {
     /// Resolves user IDs to display names.
     async fn get_user_info(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         user_ids: &[String],
         correlation_id: &str,
     ) -> Result<Vec<ResolvedUser>, ProtocolError>;
 
-    /// Resolves a display name back to a user ID.
+    /// Resolves a display name back to a user ID. `None` when the service
+    /// does not recognize the user.
     async fn get_user_id(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         display_name: &str,

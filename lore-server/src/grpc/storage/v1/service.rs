@@ -12,11 +12,15 @@ use super::copy::CopyResponseStream;
 use super::get;
 use super::get::GetResponseStream;
 use super::get_metadata;
+use super::get_resolved;
+use super::get_resolved::GetResolvedResponseStream;
 use super::mutable_compare_and_swap;
 use super::mutable_load;
 use super::mutable_store;
 use super::put;
 use super::put::PutResponseStream;
+use super::put_resolved;
+use super::put_resolved::PutResolvedResponseStream;
 use super::query;
 use super::verify;
 use crate::grpc::storage_service::LoreStorageService;
@@ -41,13 +45,50 @@ impl StorageServiceV1 for LoreStorageService {
         get_metadata::handler(request, self.immutable_store().clone(), self).await
     }
 
+    type GetResolvedStream = GetResolvedResponseStream;
+
+    async fn get_resolved(
+        &self,
+        request: Request<Streaming<storage_v1::GetResolvedRequest>>,
+    ) -> Result<Response<Self::GetResolvedStream>, Status> {
+        get_resolved::handler(
+            request,
+            self.mutable_store().clone(),
+            self.immutable_store().clone(),
+            self,
+        )
+        .await
+    }
+
+    type PutResolvedStream = PutResolvedResponseStream;
+
+    async fn put_resolved(
+        &self,
+        request: Request<Streaming<storage_v1::PutResolvedRequest>>,
+    ) -> Result<Response<Self::PutResolvedStream>, Status> {
+        put_resolved::handler(
+            request,
+            self.repository_authorizer(),
+            self.mutable_store().clone(),
+            self.immutable_store().clone(),
+            self,
+        )
+        .await
+    }
+
     type PutStream = PutResponseStream;
 
     async fn put(
         &self,
         request: Request<Streaming<storage_v1::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
-        put::handler(request, self.immutable_store().clone(), self).await
+        put::handler(
+            request,
+            self.repository_authorizer(),
+            self.immutable_store().clone(),
+            self,
+        )
+        .await
     }
 
     async fn query(
@@ -63,14 +104,25 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
-        copy::handler(request, self.immutable_store().clone(), self).await
+        copy::handler(
+            request,
+            self.immutable_store().clone(),
+            self.repository_authorizer().clone(),
+            self,
+        )
+        .await
     }
 
     async fn verify(
         &self,
         request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
-        verify::handler(request, self.local_immutable_store().clone()).await
+        verify::handler(
+            request,
+            self.repository_authorizer(),
+            self.local_immutable_store().clone(),
+        )
+        .await
     }
 
     async fn mutable_load(
@@ -84,30 +136,23 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
-        mutable_store::handler(request, self.mutable_store().clone()).await
+        mutable_store::handler(
+            request,
+            self.repository_authorizer(),
+            self.mutable_store().clone(),
+        )
+        .await
     }
 
     async fn mutable_compare_and_swap(
         &self,
         request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
-        mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::storage::v1::storage_service_server::StorageServiceServer;
-
-    use crate::grpc::storage_service::LoreStorageService;
-
-    /// Compile-time check that `LoreStorageService` fully implements the generated
-    /// `StorageService` trait — wrapping it in `StorageServiceServer` requires the
-    /// trait bound to hold. Per-handler behavior is tested in each handler module.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreStorageService,
-    ) -> StorageServiceServer<LoreStorageService> {
-        StorageServiceServer::new(service)
+        mutable_compare_and_swap::handler(
+            request,
+            self.repository_authorizer(),
+            self.mutable_store().clone(),
+        )
+        .await
     }
 }

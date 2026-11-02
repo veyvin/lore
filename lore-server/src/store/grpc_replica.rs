@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
@@ -22,14 +23,15 @@ use lore_revision::util;
 use lore_revision::util::time::RetryPolicy;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
-use lore_storage::StoreMatch;
+use lore_storage::StoreGetData;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
 use lore_telemetry::observe::ObserveResult;
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 use mockall::automock;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -209,6 +211,7 @@ impl From<tonic::Status> for ReplicationClientError {
     }
 }
 
+#[lore_macro::test_pub]
 pub struct ReplicationClientImpl {
     client: ReplicationServiceClient<Channel>,
     buffer: usize,
@@ -219,14 +222,14 @@ pub struct ReplicationClientImpl {
     instruments: Arc<ReplicationClientInstruments>,
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 pub use MockReplicationClientImpl as ReplicationClient;
-#[cfg(not(test))]
+#[cfg(not(feature = "test-util"))]
 pub use ReplicationClientImpl as ReplicationClient;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 
-#[cfg_attr(test, automock)]
+#[cfg_attr(feature = "test-util", automock)]
 impl ReplicationClientImpl {
     pub fn new(
         client: ReplicationServiceClient<Channel>,
@@ -517,6 +520,16 @@ impl InstrumentProvider for ReplicationClientInstrumentProvider {
     }
 }
 
+/// Write-only replication over gRPC: it accepts `put` and `obliterate` and refuses every read.
+///
+/// Not in use, and outstanding work. `query`, `get_metadata` and `get` answer with
+/// `Store does not support operation`, so nothing that resolves an address can be backed by this
+/// store, and it is the one production [`ImmutableStore`] the conformance battery does not run
+/// against — a store that refuses to resolve fails the battery's first check for behaving as
+/// designed, so hooking it up needs the battery to gain a way to express "this store does not
+/// answer reads" and assert the refusal is uniform across all three. Until then this
+/// implementation is unverified against the contract the other stores are held to. Both belong in
+/// the change that brings this store back into use.
 pub struct GrpcReplica {
     client: ReplicationClient,
 }
@@ -529,30 +542,34 @@ impl GrpcReplica {
 
 #[async_trait]
 impl ImmutableStore for GrpcReplica {
-    async fn exist(
-        self: Arc<Self>,
-        _repository: Partition,
-        _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
     }
 
-    async fn exist_batch(
-        self: Arc<Self>,
-        _repository: Partition,
-        _addresses: &[Address],
-        _match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     async fn query(
         self: Arc<Self>,
+        _partition: Partition,
+        _addresses: &[Address],
+        _results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("Store does not support operation"))
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -560,8 +577,7 @@ impl ImmutableStore for GrpcReplica {
         self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-        _match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -626,8 +642,6 @@ impl ImmutableStore for GrpcReplica {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     fn max_query_batch(&self) -> Option<usize> {
         None
     }
@@ -639,299 +653,15 @@ impl ImmutableStore for GrpcReplica {
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use lore_base::types::Partition;
-    use lore_revision::fragment::generate_random;
-    use lore_storage::ImmutableStore;
-    use mockall::predicate::eq;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_put() -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = MockReplicationClientImpl::default();
-
-        let repository = rand::random::<Partition>();
-        let (fragment, address, payload) = generate_random();
-
-        client
-            .expect_put()
-            .with(
-                eq(repository),
-                eq(address),
-                eq(fragment),
-                eq(Some(payload.clone())),
-            )
-            .return_once(|_, _, _, _| Ok(()));
-
-        let store = GrpcReplica::new(client);
-
-        Arc::new(store)
-            .put(
-                repository,
-                address,
-                fragment,
-                Some(payload),
-                false, /* force */
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_put_fails_with_slowdown() -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = MockReplicationClientImpl::default();
-
-        let repository = rand::random::<Partition>();
-        let (fragment, address, payload) = generate_random();
-
-        client
-            .expect_put()
-            .with(
-                eq(repository),
-                eq(address),
-                eq(fragment),
-                eq(Some(payload.clone())),
-            )
-            .return_once(|_, _, _, _| Err(ReplicationClientError::SlowDown));
-
-        let store = GrpcReplica::new(client);
-
-        let err = Arc::new(store)
-            .put(
-                repository,
-                address,
-                fragment,
-                Some(payload),
-                false, /* force */
-            )
-            .await
-            .expect_err("should have failed");
-
-        assert!(matches!(err, StoreError::SlowDown(_)));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_put_fails_with_other_error() -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = MockReplicationClientImpl::default();
-
-        let repository = rand::random::<Partition>();
-        let (fragment, address, payload) = generate_random();
-
-        client
-            .expect_put()
-            .with(
-                eq(repository),
-                eq(address),
-                eq(fragment),
-                eq(Some(payload.clone())),
-            )
-            .return_once(|_, _, _, _| {
-                Err(ReplicationClientError::RequestFailed(
-                    tonic::Status::internal("Oh noes"),
-                ))
-            });
-
-        let store = GrpcReplica::new(client);
-
-        let err = Arc::new(store)
-            .put(
-                repository,
-                address,
-                fragment,
-                Some(payload),
-                false, /* force */
-            )
-            .await
-            .expect_err("should have failed");
-
-        assert!(matches!(err, StoreError::Internal(_)));
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod stream_error_tests {
-    use std::net::SocketAddr;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use lore_base::types::Partition;
-    use lore_proto::rpc::replication_service_server::ReplicationService as ReplicationServiceTrait;
-    use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
-    use lore_revision::fragment::generate_random;
-    use lore_revision::util;
-    use tokio_stream::Stream;
-    use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::Request;
-    use tonic::Response;
-    use tonic::Status;
-
-    use super::*;
-
-    /// A test gRPC server that responds normally for the first `n` requests
-    /// per stream, then sends an error status that closes the response stream.
-    struct ErrorAfterNService {
-        n: usize,
-    }
-
-    #[tonic::async_trait]
-    impl ReplicationServiceTrait for ErrorAfterNService {
-        type PutStream = Pin<Box<dyn Stream<Item = Result<PutResponse, Status>> + Send>>;
-
-        async fn put(
-            &self,
-            request: Request<Streaming<ReplicationPutRequest>>,
-        ) -> Result<Response<Self::PutStream>, Status> {
-            let n = self.n;
-            let mut stream = request.into_inner();
-            let (tx, rx) = mpsc::channel(100);
-
-            tokio::spawn(async move {
-                let mut count = 0;
-                while let Some(req) = stream.next().await {
-                    let Ok(req) = req else { break };
-                    count += 1;
-
-                    if count > n {
-                        let _ = tx
-                            .send(Err(Status::internal("test: intentional stream error")))
-                            .await;
-                        break;
-                    }
-
-                    // Delay so requests accumulate in the client's inflight map
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-
-                    let address = req.put_request.and_then(|p| p.address);
-                    let _ = tx.send(Ok(PutResponse { address })).await;
-                }
-            });
-
-            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-        }
-    }
-
-    /// Starts a test gRPC server on a random port and returns the port number.
-    async fn start_test_server(service: ErrorAfterNService) -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(ReplicationServiceServer::new(service))
-                .serve(addr)
-                .await
-                .unwrap();
-        });
-
-        // Allow the server to start listening
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        port
-    }
-
-    async fn connect_client(port: u16) -> ReplicationClientImpl {
-        let channel = tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{port}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-
-        ReplicationClientImpl::new(
-            ReplicationServiceClient::new(channel),
-            100, /* buffer */
-            util::time::RetryPolicy::builder()
-                .with_initial_backoff_millis(10)
-                .with_max_backoff_millis(100)
-                .with_limit(0)
-                .build(),
-        )
-    }
-
-    /// Verifies that in-flight requests resolve (don't hang) when the server
-    /// errors the response stream. The server responds to the first 3 requests
-    /// with a delay, then errors on request 4+. Because the client
-    /// sends all 20 concurrently, requests 5-20 are inflight
-    /// map when the error arrives.
-    #[tokio::test]
-    async fn test_inflight_requests_resolve_on_stream_error() {
-        let port = start_test_server(ErrorAfterNService { n: 3 }).await;
-        let client = Arc::new(connect_client(port).await);
-
-        let mut join_set = tokio::task::JoinSet::new();
-        for _ in 0..20 {
-            let client = client.clone();
-            join_set.spawn(async move {
-                let repository = rand::random::<Partition>();
-                let (fragment, address, payload) = generate_random();
-                client
-                    .put(repository, address, fragment, Some(payload))
-                    .await
-            });
-        }
-
-        // All 20 puts must resolve
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(_result) = join_set.join_next().await {}
-        })
-        .await;
-
-        assert!(result.is_ok(), "Timed out — inflight requests are hanging");
-    }
-
-    /// Verifies that the client recovers after a stream error: the first
-    /// puts succeed, then the stream errors, and a subsequent put succeeds
-    /// after the client reconnects on a new stream.
-    #[tokio::test]
-    async fn test_client_recovers_after_stream_error() {
-        let port = start_test_server(ErrorAfterNService { n: 3 }).await;
-        let client = connect_client(port).await;
-
-        assert_eq!(client.current_epoch.load(Ordering::SeqCst), 0);
-
-        // Send 3 sequential puts — these all succeed on the first stream
-        for _ in 0..3 {
-            let repository = rand::random::<Partition>();
-            let (fragment, address, payload) = generate_random();
-            client
-                .put(repository, address, fragment, Some(payload))
-                .await
-                .expect("put should succeed within server's limit");
-        }
-
-        // First stream was created during put 1
-        assert_eq!(client.current_epoch.load(Ordering::SeqCst), 1);
-
-        // 4th put triggers stream error;
-        let repository = rand::random::<Partition>();
-        let (fragment, address, payload) = generate_random();
-        client
-            .put(repository, address, fragment, Some(payload.clone()))
-            .await
-            .expect_err("4th should cause error");
-
-        // 5th put creates a new stream (epoch 2) and succeeds
-        client
-            .put(repository, address, fragment, Some(payload.clone()))
-            .await
-            .expect("5th request should work");
-
-        assert_eq!(client.current_epoch.load(Ordering::SeqCst), 2);
+    async fn copy(
+        self: Arc<Self>,
+        _source_partition: Partition,
+        _source_address: Address,
+        _destination_partition: Partition,
+        _destination_context: Context,
+        _behavior: CopyBehavior,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("copy not supported on grpc replica"))
     }
 }

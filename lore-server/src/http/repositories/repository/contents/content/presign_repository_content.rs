@@ -9,7 +9,9 @@ use axum::Extension;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use hex::FromHexError;
@@ -17,6 +19,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_revision::lore::RepositoryId;
 use lore_storage::StoreMatch;
+use lore_storage::immutable_store::query_one;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
@@ -24,6 +27,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt_axum_middleware::http_permits;
+use crate::authnz::repository_authorizer::Action;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -40,6 +45,12 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
+    #[error("Presign not permitted on this repository")]
+    NotPermitted,
+    #[error("content_type is not allowed: {0}")]
+    DisallowedContentType(String),
+    #[error("header value is not valid: {0}")]
+    InvalidHeaderValue(String),
     #[error("Content not found")]
     NotFound,
     #[error("Store error checking content existence")]
@@ -51,12 +62,17 @@ pub enum PresignError {
 impl IntoResponse for PresignError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match &self {
-            PresignError::ParseRepository(_) | PresignError::ParseAddress(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            PresignError::ParseRepository(_)
+            | PresignError::ParseAddress(_)
+            | PresignError::DisallowedContentType(_)
+            | PresignError::InvalidHeaderValue(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
+            ),
+            PresignError::NotPermitted => (
+                StatusCode::FORBIDDEN,
+                "presign not permitted on this repository".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,6 +107,7 @@ pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    extensions: Extensions,
     headers: HeaderMap,
     Json(body): Json<PresignRequest>,
 ) -> Result<impl IntoResponse, PresignError> {
@@ -103,9 +120,45 @@ pub async fn handler(
     let repository = repository_id
         .parse::<RepositoryId>()
         .map_err(PresignError::ParseRepository)?;
+    if !http_permits(
+        state.repository_authorizer.as_ref(),
+        &extensions,
+        repository,
+        Action::Presign,
+    )
+    .await
+    {
+        return Err(PresignError::NotPermitted);
+    }
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;
+
+    // Fast-feedback rejection; redeem also enforces the allowlist for
+    // already issued tokens.
+    if let Some(content_type) = body.content_type.as_deref()
+        && !presign_config
+            .content_type_allowlist
+            .is_allowed(content_type)
+    {
+        return Err(PresignError::DisallowedContentType(
+            content_type.to_string(),
+        ));
+    }
+
+    // Reject values redeem could not serialize into a response header, so a
+    // token mint accepts is always one redeem can serve.
+    for value in [
+        &body.content_type,
+        &body.content_encoding,
+        &body.content_disposition,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        HeaderValue::from_str(value)
+            .map_err(|_err| PresignError::InvalidHeaderValue(value.clone()))?;
+    }
 
     let correlation_id = headers
         .get(CORRELATION_ID_HEADER)
@@ -122,16 +175,14 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // Verify the address exists before issuing a URL for it.
-            let match_result = immutable_store
-                .clone()
-                .exist(repository, parsed_address, StoreMatch::MatchFull)
+            let match_result = query_one(&immutable_store, repository, parsed_address)
                 .await
                 .map_err(|e| {
-                    warn!(%e, "Presign exist check failed");
+                    warn!(%e, "Presign resolve check failed");
                     PresignError::StoreError
                 })?;
 
-            if match_result == StoreMatch::MatchNone {
+            if match_result.match_made != StoreMatch::MatchFull {
                 return Err(PresignError::NotFound);
             }
 
@@ -174,63 +225,4 @@ pub async fn handler(
             ))
         })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::http::StatusCode;
-    use axum_test::TestServer;
-    use lore_base::runtime::LORE_CONTEXT;
-    use rand::random;
-    use serde_json::json;
-
-    use crate::http::server::LoreHttpServerSettings;
-    use crate::http::server::PresignConfig;
-    use crate::http::server::ServerHealth;
-    use crate::http::server::ServerState;
-    use crate::http::server::create_router;
-    use crate::store::test_store_create;
-
-    fn test_presign_config() -> PresignConfig {
-        let key_bytes = [0u8; 32];
-        PresignConfig {
-            hmac_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
-            key_id: "test_key_id_1234".to_string(),
-            min_ttl_seconds: 1,
-            default_ttl_seconds: 3600,
-            max_ttl_seconds: 86400,
-        }
-    }
-
-    #[tokio::test]
-    async fn returns_404_when_address_not_found() {
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let repository = random::<lore_revision::lore::RepositoryId>();
-                let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
-
-                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-                let state = ServerState {
-                    immutable_store,
-                    mutable_store,
-                    jwt_verifier: None,
-                    max_file_size: 100,
-                    presign_config: Some(test_presign_config()),
-                };
-                let repo_hex = format!("{repository}");
-                let settings = LoreHttpServerSettings::default();
-                let app = create_router(state, test_health, &settings);
-                let server = TestServer::new(app).unwrap();
-
-                let response = server
-                    .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
-                    .json(&json!({"ttl_seconds": 3600}))
-                    .await;
-
-                assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
-            })
-            .await;
-    }
 }

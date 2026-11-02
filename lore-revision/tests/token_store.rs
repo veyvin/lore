@@ -4,8 +4,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::OnceLock;
 
-    use keyring::mock;
-    use keyring::set_default_credential_builder;
+    use lore_base::env::CallEnvironment;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_credential::token_store;
@@ -13,10 +12,20 @@ mod tests {
     use lore_credential::token_store::vulnerable_all_tokens;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::relay::EventDispatcher;
 
     include!("helper.rs");
 
     const AUTH_ENDPOINT: &str = "http://storeload.auth.example.com";
+
+    /// `AUTH_ENDPOINT` behind an implementation that refuses every grant, so an
+    /// exchange that misses the cache and the store fails before any network call.
+    fn refusing_endpoint() -> lore_transport::auth::AuthEndpoint {
+        lore_transport::auth::AuthEndpoint::new(
+            AUTH_ENDPOINT.to_string(),
+            lore_transport::auth::AuthEndpoint::none().auth,
+        )
+    }
     static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     async fn sequential_mutex_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -31,7 +40,9 @@ mod tests {
         unsafe {
             std::env::set_var("LORE_AUTH_PATH", auth_dir.display().to_string());
         }
-        set_default_credential_builder(mock::default_credential_builder());
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().expect("Failed to create mock store"),
+        );
         let (_immutable_store, _mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let _repository_id = RepositoryId::default();
@@ -173,20 +184,26 @@ mod tests {
                     .await
                     .expect("Failed to store first token");
 
-                let token =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect("Failed to load token after store same identity");
+                let token = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token after store same identity");
                 assert_eq!(token.as_str(), replaced_token);
 
                 token_store::remove_user_token(AUTH_ENDPOINT, identity)
                     .await
                     .expect("Failed to remove token");
 
-                let _ =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect_err("Removed token still available");
+                let _ = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect_err("Removed token still available");
             }))
             .await
             .expect("Task failure");
@@ -212,13 +229,16 @@ mod tests {
                     .await
                     .expect("Failed to store 'other_identity' token");
 
-                let found_token =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect("Failed to load token after store other identity");
+                let found_token = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token after store other identity");
                 assert_eq!(found_token.as_str(), token);
 
-                let found_token = token_store::load_user_token(
+                let found_token = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     other_identity,
                     vulnerable_all_tokens(),
@@ -234,14 +254,15 @@ mod tests {
                     .await
                     .expect("Failed to remove 'other_identity' token");
 
-                let _ =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect_err(
-                            format!("Removed token is still available for {identity}").as_str(),
-                        );
+                let _ = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect_err(format!("Removed token is still available for {identity}").as_str());
 
-                let _ = token_store::load_user_token(
+                let _ = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     other_identity,
                     vulnerable_all_tokens(),
@@ -250,6 +271,69 @@ mod tests {
                 .expect_err(
                     format!("Removed token is still available for {other_identity}").as_str(),
                 );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// Entries are keyed by the endpoint that issued them, so a user who logs
+    /// in on the gRPC path, then on the OIDC path, and then switches back
+    /// finds the first credentials intact and need not log in a third time.
+    #[tokio::test]
+    async fn a_token_from_one_endpoint_survives_a_login_at_another() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                const OIDC_ISSUER: &str = "https://issuer.storeload.example.com";
+                let identity = "identity0";
+                let grpc_token = "grpc-token";
+                let oidc_token = "oidc-token";
+                let _ = token_store::remove_user_token(OIDC_ISSUER, identity).await;
+
+                token_store::store_user_token(AUTH_ENDPOINT, identity, grpc_token, vec![])
+                    .await
+                    .expect("Failed to store the gRPC token");
+                token_store::store_user_token(OIDC_ISSUER, identity, oidc_token, vec![])
+                    .await
+                    .expect("Failed to store the OIDC token");
+
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The gRPC token must still load");
+                assert_eq!(found.as_str(), grpc_token);
+
+                let found = token_store::load_user_token_from_store(
+                    OIDC_ISSUER,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The OIDC token must load");
+                assert_eq!(found.as_str(), oidc_token);
+
+                token_store::remove_user_token(OIDC_ISSUER, identity)
+                    .await
+                    .expect("Failed to remove the OIDC token");
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Removing the OIDC token must leave the gRPC token");
+                assert_eq!(found.as_str(), grpc_token);
+
+                token_store::remove_user_token(AUTH_ENDPOINT, identity)
+                    .await
+                    .expect("Failed to remove the gRPC token");
             }))
             .await
             .expect("Task failure");
@@ -281,7 +365,7 @@ mod tests {
                 .expect("Failed to store token");
 
                 // prove we do not get the token for a wrong audience
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud1".into()),
@@ -292,7 +376,7 @@ mod tests {
 
                 // get token by its audience
                 for domain in audiences {
-                    token_store::load_user_token(
+                    token_store::load_user_token_from_store(
                         AUTH_ENDPOINT,
                         identity,
                         tokens_only_for_recipient_domain(domain.clone()),
@@ -302,7 +386,7 @@ mod tests {
                 }
 
                 //get token by its issuing endpoint
-                token_store::load_user_token(
+                token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("storeload.auth.example.com".to_string()),
@@ -336,7 +420,7 @@ mod tests {
                 .expect("Failed to store token");
 
                 // prove we do not get the token for a wrong audience
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud1".into()),
@@ -345,7 +429,7 @@ mod tests {
                 .unwrap_err();
                 assert!(load_error.is_token_not_found());
 
-                token_store::load_user_token(
+                token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("lore.example.com".to_string()),
@@ -382,9 +466,13 @@ mod tests {
                 .await
                 .expect("Failed to store token");
 
-                token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                    .await
-                    .expect("Failed to load token");
+                token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token");
             }))
             .await
             .expect("Task failure");
@@ -407,7 +495,7 @@ mod tests {
                     .expect("Failed to store first token");
 
                 // prove the token gets updated by first trying to load it filtering for 'aud2'
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud2".into()),
@@ -422,7 +510,7 @@ mod tests {
                     .expect("Failed to store second token");
 
                 // token can now be loaded
-                let loaded_token = token_store::load_user_token(
+                let loaded_token = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud2".into()),
@@ -431,6 +519,241 @@ mod tests {
                 .expect("Failed to load token after store same identity");
                 assert_eq!(loaded_token.as_str(), token);
             }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// A JWT naming "alice", unexpired (`exp` 2000000000).
+    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+    const SUPPLIED_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+    /// An access token with no identity token beside it must not fall back to
+    /// the store: the caller is working from tokens they supplied, and the
+    /// stored identities came from a login this call is not using. Proven
+    /// against a store that does hold a token for the identity, so a regression
+    /// to the fallback is visible here.
+    #[tokio::test]
+    async fn access_token_alone_does_not_fall_back_to_the_store() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let identity = "supplied-credentials-identity";
+
+                token_store::store_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    "stored-token",
+                    vec!["example.com".into()],
+                )
+                .await
+                .expect("Failed to store token");
+
+                // Nothing supplied: the stored token answers, so the fixture is real.
+                let stored = token_store::load_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    tokens_only_for_recipient_domain("example.com".into()),
+                    "",
+                    "",
+                )
+                .await
+                .expect("the stored token is found when nothing is supplied");
+                assert_eq!(stored, "stored-token");
+
+                // An access token supplied instead: the same lookup refuses.
+                let refused = token_store::load_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    tokens_only_for_recipient_domain("example.com".into()),
+                    "",
+                    "access-token",
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    refused.is_token_not_found(),
+                    "an access token must not fall back to the stored identity"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// When called with an externally supplied `identity_token` or access token,
+    /// the on-disk token store is bypassed for both reads and writes. We do not
+    /// want to store authz exchange results for supplied identity tokens, and
+    /// do not want to read on-disk authz tokens for externally supplied tokens,
+    /// since the stored tokens have all originated from other login mechanisms.
+    /// We do not want to mix externally provided tokens with internal login
+    /// results.
+    ///
+    /// The endpoint's implementation refuses every grant, so the exchange the
+    /// supplied call falls through to fails before any network call.
+    #[tokio::test]
+    async fn a_supplied_identity_token_bypasses_the_stored_authorization_token() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let identity = "supplied-authz-identity";
+                let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+                    .parse()
+                    .expect("a valid repository id");
+
+                // An authorization token in the store, keyed as `exchange` keys them.
+                let store_key = format!("{AUTH_ENDPOINT}/{repository}");
+                token_store::store_user_token(
+                    &store_key,
+                    identity,
+                    SUPPLIED_JWT,
+                    vec!["example.com".into()],
+                )
+                .await
+                .expect("Failed to store authorization token");
+
+                // Nothing supplied: the stored authorization token answers.
+                let stored = lore_transport::auth::exchange::exchange(
+                    &refusing_endpoint(),
+                    identity,
+                    repository,
+                    "example.com".to_string(),
+                    "",
+                    "",
+                )
+                .await
+                .expect("the stored authorization token is used");
+                assert_eq!(stored, SUPPLIED_JWT);
+
+                // An identity token supplied: neither the store nor the entry the
+                // call above cached answers, so this goes on to exchange and
+                // is refused by the endpoint's implementation.
+                let result = lore_transport::auth::exchange::exchange(
+                    &refusing_endpoint(),
+                    identity,
+                    repository,
+                    "example.com".to_string(),
+                    SUPPLIED_JWT,
+                    "",
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "a supplied identity token must not be served a stored authorization token"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// The context of a call relayed from a process whose token store is `auth_dir`.
+    fn relayed_from(auth_dir: &TempDir) -> Arc<ExecutionContext> {
+        Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [None, Some(auth_dir.display().to_string())],
+                }),
+        )
+    }
+
+    /// A call relayed from another process reads the token store its caller names, so one
+    /// process caches each store apart: an identity stored through one caller's store is not
+    /// served to a caller naming another.
+    #[tokio::test]
+    async fn a_relayed_call_reads_only_its_callers_token_store() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(AUTH_ENDPOINT, "first", "token", vec![])
+                            .await
+                            .expect("Failed to store token");
+                        assert_eq!(
+                            token_store::load_identities(AUTH_ENDPOINT)
+                                .await
+                                .expect("Failed to get identities"),
+                            ["first"]
+                        );
+                    })
+                    .await;
+                let identities = LORE_CONTEXT
+                    .scope(second, token_store::load_identities(AUTH_ENDPOINT))
+                    .await
+                    .expect("Failed to get identities");
+                assert!(
+                    identities.is_empty(),
+                    "a caller naming another store must not be served this one's identities"
+                );
+            })
+            .await
+            .expect("Task failure");
+    }
+
+    /// An authorization one caller's token store earned is cached for that store alone: a caller
+    /// naming a store that holds nothing for the identity is not served it.
+    ///
+    /// The endpoint's implementation refuses every grant, so a call that misses the cache and
+    /// the store fails before any network call.
+    #[tokio::test]
+    async fn a_relayed_call_is_served_only_its_callers_authorization() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+        let identity = "relayed-authz-identity";
+        let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id");
+        let exchange = move || async move {
+            lore_transport::auth::exchange::exchange(
+                &refusing_endpoint(),
+                identity,
+                repository,
+                "example.com".to_string(),
+                "",
+                "",
+            )
+            .await
+        };
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(
+                            &format!("{AUTH_ENDPOINT}/{repository}"),
+                            identity,
+                            SUPPLIED_JWT,
+                            vec!["example.com".into()],
+                        )
+                        .await
+                        .expect("Failed to store authorization token");
+                        assert_eq!(
+                            exchange().await.expect("the stored authorization is used"),
+                            SUPPLIED_JWT
+                        );
+                    })
+                    .await;
+                assert!(
+                    LORE_CONTEXT.scope(second, exchange()).await.is_err(),
+                    "a caller naming another store must not be served this one's authorization"
+                );
+            })
             .await
             .expect("Task failure");
     }

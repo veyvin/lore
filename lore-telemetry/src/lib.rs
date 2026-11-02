@@ -85,6 +85,20 @@ pub trait InstrumentProvider {
         self.meter()
             .u64_histogram(self.scope_name(name))
             .with_unit("bytes")
+            .with_boundaries(vec![
+                64.,      // 64 B
+                256.,     // 256 B
+                512.,     // 512 B
+                1_024.,   // 1 KiB
+                2_048.,   // 2 KiB
+                4_096.,   // 4 KiB
+                8_192.,   // 8 KiB
+                16_384.,  // 16 KiB
+                32_768.,  // 32 KiB
+                65_536.,  // 64 KiB
+                131_072., // 128 KiB
+                262_144., // 256 KiB - Fragment Size
+            ])
             .build()
     }
 
@@ -134,51 +148,5 @@ pub trait InstrumentProvider {
         tail[0] = create_operation_context_attribute(context);
 
         Ok(required)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::LazyLock;
-
-    use opentelemetry::KeyValue;
-
-    use super::*;
-
-    // Test for InstrumentProvider trait
-    static TEST_PROVIDER_ATTRIBUTES: LazyLock<[KeyValue; 2]> = LazyLock::new(|| {
-        [
-            KeyValue::new("key1".to_string(), "value1".to_string()),
-            KeyValue::new("key2".to_string(), "value2".to_string()),
-        ]
-    });
-
-    struct TestProvider {}
-    impl InstrumentProvider for TestProvider {
-        fn namespace(&self) -> &'static str {
-            "test-namespace"
-        }
-
-        fn labels(&self) -> &[KeyValue] {
-            TEST_PROVIDER_ATTRIBUTES.as_slice()
-        }
-    }
-
-    #[test]
-    fn can_concatenate_context_label() {
-        let test_provider = TestProvider {};
-
-        let all_labels = test_provider.get_labels_for_operation_context("my-test-context");
-        assert_eq!(all_labels.len(), 3);
-        assert_eq!(all_labels[0].key.as_str(), "key1");
-        assert_eq!(all_labels[0].value.as_str(), "value1");
-        assert_eq!(all_labels[1].key.as_str(), "key2");
-        assert_eq!(all_labels[1].value.as_str(), "value2");
-
-        assert_eq!(
-            all_labels[2].key.as_str(),
-            METRICS_OPERATION_CONTEXT_ATTRIBUTE_NAME
-        );
-        assert_eq!(all_labels[2].value.as_str(), "my-test-context");
     }
 }

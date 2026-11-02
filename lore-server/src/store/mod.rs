@@ -22,13 +22,8 @@ pub use configuration::empty_plugin_config;
 pub use configuration::has_plugin_config;
 pub use configuration::resolve_plugin_config;
 pub use configuration::resolve_plugin_config_with_fallback;
-#[cfg(test)]
-use lore_revision::runtime::execution_context;
+use lore_base::lore_spawn;
 use lore_storage::ImmutableStore;
-#[cfg(test)]
-use lore_storage::StoreError;
-#[cfg(test)]
-use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Gauge;
@@ -113,7 +108,7 @@ pub async fn memory_stats_reporter(store: Weak<dyn ImmutableStore>, interval: Op
 pub fn spawn_immutable_store_availability_monitor(health: Arc<ServerHealth>) {
     let instruments = STORE_INSTRUMENTS.get_or_init(Default::default);
     if let Some((interval, timeout)) = health.interval_timeout {
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             // Check if the store is in good condition every given interval
             loop {
                 tokio::time::sleep(interval.max(Duration::from_secs(10))).await;
@@ -131,37 +126,4 @@ pub fn spawn_immutable_store_availability_monitor(health: Arc<ServerHealth>) {
             }
         });
     }
-}
-
-#[cfg(test)]
-pub async fn test_store_create() -> Result<
-    (
-        Arc<dyn ImmutableStore>,
-        Arc<dyn lore_storage::MutableStore>,
-        Arc<lore_revision::interface::ExecutionContext>,
-    ),
-    StoreError,
-> {
-    let execution = crate::util::setup_execution("test", String::default(), String::default());
-
-    lore_base::runtime::LORE_CONTEXT
-        .scope(execution, async move {
-            let immutable = lore_storage::local::immutable_store::create(
-                None::<&str>, /* No on disk path, in-memory only */
-                /* No max capacity, eviction, max size, or compaction */
-                ImmutableStoreCreateOptions::none(),
-                false, /* Do not deserialize buckets */
-                lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
-            )
-            .await?;
-            let mutable: Arc<dyn lore_storage::MutableStore> =
-                lore_storage::local::mutable_store::create(
-                    None::<&str>, /* No on disk path, in-memory only */
-                    lore_storage::MutableStoreSettings::default(),
-                    immutable.clone(),
-                )
-                .await?;
-            Ok((immutable, mutable, execution_context()))
-        })
-        .await
 }

@@ -6,8 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
-use bytes::Bytes;
-use bytes::BytesMut;
+use lore_base::allocator::HeapBox;
+use lore_base::allocator::HeapBuf;
+use lore_base::allocator::node_block_allocator;
 use lore_error_set::prelude::*;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
@@ -19,8 +20,6 @@ use zerocopy::IntoBytes;
 
 use crate::bitflagsops;
 use crate::change;
-use crate::change::FileAction;
-use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidNodeHierarchy;
 use crate::errors::Oversized;
@@ -28,6 +27,9 @@ use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
+use crate::interface::LoreNodeStagedAction;
+use crate::interface::LoreNodeType;
+use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -35,8 +37,10 @@ use crate::lore::RepositoryId;
 use crate::lore::ZeroHeapAlloc;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
 
@@ -79,6 +83,10 @@ const NODE_INDEX_MASK: u32 = (1u32 << BLOCK_NODE_SHIFT) - 1;
 /// block from consuming unbounded memory, and bounds the allocation on
 /// deserialize.
 pub const NODE_NAME_MAX_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum byte length of a single node name, matching the bound branch and
+/// repository names use. Enforced when a name is stored, not when one is read,
+/// so a tree written before the bound existed stays readable.
+pub const MAX_NODE_NAME_LEN: usize = 1000;
 
 bitflags! {
     #[repr(transparent)]
@@ -97,6 +105,21 @@ bitflags! {
     }
 }
 bitflagsops!(NodeBlockFlags, u32);
+
+/// The [`NodeBlockFlags`] bits that are never stored.
+///
+/// The state they described belongs to this process, not to the block, so it is
+/// held as plain fields on [`NodeBlockRuntimeData`] instead. Nothing writes
+/// these bits any more; they stay declared so their values are not given a
+/// stored meaning by a later change, and so a block from a store written before
+/// the split can be cleared of them on the way in.
+///
+/// Keeping them out of [`NodeBlockData`] is what lets `State::serialize` write a
+/// block straight from its lock: with nothing to clear first, it no longer has
+/// to copy the block out to produce the image.
+pub const NODE_BLOCK_RUNTIME_FLAGS: u32 = NodeBlockFlags::Dirty.bits()
+    | NodeBlockFlags::FirstUnusedNode.bits()
+    | NodeBlockFlags::UpgradeGeneratedNametable.bits();
 
 bitflags! {
     #[repr(transparent)]
@@ -189,6 +212,16 @@ bitflagsops!(NodeFlags, u16);
 impl NodeFlags {
     pub fn is_directory(&self) -> bool {
         !(self.contains(NodeFlags::File) || self.contains(NodeFlags::Link))
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        if self.contains(NodeFlags::File) {
+            LoreNodeType::File
+        } else if self.contains(NodeFlags::Link) {
+            LoreNodeType::Link
+        } else {
+            LoreNodeType::Directory
+        }
     }
 }
 
@@ -339,6 +372,31 @@ impl Node {
         (self.flags & NodeFlags::Staged) == NodeFlags::Staged.bits()
     }
 
+    /// The staged change this node carries, as the API surface names it.
+    ///
+    /// Reports [`LoreNodeStagedAction::None`] for a node with no staging bits,
+    /// which is every node of a freshly loaded revision — commit clears the
+    /// change flags on what it writes. Delete is tested before add so a node
+    /// staged for addition and then staged for deletion reports the deletion.
+    pub fn staged_action(&self) -> LoreNodeStagedAction {
+        if !self.is_staged() {
+            return LoreNodeStagedAction::None;
+        }
+        if self.is_staged_delete() {
+            LoreNodeStagedAction::Delete
+        } else if self.is_staged_add() {
+            LoreNodeStagedAction::Add
+        } else if self.is_staged_move() {
+            LoreNodeStagedAction::Move
+        } else if self.is_staged_copy() {
+            LoreNodeStagedAction::Copy
+        } else if self.is_staged_modify() {
+            LoreNodeStagedAction::Modify
+        } else {
+            LoreNodeStagedAction::None
+        }
+    }
+
     /// Check if node is staged for deletion
     pub fn is_staged_delete(&self) -> bool {
         (self.flags & NodeFlags::StagedDelete) == NodeFlags::StagedDelete.bits()
@@ -407,6 +465,10 @@ impl Node {
     /// Check if the node is a directory
     pub fn is_directory(&self) -> bool {
         !self.is_file() && !self.is_link()
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        NodeFlags::from_bits_retain(self.flags).node_type()
     }
 
     /// Check if node is marked as discarded
@@ -667,96 +729,6 @@ impl SiblingCycleGuard {
     }
 }
 
-#[cfg(test)]
-mod cycle_tests {
-    use super::*;
-
-    #[test]
-    fn clean_chain_passes() {
-        let mut guard = SiblingCycleGuard::new(1);
-        for id in 2..1000 {
-            guard.observe(id).expect("clean chain should not trip");
-        }
-    }
-
-    #[test]
-    fn self_loop_at_head_detected() {
-        // A.sibling = A, walked as A, A, A, ...
-        let mut guard = SiblingCycleGuard::new(1);
-        guard.observe(42).unwrap();
-        guard.observe(42).unwrap();
-        let err = guard.observe(42).expect_err("self loop must trip");
-        assert_eq!(err.node, 42);
-        assert_eq!(err.expected_parent, 1);
-        assert_eq!(err.actual_parent, 42);
-    }
-
-    #[test]
-    fn two_cycle_detected() {
-        // A -> B -> A -> B -> ...
-        let mut guard = SiblingCycleGuard::new(1);
-        guard.observe(10).unwrap();
-        guard.observe(20).unwrap();
-        guard.observe(10).unwrap();
-        guard.observe(20).expect_err("two-cycle must trip");
-    }
-
-    #[test]
-    fn three_cycle_detected() {
-        // A -> B -> C -> A -> B -> C -> A ...
-        let chain = [10u32, 20, 30, 10, 20, 30, 10];
-        let mut guard = SiblingCycleGuard::new(1);
-        let mut tripped_at = None;
-        for (i, id) in chain.iter().enumerate() {
-            if guard.observe(*id).is_err() {
-                tripped_at = Some(i);
-                break;
-            }
-        }
-        let i = tripped_at.expect("three-cycle must trip");
-        assert!(i <= 6, "expected detection within 7 steps, got step {i}");
-    }
-
-    #[test]
-    fn mid_chain_cycle_detected() {
-        // A -> B -> C -> D -> E -> F -> G -> D -> E -> F -> G -> D ...
-        let mut chain = vec![10u32, 20, 30, 40, 50, 60, 70];
-        for _ in 0..20 {
-            chain.extend_from_slice(&[40, 50, 60, 70]);
-        }
-        let mut guard = SiblingCycleGuard::new(1);
-        let mut tripped = false;
-        for id in &chain {
-            if guard.observe(*id).is_err() {
-                tripped = true;
-                break;
-            }
-        }
-        assert!(tripped, "mid-chain cycle must trip");
-    }
-
-    #[test]
-    fn worst_case_bound_holds_for_small_cycles() {
-        // For chain length N ≤ 2^k, detection step ≤ 3N.
-        // Try several cycle sizes and verify the bound.
-        for cycle_len in [1u32, 2, 3, 5, 8, 10, 13, 64, 256] {
-            let mut guard = SiblingCycleGuard::new(1);
-            let mut steps = 0u32;
-            loop {
-                let id = 100 + (steps % cycle_len);
-                steps += 1;
-                if guard.observe(id).is_err() {
-                    break;
-                }
-                assert!(
-                    steps < 3 * cycle_len.max(1) + 10,
-                    "cycle_len={cycle_len} took {steps} steps, exceeds bound",
-                );
-            }
-        }
-    }
-}
-
 /// Block format version identifiers
 #[repr(u32)]
 pub enum NodeBlockFormat {
@@ -766,6 +738,19 @@ pub enum NodeBlockFormat {
     Nametable = 1,
     /// No timestamp
     NoTimestamp = 2,
+}
+
+/// Route a block payload's heap allocations to the revision tree's own heap
+/// rather than the general one, for the reasons in
+/// [`lore_base::allocator::node_block_allocator`].
+macro_rules! block_payload_on_tree_heap {
+    ($type:ty $(, $trait:ident)+) => {
+        $(impl $trait for $type {
+            fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+                lore_base::allocator::node_block_allocator()
+            }
+        })+
+    };
 }
 
 /// A block of nodes, 49280 bytes - 128 byte metadata, 512 nodes (96 bytes each)
@@ -795,8 +780,7 @@ pub struct NodeBlockData {
 }
 
 impl ReadBoxFromImmutable for NodeBlockData {}
-impl ZeroHeapAlloc for NodeBlockData {}
-impl CloneHeapAlloc for NodeBlockData {}
+block_payload_on_tree_heap!(NodeBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// A block of nodes, 45184 bytes - 128 byte metadata, 512 nodes (96 bytes each)
 #[repr(C)]
@@ -825,8 +809,7 @@ pub struct NodeBlockDataV2 {
 }
 
 impl ReadBoxFromImmutable for NodeBlockDataV2 {}
-impl ZeroHeapAlloc for NodeBlockDataV2 {}
-impl CloneHeapAlloc for NodeBlockDataV2 {}
+block_payload_on_tree_heap!(NodeBlockDataV2, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// Limit of inline name string in data format version 0
 pub const NODE_NAME_LIMIT: usize = 43;
@@ -853,8 +836,7 @@ pub struct NodeBlockDataV0 {
 }
 
 impl ReadBoxFromImmutable for NodeBlockDataV0 {}
-impl ZeroHeapAlloc for NodeBlockDataV0 {}
-impl CloneHeapAlloc for NodeBlockDataV0 {}
+block_payload_on_tree_heap!(NodeBlockDataV0, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// A node in the revision tree, 128 bytes (32 bit index, max 4G nodes)
 #[repr(C)]
@@ -1025,8 +1007,14 @@ impl NodeV0 {
 }
 
 struct NodeBlockRuntimeData {
-    data: Box<NodeBlockData>,
-    name: BytesMut,
+    data: HeapBox<NodeBlockData>,
+    name: HeapBuf,
+    /// The block holds edits that are not in the store yet. See
+    /// [`NODE_BLOCK_RUNTIME_FLAGS`] for why this is not a stored flag.
+    dirty: bool,
+    /// The block's first node has been discarded, which serialization uses to
+    /// link the block into the tree's unused list.
+    first_unused_node: bool,
 }
 
 /// Internally mutable wrapper around a block of nodes
@@ -1048,18 +1036,74 @@ pub struct NodeBlockWriter<'a> {
     lock: RwLockWriteGuard<'a, NodeBlockRuntimeData>,
 }
 
+/// Read accessor for a node block that borrows nothing and can be held across
+/// an await, so a block can be written to the store straight from its lock.
+///
+/// `parking_lot`'s guards are `!Send` precisely so that holding one across an
+/// await fails to compile, which is what we want everywhere but here. Releasing
+/// one of its locks from a thread other than the one that took it is sound -
+/// its `send_guard` feature is exactly this - but that feature would lift the
+/// restriction for the whole workspace, so this does it for one guard instead.
+pub struct NodeBlockOwnedReader {
+    lock: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
+}
+
+// SAFETY: see the type documentation. The one parking_lot configuration where
+// releasing a lock from another thread is not sound is `deadlock_detection`,
+// which the workspace does not enable.
+unsafe impl Send for NodeBlockOwnedReader {}
+
+impl NodeBlockOwnedReader {
+    /// The block exactly as it is to be stored.
+    pub fn node_block(&self) -> &NodeBlockData {
+        &self.lock.data
+    }
+
+    /// The name table exactly as it is to be stored.
+    pub fn name_table(&self) -> &[u8] {
+        &self.lock.name
+    }
+}
+
 #[error_set]
 pub enum NodeNameError {
     InvalidArguments,
     Oversized,
 }
 
+/// The content rules a name is held to on both the read and the write path: no traversal, no
+/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
     if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
         }
         .into());
+    }
+    if is_reserved_node_name(name) {
+        return Err(InvalidArguments {
+            reason: format!("reserved node name: {name}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Check `name` against every rule [`NodeBlockWriter::node_name_store`] enforces:
+/// the content rules the read path also applies, plus the [`MAX_NODE_NAME_LEN`]
+/// bound that only writers are held to.
+///
+/// Exposed so a caller writing several nodes can reject a bad name up front
+/// instead of discovering it part-way through and leaving the rest applied.
+pub fn validate_node_name_for_store(name: &str) -> Result<(), NodeNameError> {
+    validate_node_name(name)?;
+    if name.len() > MAX_NODE_NAME_LEN {
+        return Err(NodeNameError::from(Oversized {
+            context: format!(
+                "node name is {} bytes, exceeds MAX_NODE_NAME_LEN {MAX_NODE_NAME_LEN}",
+                name.len()
+            ),
+        }));
     }
     Ok(())
 }
@@ -1113,33 +1157,52 @@ impl std::fmt::Display for NodeNameLock {
 // name table buffer. The guard keeps the data alive and prevents writers. The raw
 // pointer is !Send by default, but moving NodeNameLock between threads is safe because
 // the ArcRwLockReadGuard owns an Arc reference to the block, ensuring the pointed-to
-// data remains valid. The !Sync BytesMut is only read through the pointer, never
+// data remains valid. The name table is only read through the pointer, never
 // modified, dropped, or cloned.
 unsafe impl Send for NodeNameLock {}
 
 impl NodeBlock {
-    pub fn new(data: Box<NodeBlockData>) -> Self {
+    pub fn new(mut data: HeapBox<NodeBlockData>) -> Self {
+        Self::clear_runtime_flags(&mut data);
         NodeBlock {
             data: Arc::new(RwLock::new(NodeBlockRuntimeData {
                 data,
-                name: BytesMut::new(),
+                name: HeapBuf::new_in(node_block_allocator()),
+                dirty: false,
+                first_unused_node: false,
             })),
             name_deserialized: AtomicBool::new(false),
         }
     }
 
-    pub fn new_with_name(data: Box<NodeBlockData>, name: BytesMut) -> Self {
+    pub fn new_with_name(mut data: HeapBox<NodeBlockData>, name: HeapBuf) -> Self {
+        Self::clear_runtime_flags(&mut data);
         NodeBlock {
-            data: Arc::new(RwLock::new(NodeBlockRuntimeData { data, name })),
+            data: Arc::new(RwLock::new(NodeBlockRuntimeData {
+                data,
+                name,
+                dirty: false,
+                first_unused_node: false,
+            })),
             name_deserialized: AtomicBool::new(true),
         }
+    }
+
+    /// Drop the bits a store written before [`NODE_BLOCK_RUNTIME_FLAGS`] existed
+    /// might carry, so the stored flags hold only what belongs in the store.
+    /// Doing it here covers every way a block is built, including the format
+    /// conversions. The runtime state itself always starts clear: a loaded block
+    /// is not registered as dirty, so treating it as dirty would make the next
+    /// edit's `mark_dirty` report "already dirty" and register nothing.
+    fn clear_runtime_flags(data: &mut NodeBlockData) {
+        data.flags &= !NODE_BLOCK_RUNTIME_FLAGS;
     }
 
     pub fn new_zeroed() -> Self {
         let mut data = NodeBlockData::new_from_heap_zeroed();
         data.block_unused_next = INVALID_BLOCK;
         data.version = NodeBlockFormat::Nametable as u32;
-        Self::new_with_name(data, BytesMut::new())
+        Self::new_with_name(data, HeapBuf::new_in(node_block_allocator()))
     }
 
     /// Get the block index from a full node ID
@@ -1148,6 +1211,14 @@ impl NodeBlock {
     }
 
     /// Acquire read access to the node block
+    /// Take a read lock that can be held across an await. See
+    /// [`NodeBlockOwnedReader`].
+    pub fn read_owned(&self) -> NodeBlockOwnedReader {
+        NodeBlockOwnedReader {
+            lock: self.data.read_arc(),
+        }
+    }
+
     pub fn read(&self) -> NodeBlockReader<'_> {
         NodeBlockReader {
             lock: self.data.read(),
@@ -1192,7 +1263,26 @@ impl NodeBlock {
     /// Callers must drop the returned value before calling `write()` on the same block,
     /// or the write lock acquisition will deadlock.
     pub fn node_name_ref(&self, node_index: usize) -> Result<NodeNameLock, NodeNameError> {
+        Self::name_lock(self.data.read_arc(), node_index)
+    }
+
+    /// A copy of a node and its name, both read under one read lock, which the name keeps
+    /// held; see [`Self::node_name_ref`].
+    pub fn node_and_name_ref(
+        &self,
+        node_index: usize,
+    ) -> (Node, Result<NodeNameLock, NodeNameError>) {
         let guard = self.data.read_arc();
+        let node = guard.data.node[node_index];
+        (node, Self::name_lock(guard, node_index))
+    }
+
+    /// The name of the node at `node_index`, read from the name table `guard` holds, which the
+    /// name keeps held.
+    fn name_lock(
+        guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
+        node_index: usize,
+    ) -> Result<NodeNameLock, NodeNameError> {
         let node = &guard.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;
@@ -1215,6 +1305,32 @@ impl NodeBlock {
         })
     }
 
+    /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped under `node_id`.
+    ///
+    /// A walk that lists or materializes content stands on this, so a name no node may carry
+    /// reaches neither disk nor a listing, and the walk carries on past the node. A name that
+    /// cannot be read at all is still an error.
+    ///
+    /// As with [`Self::node_name_ref`], the returned `NodeNameLock` holds a read lock on the
+    /// block data for its lifetime. Callers must drop it before calling `write()` on the same
+    /// block, or the write lock acquisition will deadlock. Nothing is held when the answer is
+    /// `None`.
+    pub fn node_name_ref_or_skip(
+        &self,
+        node_index: usize,
+        node_id: NodeID,
+    ) -> Result<Option<NodeNameLock>, NodeNameError> {
+        match self.node_name_ref(node_index) {
+            Ok(name) => Ok(Some(name)),
+            Err(err) if err.is_invalid_arguments() => {
+                lore_warn!("Skipping node {node_id} with invalid name: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn deserialize_nametable(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1223,7 +1339,7 @@ impl NodeBlock {
             return Ok(());
         }
 
-        Box::pin(async move { self.deserialize_nametable_impl(repository).await }).await
+        Box::pin(self.deserialize_nametable_impl(repository)).await
     }
 
     async fn deserialize_nametable_impl(
@@ -1243,11 +1359,9 @@ impl NodeBlock {
                 .with_max_content_size(NODE_NAME_MAX_SIZE as u64),
         )
         .await
-        .internal("Deserialize deprecated name table failed")?;
+        .forward::<StateError>("Deserialize deprecated name table failed")?;
 
-        let nametable = bytes
-            .try_into_mut()
-            .unwrap_or_else(|bytes| BytesMut::from(&bytes[..]));
+        let nametable = HeapBuf::from_slice_in(&bytes, node_block_allocator());
 
         let mut writer = self.write();
         if !self.is_nametable_deserialized() {
@@ -1267,6 +1381,9 @@ impl NodeBlock {
         lock.node_name_repack();
     }
 
+    /// Reads the node block at `address`, falling back to the older block formats when it does not
+    /// read as the current one. The fallback is boxed, as only older repositories and failed reads
+    /// take it.
     pub async fn deserialize(
         repository: Arc<RepositoryContext>,
         state: &State,
@@ -1282,11 +1399,10 @@ impl NodeBlock {
                     block_data.version
                 )));
             }
-            block_data.flags &= !NodeBlockFlags::Dirty;
             block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
             Ok(NodeBlock::new(block_data))
         } else {
-            Self::deserialize_other_version(repository, state, address).await
+            Box::pin(Self::deserialize_other_version(repository, state, address)).await
         }
     }
 
@@ -1303,7 +1419,6 @@ impl NodeBlock {
             let (mut block_data, name) =
                 Self::convert_block_v0(repository.clone(), state, block_data_v0).await?;
 
-            block_data.flags &= !NodeBlockFlags::Dirty;
             block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
 
             return Ok(NodeBlock::new_with_name(block_data, name));
@@ -1313,15 +1428,12 @@ impl NodeBlock {
             match NodeBlockDataV2::read_box_from_immutable(repository.clone(), address, true).await
             {
                 Ok(data) => Ok(data),
-                Err(err) => Err(err)
-                    .internal("Deserialize node block failed")
-                    .map_err(StateError::from),
+                Err(err) => Err(err).forward::<StateError>("Deserialize node block failed"),
             }?;
 
         lore_debug!("Converting v2 block data format when deserializing block");
         let mut block_data = Self::convert_block_v2(repository.clone(), block_data_v2)?;
 
-        block_data.flags &= !NodeBlockFlags::Dirty;
         block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
 
         Ok(NodeBlock::new(block_data))
@@ -1330,14 +1442,16 @@ impl NodeBlock {
     pub async fn convert_block_v0(
         repository: Arc<RepositoryContext>,
         state: &State,
-        block_data_old: Box<NodeBlockDataV0>,
-    ) -> Result<(Box<NodeBlockData>, BytesMut), StateError> {
+        block_data_old: HeapBox<NodeBlockDataV0>,
+    ) -> Result<(HeapBox<NodeBlockData>, HeapBuf), StateError> {
         const EXPECTED_NAME_LENGTH: usize = 16;
         let mut block_data = NodeBlockData::new_from_heap_zeroed();
-        let mut name_buffer =
-            BytesMut::with_capacity(EXPECTED_NAME_LENGTH * node::BLOCK_V0_NODE_COUNT);
+        let mut name_buffer = HeapBuf::with_capacity_in(
+            EXPECTED_NAME_LENGTH * node::BLOCK_V0_NODE_COUNT,
+            node_block_allocator(),
+        );
 
-        block_data.flags = block_data_old.flags | NodeBlockFlags::UpgradeGeneratedNametable;
+        block_data.flags = block_data_old.flags;
         block_data.node_count = block_data_old.node_count;
         block_data.node_unused_count = block_data_old.node_unused_count;
         block_data.node_unused = block_data_old.node_unused;
@@ -1390,8 +1504,8 @@ impl NodeBlock {
 
     pub fn convert_block_v2(
         _repository: Arc<RepositoryContext>,
-        block_data_v2: Box<NodeBlockDataV2>,
-    ) -> Result<Box<NodeBlockData>, StateError> {
+        block_data_v2: HeapBox<NodeBlockDataV2>,
+    ) -> Result<HeapBox<NodeBlockData>, StateError> {
         let mut block_data = NodeBlockData::new_from_heap_zeroed();
 
         block_data.flags = block_data_v2.flags;
@@ -1459,13 +1573,20 @@ impl NodeBlockReader<'_> {
         &self.lock.data.node[node_index]
     }
 
-    pub fn clone_name_table(&self) -> Bytes {
-        self.lock.name.clone().freeze()
-    }
-
     /// Access the full node block
     pub fn node_block(&self) -> &NodeBlockData {
         &self.lock.data
+    }
+
+    /// Whether the block holds edits that are not in the store yet.
+    pub fn is_dirty(&self) -> bool {
+        self.lock.dirty
+    }
+
+    /// Whether the block's first node has been discarded, which serialization
+    /// uses to link the block into the tree's unused list.
+    pub fn has_first_unused_node(&self) -> bool {
+        self.lock.first_unused_node
     }
 
     /// Check if block is full
@@ -1508,17 +1629,28 @@ impl NodeBlockWriter<'_> {
 
     /// Mark the block as dirty
     pub fn mark_dirty(&mut self) -> bool {
-        let block = &mut self.lock.data;
-        let was_dirty = block.flags & NodeBlockFlags::Dirty != 0;
-        block.flags |= NodeBlockFlags::Dirty;
+        let was_dirty = self.lock.dirty;
+        self.lock.dirty = true;
         !was_dirty
     }
 
+    /// Clear the dirty flag once the block has been written out.
+    ///
+    /// [`Self::mark_dirty`] reports whether the block *became* dirty, and callers use
+    /// that to decide whether to register it for the next serialize. A block left
+    /// flagged after being written answers "already dirty" to the next edit, which then
+    /// registers nothing — so the edit is silently dropped from that serialize.
+    pub fn clear_dirty(&mut self) {
+        self.lock.dirty = false;
+    }
+
     pub fn discard_node(&mut self, block_index: usize, node_index: usize) {
-        let block = &mut self.lock.data;
-        if block.node_unused_count == 0 && block.node_count == BLOCK_NODE_COUNT as u32 {
-            block.flags |= NodeBlockFlags::FirstUnusedNode;
+        if self.lock.data.node_unused_count == 0
+            && self.lock.data.node_count == BLOCK_NODE_COUNT as u32
+        {
+            self.lock.first_unused_node = true;
         }
+        let block: &mut NodeBlockData = &mut self.lock.data;
         {
             let node = &mut block.node[node_index];
             node.child = 0;
@@ -1584,7 +1716,30 @@ impl NodeBlockWriter<'_> {
         self.lock.data.as_mut()
     }
 
+    /// Store `name` in the block's name table, reusing the slot at
+    /// `(prev_offset, prev_length)` when the new name fits in it, and return the
+    /// slot the name now occupies.
+    ///
+    /// The name is validated first, by the same rules
+    /// [`NodeBlock::node_name_clone`] applies when reading one back plus a
+    /// [`MAX_NODE_NAME_LEN`] bound, so no writer can store a name the read path
+    /// will later refuse — such a node is invisible to a listing and errors from
+    /// a per-node read.
     pub fn node_name_store(
+        &mut self,
+        name: &str,
+        prev_offset: u32,
+        prev_length: u32,
+    ) -> Result<(u32, u32), NodeNameError> {
+        validate_node_name_for_store(name)?;
+        self.node_name_store_unchecked(name, prev_offset, prev_length)
+    }
+
+    /// [`Self::node_name_store`] without the name rules. Only a test has a use for it: a
+    /// name table written before a rule existed can hold a name the rule refuses, and the
+    /// read path has to be shown refusing or skipping such a node.
+    #[lore_macro::test_pub]
+    fn node_name_store_unchecked(
         &mut self,
         name: &str,
         prev_offset: u32,
@@ -1633,7 +1788,7 @@ impl NodeBlockWriter<'_> {
         if lock.name.is_empty() {
             return;
         }
-        let mut new_name = BytesMut::with_capacity(lock.name.capacity());
+        let mut new_name = HeapBuf::with_capacity_in(lock.name.capacity(), lock.name.allocator());
 
         let node_count = lock.data.node_count as usize;
         for node_index in 0..node_count {
@@ -1655,7 +1810,7 @@ impl NodeBlockWriter<'_> {
         }
 
         lock.name = new_name;
-        lock.data.flags |= NodeBlockFlags::Dirty;
+        lock.dirty = true;
         lock.data.flags &= !NodeBlockFlags::RepackNametable;
     }
 }
@@ -1695,12 +1850,20 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = Arc::new(repository.to_link_context(self.repository).await);
-            let state = State::deserialize(repository.clone(), self.revision).await?;
-            Ok((repository, state))
+            self.open(&repository).await
         } else {
             Ok((repository, state))
         }
+    }
+
+    /// The repository and revision state this link names, reached from `repository`.
+    pub async fn open(
+        &self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<LinkedState, StateError> {
+        let repository = repository.to_link_context(self.repository).await;
+        let state = State::deserialize(repository.clone(), self.revision).await?;
+        Ok((repository, state))
     }
 }
 
@@ -1733,21 +1896,6 @@ impl NodeDelta {
             _unused: 0,
             action: change::FileAction::from_node_flags(node_flags) as u16,
             flags: change_flags.bits(),
-        }
-    }
-
-    pub fn from_node_change(change: NodeChange) -> Self {
-        let node = match change.action {
-            FileAction::Delete => change.from.node,
-            FileAction::Add | FileAction::Move | FileAction::Copy | FileAction::Keep => {
-                change.to.node
-            }
-        };
-        NodeDelta {
-            node,
-            _unused: 0,
-            action: change.action as u16,
-            flags: change.flags.bits(),
         }
     }
 }
@@ -1810,11 +1958,13 @@ impl NodeFileMetadata {
 pub const BLOCK_NODE_FILE_METADATA_COUNT: usize = BLOCK_NODE_COUNT;
 
 /// Old block count before the metadata block was extended to 512 elements
+#[lore_macro::test_pub]
 const BLOCK_NODE_FILE_METADATA_COUNT_V0: usize = 511;
 
-/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each
+/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each.
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(Clone, IntoBytes, FromBytes, Immutable)]
 pub struct NodeFileMetadataBlockData {
     /// Block flags
     pub flags: u32,
@@ -1827,11 +1977,13 @@ pub struct NodeFileMetadataBlockData {
 }
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockData {}
-impl ZeroHeapAlloc for NodeFileMetadataBlockData {}
+block_payload_on_tree_heap!(NodeFileMetadataBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
-/// Legacy block of file metadata with 511 elements (old format before extension to 512)
+/// Legacy block of file metadata with 511 elements (old format before extension to 512).
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
+#[lore_macro::test_pub]
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(IntoBytes, FromBytes, Immutable)]
 struct NodeFileMetadataBlockDataV0 {
     flags: u32,
     version: u32,
@@ -1840,12 +1992,13 @@ struct NodeFileMetadataBlockDataV0 {
 }
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockDataV0 {}
-impl ZeroHeapAlloc for NodeFileMetadataBlockDataV0 {}
+block_payload_on_tree_heap!(NodeFileMetadataBlockDataV0, ZeroHeapAlloc);
 
 impl NodeFileMetadataBlockDataV0 {
     /// Convert the old 511-element block into the current 512-element format.
     /// The last element is zero-initialized.
-    fn into_current(self) -> Box<NodeFileMetadataBlockData> {
+    #[lore_macro::test_pub]
+    fn to_current(&self) -> HeapBox<NodeFileMetadataBlockData> {
         let mut block = NodeFileMetadataBlockData::new_from_heap_zeroed();
         block.flags = self.flags;
         block.version = self.version;
@@ -1860,7 +2013,7 @@ impl NodeFileMetadataBlockData {
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<NodeFileMetadataBlockData>, ImmutableError> {
+    ) -> Result<HeapBox<NodeFileMetadataBlockData>, ImmutableError> {
         match NodeFileMetadataBlockData::read_box_from_immutable(repository.clone(), address, cache)
             .await
         {
@@ -1871,7 +2024,7 @@ impl NodeFileMetadataBlockData {
                 )
                 .await
                 {
-                    Ok(old_block) => Ok(old_block.into_current()),
+                    Ok(old_block) => Ok(old_block.to_current()),
                     Err(_) => Err(original_err),
                 }
             }
@@ -1880,20 +2033,45 @@ impl NodeFileMetadataBlockData {
     }
 }
 
+struct NodeFileMetadataBlockRuntimeData {
+    data: HeapBox<NodeFileMetadataBlockData>,
+    /// The block holds edits that are not in the store yet. Dirty is the only
+    /// flag a file metadata block has and it is runtime state, so
+    /// [`NodeFileMetadataBlockFlags::Dirty`] is never stored. Same reason as
+    /// [`NODE_BLOCK_RUNTIME_FLAGS`].
+    dirty: bool,
+}
+
 /// Internally mutable wrapper around a block of nodes
 pub struct NodeFileMetadataBlock {
     /// Node block data containing all the nodes
-    data: parking_lot::RwLock<Box<NodeFileMetadataBlockData>>,
+    data: Arc<parking_lot::RwLock<NodeFileMetadataBlockRuntimeData>>,
 }
 
 /// Read accessor for a node block
 pub struct NodeFileMetadataBlockReader<'a> {
-    lock: RwLockReadGuard<'a, Box<NodeFileMetadataBlockData>>,
+    lock: RwLockReadGuard<'a, NodeFileMetadataBlockRuntimeData>,
 }
 
 /// Write accessor for a node block
 pub struct NodeFileMetadataBlockWriter<'a> {
-    lock: RwLockWriteGuard<'a, Box<NodeFileMetadataBlockData>>,
+    lock: RwLockWriteGuard<'a, NodeFileMetadataBlockRuntimeData>,
+}
+
+/// Read accessor for a file metadata block that can be held across an await.
+/// See [`NodeBlockOwnedReader`].
+pub struct NodeFileMetadataBlockOwnedReader {
+    lock: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeFileMetadataBlockRuntimeData>,
+}
+
+// SAFETY: see [`NodeBlockOwnedReader`].
+unsafe impl Send for NodeFileMetadataBlockOwnedReader {}
+
+impl NodeFileMetadataBlockOwnedReader {
+    /// The block exactly as it is to be stored.
+    pub fn node_block(&self) -> &NodeFileMetadataBlockData {
+        &self.lock.data
+    }
 }
 
 impl Default for NodeFileMetadataBlock {
@@ -1903,9 +2081,23 @@ impl Default for NodeFileMetadataBlock {
 }
 
 impl NodeFileMetadataBlock {
-    pub fn new(data: Box<NodeFileMetadataBlockData>) -> Self {
+    pub fn new(mut data: HeapBox<NodeFileMetadataBlockData>) -> Self {
+        // As in `NodeBlock::clear_runtime_flags`: drop what an older store may
+        // carry, and start the runtime state clear.
+        data.flags &= !NodeFileMetadataBlockFlags::Dirty;
         NodeFileMetadataBlock {
-            data: RwLock::new(data),
+            data: Arc::new(RwLock::new(NodeFileMetadataBlockRuntimeData {
+                data,
+                dirty: false,
+            })),
+        }
+    }
+
+    /// Take a read lock that can be held across an await. See
+    /// [`NodeBlockOwnedReader`].
+    pub fn read_owned(&self) -> NodeFileMetadataBlockOwnedReader {
+        NodeFileMetadataBlockOwnedReader {
+            lock: self.data.read_arc(),
         }
     }
 
@@ -1935,12 +2127,17 @@ impl NodeFileMetadataBlockReader<'_> {
     /// Get the node for the given node index
     pub fn node(&self, node_index: usize) -> &NodeFileMetadata {
         debug_assert!(node_index < BLOCK_NODE_COUNT);
-        &self.lock.node[node_index]
+        &self.lock.data.node[node_index]
     }
 
     /// Access the full node block
     pub fn node_block(&self) -> &NodeFileMetadataBlockData {
-        &self.lock
+        &self.lock.data
+    }
+
+    /// Whether the block holds edits that are not in the store yet.
+    pub fn is_dirty(&self) -> bool {
+        self.lock.dirty
     }
 }
 
@@ -1948,177 +2145,19 @@ impl NodeFileMetadataBlockWriter<'_> {
     /// Get the node for the given node index
     pub fn node(&mut self, node_index: usize) -> &mut NodeFileMetadata {
         debug_assert!(node_index < BLOCK_NODE_COUNT);
-        &mut self.lock.node[node_index]
+        &mut self.lock.data.node[node_index]
     }
 
     /// Mark the block as dirty
     pub fn mark_dirty(&mut self) -> bool {
-        let was_dirty = self.lock.flags & NodeFileMetadataBlockFlags::Dirty != 0;
-        self.lock.flags |= NodeFileMetadataBlockFlags::Dirty;
+        let was_dirty = self.lock.dirty;
+        self.lock.dirty = true;
         !was_dirty
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn node_with_flags(flags: u16) -> Node {
-        Node {
-            flags,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn dirty_flag_bit_positions() {
-        // V1: Dirty at bit 3
-        assert_eq!(NodeFlags::Dirty.bits(), 0b1000);
-        // V1: Dirty does not overlap with Staged (bit 4)
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::Staged.bits(), 0);
-        // V1: Dirty does not overlap with File/Module/ExternalName
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::File.bits(), 0);
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::Link.bits(), 0);
-
-        // V2: Dirty at bit 15
-        assert_eq!(NodeFlagsV2::Dirty.bits(), 1 << 15);
-        // V2: Dirty does not overlap with Staged (bit 16)
-        assert_eq!(NodeFlagsV2::Dirty.bits() & NodeFlagsV2::Staged.bits(), 0);
-    }
-
-    #[test]
-    fn dirty_compound_flags_v1() {
-        assert_eq!(
-            NodeFlags::DirtyModify.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyAdd.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedAdd.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyDelete.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedDelete.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyMove.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyCopy.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedCopy.bits() & NodeFlags::ActionBits.bits()
-        );
-    }
-
-    #[test]
-    fn dirty_bits_mask() {
-        // DirtyBits = Dirty + ActionBits (bits 3, 5-9)
-        let expected = NodeFlags::Dirty.bits() | NodeFlags::ActionBits.bits();
-        assert_eq!(NodeFlags::DirtyBits.bits(), expected);
-        // DirtyBits does NOT include Staged (bit 4)
-        assert_eq!(NodeFlags::DirtyBits.bits() & NodeFlags::Staged.bits(), 0);
-        // DirtyBits does NOT include MergeBits
-        assert_eq!(NodeFlags::DirtyBits.bits() & NodeFlags::MergeBits.bits(), 0);
-    }
-
-    #[test]
-    fn action_bits_mask() {
-        // ActionBits = bits 5-9 (shared between Dirty and Staged)
-        let expected = (NodeFlags::StagedModify.bits()
-            | NodeFlags::StagedAdd.bits()
-            | NodeFlags::StagedDelete.bits()
-            | NodeFlags::StagedMove.bits()
-            | NodeFlags::StagedCopy.bits())
-            & !NodeFlags::Staged.bits();
-        assert_eq!(NodeFlags::ActionBits.bits(), expected);
-    }
-
-    #[test]
-    fn node_is_dirty_queries() {
-        // Clean node
-        let node = Node::default();
-        assert!(!node.is_dirty());
-        assert!(!node.is_dirty_modify());
-
-        // Dirty only
-        let node = node_with_flags(NodeFlags::DirtyModify.bits());
-        assert!(node.is_dirty());
-        assert!(node.is_dirty_modify());
-        assert!(!node.is_dirty_add());
-        assert!(!node.is_staged());
-
-        // Dirty+Staged (orthogonal)
-        let node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        assert!(node.is_dirty());
-        assert!(node.is_staged());
-        assert!(node.is_staged_modify());
-        assert!(node.is_dirty_or_staged());
-    }
-
-    #[test]
-    fn node_has_any_change_flags() {
-        assert!(!Node::default().has_any_change_flags());
-        assert!(node_with_flags(NodeFlags::Dirty.bits()).has_any_change_flags());
-        assert!(node_with_flags(NodeFlags::Staged.bits()).has_any_change_flags());
-        assert!(!node_with_flags(NodeFlags::File.bits()).has_any_change_flags());
-    }
-
-    #[test]
-    fn clear_staged_flags_preserves_dirty() {
-        let mut node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        node.clear_staged_flags();
-        assert!(node.is_dirty());
-        assert!(!node.is_staged());
-        assert_ne!(node.flags & NodeFlags::ActionBits.bits(), 0);
-    }
-
-    #[test]
-    fn clear_staged_flags_clears_action_when_no_dirty() {
-        let mut node = node_with_flags(NodeFlags::StagedModify.bits());
-        node.clear_staged_flags();
-        assert_eq!(
-            node.flags & (NodeFlags::StagedBits.bits() | NodeFlags::Dirty.bits()),
-            0
-        );
-    }
-
-    #[test]
-    fn clear_dirty_flags_preserves_staged() {
-        let mut node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        node.clear_dirty_flags();
-        assert!(!node.is_dirty());
-        assert!(node.is_staged());
-        assert!(node.is_staged_modify());
-    }
-
-    #[test]
-    fn clear_dirty_flags_clears_action_when_no_staged() {
-        let mut node = node_with_flags(NodeFlags::DirtyModify.bits());
-        node.clear_dirty_flags();
-        assert_eq!(
-            node.flags & (NodeFlags::DirtyBits.bits() | NodeFlags::StagedBits.bits()),
-            0
-        );
-    }
-
-    #[test]
-    fn clear_all_change_flags() {
-        let mut node = node_with_flags(
-            NodeFlags::File.bits() | NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits(),
-        );
-        node.clear_all_change_flags();
-        assert!(node.is_file());
-        assert!(!node.is_dirty());
-        assert!(!node.is_staged());
-        assert_eq!(node.flags & NodeFlags::ActionBits.bits(), 0);
-    }
-
-    #[test]
-    fn action_bits_extraction() {
-        let node = node_with_flags(NodeFlags::DirtyMove.bits());
-        assert_eq!(
-            node.action_bits(),
-            NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
-        );
+    /// Clear the dirty flag once the block has been written out. See
+    /// [`NodeBlockWriter::clear_dirty`].
+    pub fn clear_dirty(&mut self) {
+        self.lock.dirty = false;
     }
 }

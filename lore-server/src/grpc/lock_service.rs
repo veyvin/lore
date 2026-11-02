@@ -30,12 +30,17 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use super::ServerResultExt;
 use super::extract_correlation_id;
 use super::get_repository;
 use super::get_user_id;
-use super::is_owner_or_admin;
 use super::timeout_grpc;
-use crate::grpc::can_admin_lock;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::require_action;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -73,6 +78,56 @@ fn lock_query_from_request(
     }
 }
 
+/// Answers a lock query from this server's own lock store.
+pub async fn query_implementation(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+) -> Result<Response<QueryResponse>, Status> {
+    let query = lock_query_from_request(caller_context.repository_id, &request)
+        .map_err(handle_lock_error)?;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            lock_store
+                .query_locks(query)
+                .await
+                .map(|result| {
+                    Response::new(QueryResponse {
+                        result: result.into_iter().map(Into::into).collect(),
+                    })
+                })
+                .map_err(handle_lock_error)
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` answer the query, and relays its
+/// answer to the client.
+async fn forward_query(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<QueryResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let query_result = client
+        .query(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = query_result?;
+    Ok(response)
+}
+
 fn handle_lock_error(error: LockError) -> Status {
     match error {
         LockError::LockNotFound(_) => Status::not_found(error.to_string()),
@@ -90,6 +145,8 @@ fn handle_lock_error(error: LockError) -> Status {
 pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
@@ -101,6 +158,8 @@ impl LoreLockService {
     pub fn new(
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         let instrument_provider = LoreLockServiceInstrumentProvider {};
@@ -108,6 +167,8 @@ impl LoreLockService {
         Self {
             lock_store,
             notification,
+            authorizer,
+            forwarded_requests,
             rpc_timeout,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
@@ -164,6 +225,17 @@ impl LoreLockService {
 
         Ok(locks)
     }
+
+    /// `owner` or `admin` on `repository` waives the lock-ownership check.
+    async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
+        self.authorizer
+            .permits(extensions, repository, Action::Owner)
+            .await
+            || self
+                .authorizer
+                .permits(extensions, repository, Action::Admin)
+                .await
+    }
 }
 
 impl LoreLockService {
@@ -171,6 +243,7 @@ impl LoreLockService {
         &self,
         request: Request<LockRequest>,
     ) -> Result<Response<LockResponse>, Status> {
+        require_action(&self.authorizer, &request, Action::Write).await?;
         let repository = get_repository(request.metadata())?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -204,29 +277,16 @@ impl LoreLockService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let repository = get_repository(request.metadata())?;
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let query_request = request.get_ref();
+        let caller_context = CallerContext::from_original_request(&request)?;
+        let query_request = request.into_inner();
 
-        let query =
-            lock_query_from_request(repository, query_request).map_err(handle_lock_error)?;
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                self.lock_store
-                    .query_locks(query)
-                    .await
-                    .map(|result| {
-                        Response::new(QueryResponse {
-                            result: result.into_iter().map(Into::into).collect(),
-                        })
-                    })
-                    .map_err(handle_lock_error)
-            })
-            .await
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_query
+        {
+            forward_query(query_request, caller_context, forwarded_requests).await
+        } else {
+            query_implementation(query_request, caller_context, self.lock_store.as_ref()).await
+        }
     }
 
     async fn handle_status(
@@ -288,7 +348,16 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !is_owner_or_admin(request.extensions(), repository);
+        let elevated = self.is_elevated(request.extensions(), repository).await;
+        if !elevated
+            && !self
+                .authorizer
+                .permits(request.extensions(), repository, Action::Write)
+                .await
+        {
+            return Err(no_repository_access_status());
+        }
+        let validate_user = !elevated;
         let unlock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -336,7 +405,14 @@ impl LoreLockService {
     ) -> Result<Response<AdminLockResponse>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let extensions = request.extensions().clone();
+        if !self
+            .authorizer
+            .permits(request.extensions(), repository, Action::Migrate)
+            .await
+        {
+            warn!("Attempt to apply admin locks, but user does not have the correct permissions");
+            return Err(Status::permission_denied("Permission denied"));
+        }
 
         let user_id = get_user_id(request.extensions());
         let lock_request = request.into_inner();
@@ -359,11 +435,6 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !can_admin_lock(&extensions, repository) {
-                    warn!("Attempt to apply admin locks, but user does not have the correct permissions");
-                    return Err(Status::permission_denied("Permission denied"));
-                }
-
                 self.lock_as_user(repository, resources, &owner)
                     .await
                     .map(|locks| Response::new(AdminLockResponse { locks }))
@@ -409,284 +480,5 @@ impl LockService for LoreLockService {
         request: Request<AdminLockRequest>,
     ) -> Result<Response<AdminLockResponse>, Status> {
         timeout_grpc(self.rpc_timeout, self.handle_admin_lock(request)).await
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use lore_proto::LockService;
-    use lore_revision::lore::RepositoryId;
-    use lore_transport::grpc::REPOSITORY_ID_KEY;
-    use rand::random;
-    use tonic::Code;
-    use tonic::Request;
-
-    use crate::grpc::lock_service::LoreLockService;
-
-    mod store {
-        use async_trait::async_trait;
-        use lore_base::types::LockData;
-        use lore_base::types::LockResource;
-        use lore_revision::lock::LockError;
-        use lore_revision::lock::LockQuery;
-        use lore_revision::lock::LockStore;
-        use lore_revision::lore::RepositoryId;
-
-        mockall::mock! {
-             pub MockLockStore {}
-
-             #[async_trait]
-             impl LockStore for MockLockStore {
-
-                async fn lock_resources(
-                    &self,
-                    owner_id: &str,
-                    repository: RepositoryId,
-                    resources: &[LockResource],
-                ) -> Result<Vec<LockData>, LockError>;
-
-                async fn query_locks(&self, query: LockQuery) -> Result<Vec<LockData>, LockError>;
-
-                async fn check_locks_status(
-                    &self,
-                    repository: RepositoryId,
-                    resources: &[LockResource],
-                ) -> Result<Vec<LockData>, LockError>;
-
-
-                async fn unlock_resources(
-                    &self,
-                    owner_id: &str,
-                    validate_user: bool,
-                    repository: RepositoryId,
-                    resources: &[LockResource],
-                ) -> Result<Vec<LockResource>, LockError>;
-            }
-        }
-    }
-
-    mod status {
-        use lore_proto::lock::Resource;
-        use lore_proto::lock::StatusRequest;
-
-        use super::*;
-        use crate::notification::local::NotificationSender;
-
-        #[tokio::test]
-        async fn resource_count_exceeds_limit() {
-            let lock_store = super::store::MockMockLockStore::new();
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let resources: Vec<Resource> = (0..101)
-                .map(|_| Resource {
-                    branch: Default::default(),
-                    hash: Default::default(),
-                    description: "".to_string(),
-                })
-                .collect();
-
-            let mut request = Request::new(StatusRequest { resources });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let error_status = lock_service
-                .status(request)
-                .await
-                .expect_err("Status should fail when resource count exceeds limit");
-
-            assert_eq!(error_status.code(), Code::InvalidArgument);
-        }
-
-        #[tokio::test]
-        async fn resource_count_at_limit() {
-            let mut lock_store = super::store::MockMockLockStore::new();
-            lock_store
-                .expect_check_locks_status()
-                .return_once(|_, _| Ok(vec![]));
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let resources: Vec<Resource> = (0..100)
-                .map(|_| Resource {
-                    branch: Default::default(),
-                    hash: Default::default(),
-                    description: "".to_string(),
-                })
-                .collect();
-
-            let mut request = Request::new(StatusRequest { resources });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let _ = lock_service
-                .status(request)
-                .await
-                .expect("Status should succeed when resource count is at limit");
-        }
-    }
-
-    mod unlock {
-        use lore_proto::lock::AdminLockRequest;
-        use lore_proto::lock::LockRequest;
-        use lore_proto::lock::Resource;
-        use lore_proto::lock::StatusRequest;
-        use lore_proto::lock::UnlockRequest;
-
-        use super::*;
-        use crate::notification::local::NotificationSender;
-
-        #[tokio::test]
-        async fn lock_zero_resources() {
-            let lock_store = super::store::MockMockLockStore::new();
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let mut request = Request::new(LockRequest { resources: vec![] });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let _ = lock_service
-                .lock(request)
-                .await
-                .expect("LockData did not return ok status");
-        }
-
-        #[tokio::test]
-        async fn unlock_zero_resources() {
-            let lock_store = super::store::MockMockLockStore::new();
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let mut request = Request::new(UnlockRequest { resources: vec![] });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let _ = lock_service
-                .unlock(request)
-                .await
-                .expect("Unlock did not return ok status");
-        }
-
-        #[tokio::test]
-        async fn status_zero_resources() {
-            let lock_store = super::store::MockMockLockStore::new();
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let mut request = Request::new(StatusRequest { resources: vec![] });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let _ = lock_service
-                .status(request)
-                .await
-                .expect("Status did not return ok status");
-        }
-
-        #[tokio::test]
-        async fn admin_unlock_zero_resources() {
-            let lock_store = super::store::MockMockLockStore::new();
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let mut request = Request::new(AdminLockRequest {
-                resources: vec![],
-                owner: "".to_string(),
-            });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let _ = lock_service
-                .admin_lock(request)
-                .await
-                .expect("Admin lock did not return ok status");
-        }
-
-        #[tokio::test]
-        async fn unlock_fails_for_other_owner() {
-            let mut lock_store = super::store::MockMockLockStore::new();
-            lock_store
-                .expect_unlock_resources()
-                .return_once(|_, _, _, _| Err(lore_base::error::LockNotOwned.into()));
-
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-            );
-
-            let mut request = Request::new(UnlockRequest {
-                resources: vec![Resource {
-                    branch: Default::default(),
-                    hash: Default::default(),
-                    description: "".to_string(),
-                }],
-            });
-            let repository = random::<RepositoryId>();
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-
-            let error_status = lock_service
-                .unlock(request)
-                .await
-                .expect_err("Unlock did not return error status");
-
-            assert_eq!(error_status.code(), Code::FailedPrecondition);
-        }
     }
 }

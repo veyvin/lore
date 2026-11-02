@@ -17,11 +17,15 @@ use lore_storage::StoreError;
 use lore_storage::validate_fragment_list;
 use lore_storage::validate_fragment_metadata;
 use lore_telemetry::InstrumentProvider;
+use lore_telemetry::LabelArray;
 use lore_telemetry::tracing::fields::ADDRESS;
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
+use smallvec::SmallVec;
 use tracing::debug;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -32,6 +36,9 @@ use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
 use crate::util::setup_execution;
 
+const METRICS_COMPRESSION_LABEL: &str = "fragment_compression";
+
+#[lore_macro::test_pub]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Put {
     address: Address,
@@ -96,14 +103,24 @@ struct PutInstrument {
 }
 
 impl PutInstrument {
-    fn payload_size(&self, size: u32) {
-        self.payload_size_histogram
-            .record(size as u64, self.provider.labels());
+    fn fragment_labels(&self, fragment: &Fragment) -> LabelArray {
+        let mut labels = SmallVec::new();
+        labels.extend(self.provider.labels().iter().cloned());
+
+        labels.push(KeyValue::new(
+            METRICS_COMPRESSION_LABEL,
+            FragmentFlags::compression_label(fragment.flags),
+        ));
+
+        labels
     }
 
-    fn content_size(&self, size: u64) {
-        self.content_size_histogram
-            .record(size, self.provider.labels());
+    fn payload_size(&self, size: u32, labels: &[KeyValue]) {
+        self.payload_size_histogram.record(size as u64, labels);
+    }
+
+    fn content_size(&self, size: u64, labels: &[KeyValue]) {
+        self.content_size_histogram.record(size, labels);
     }
 }
 
@@ -125,34 +142,49 @@ impl Put {
         &self.address
     }
 
+    /// Verify the caller holds the content named by the address.
+    ///
+    /// The payload is that proof: the hash is recomputed from it and compared to
+    /// the address. A put carrying none proves nothing and is refused — skipping
+    /// is not equivalent to passing. The store deduplicates on hash across
+    /// partitions; sharing content across them is `Copy`'s job, which names a
+    /// `source_repository` and authorizes the caller against it.
+    #[lore_macro::test_pub]
     fn validate_hash(&self) -> Result<(), MessageHandleError> {
-        if let Some(payload) = self.payload.as_ref() {
-            match lore_storage::hash_fragment(self.fragment, payload.as_ref()) {
-                Ok(hash) => {
-                    if hash != self.address.hash {
-                        warn!(
-                            fragment = ?self.fragment,
-                            {ADDRESS} = %self.address,
-                            computed_hash = %hash,
-                            "Hash validation failed, computed hash does not match address"
-                        );
-                        return Err(MessageHandleError::HashMismatch);
-                    }
-                }
-                Err(err) => {
+        let Some(payload) = self.payload.as_ref() else {
+            warn!(
+                fragment = ?self.fragment,
+                {ADDRESS} = %self.address,
+                "Hash validation failed, put carries no payload to prove the address"
+            );
+            return Err(MessageHandleError::HashFailed);
+        };
+        match lore_storage::hash_fragment(self.fragment, payload.as_ref()) {
+            Ok(hash) => {
+                if hash != self.address.hash {
                     warn!(
                         fragment = ?self.fragment,
                         {ADDRESS} = %self.address,
-                        error = ?err,
-                        "Hash validation failed, unable to hash"
+                        computed_hash = %hash,
+                        "Hash validation failed, computed hash does not match address"
                     );
-                    return Err(MessageHandleError::HashFailed);
+                    return Err(MessageHandleError::HashMismatch);
                 }
+            }
+            Err(err) => {
+                warn!(
+                    fragment = ?self.fragment,
+                    {ADDRESS} = %self.address,
+                    error = ?err,
+                    "Hash validation failed, unable to hash"
+                );
+                return Err(MessageHandleError::HashFailed);
             }
         }
         Ok(())
     }
 
+    #[lore_macro::test_pub]
     fn validate_fragment(&self) -> Result<(), MessageHandleError> {
         // Metadata checks (size bounds, flag sanity, size_payload ≤ size_content,
         // uncompressed/unfragmented size equality, compressed+fragmented exclusion,
@@ -174,8 +206,8 @@ impl Put {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn to_bytes(&self) -> Bytes {
+    #[cfg(feature = "test-util")]
+    pub fn to_bytes(&self) -> Bytes {
         use zerocopy::IntoBytes;
 
         let mut bytes =
@@ -239,8 +271,6 @@ pub async fn handle_put(
     );
 
     let instruments = instruments();
-    instruments.payload_size(put.fragment.size_payload);
-    instruments.content_size(put.fragment.size_content);
 
     let address = put.address;
     let fragment = put.fragment;
@@ -253,6 +283,20 @@ pub async fn handle_put(
 
             let mut fragment = fragment;
             fragment.flags &= !FragmentFlags::PayloadStored;
+
+            // Transcode incoming Oodle payloads to Zstd.
+            // The hash is over uncompressed content, so the address is unchanged.
+            #[cfg(feature = "oodle")]
+            let (fragment, payload) = crate::protocol::oodle_ingress::convert_oodle_on_ingress(
+                address, fragment, payload,
+            )
+            .await;
+
+            {
+                let labels = instruments.fragment_labels(&fragment);
+                instruments.payload_size(put.fragment.size_payload, &labels);
+                instruments.content_size(put.fragment.size_content, &labels);
+            }
 
             match immutable_store
                 .put(repository, address, fragment, payload, false)
@@ -279,6 +323,7 @@ impl Message for Put {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -307,410 +352,5 @@ pub struct PutResponse {}
 impl Response for PutResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::types::Hash;
-    use lore_revision::fragment;
-    use rand::random;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    fn mock_message() -> Put {
-        let (fragment, address, payload) = fragment::generate_random();
-
-        Put {
-            address,
-            fragment,
-            payload: Some(payload),
-        }
-    }
-
-    mod unvalidated_put {
-        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
-
-        use super::*;
-
-        #[test]
-        fn put_valid_with_payload() {
-            let (fragment, address, payload) = fragment::generate_random();
-            let unvalidated = UnvalidatedPut {
-                address,
-                fragment,
-                payload: Some(payload.clone()),
-            };
-
-            let put: Put = unvalidated.validate().unwrap();
-            assert_eq!(put.address, address);
-            assert_eq!(put.fragment, fragment);
-            assert_eq!(put.payload, Some(payload));
-        }
-
-        #[test]
-        fn put_valid_without_payload() {
-            let (fragment, address, _) = fragment::generate_random();
-            let unvalidated = UnvalidatedPut {
-                address,
-                fragment,
-                payload: None,
-            };
-
-            let put: Put = unvalidated.validate().unwrap();
-            assert_eq!(put.address, address);
-            assert_eq!(put.fragment, fragment);
-            assert_eq!(put.payload, None);
-        }
-
-        #[test]
-        fn rejects_oversized_fragment() {
-            let (mut fragment, address, payload) = fragment::generate_random();
-            fragment.size_payload = FRAGMENT_SIZE_THRESHOLD as u32 + 1;
-            let unvalidated = UnvalidatedPut {
-                address,
-                fragment,
-                payload: Some(payload),
-            };
-
-            assert_eq!(
-                unvalidated.validate(),
-                Err(MessageParseError::InvalidFieldLength)
-            );
-        }
-
-        #[test]
-        fn rejects_payload_length_mismatch() {
-            let (fragment, address, _) = fragment::generate_random();
-            // Provide a payload whose length doesn't match fragment.size_payload
-            let wrong_payload = Bytes::from(vec![0u8; fragment.size_payload as usize + 10]);
-            let unvalidated = UnvalidatedPut {
-                address,
-                fragment,
-                payload: Some(wrong_payload),
-            };
-
-            assert_eq!(
-                unvalidated.validate(),
-                Err(MessageParseError::InvalidFieldLength)
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse() {
-        let message = mock_message();
-
-        let message_bytes = message.to_bytes();
-
-        assert_eq!(Put::parse(message_bytes), Ok(message));
-    }
-
-    #[tokio::test]
-    async fn test_handle() {
-        let message = mock_message();
-
-        let repository = random::<RepositoryId>();
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        assert_eq!(
-            LoreResponse::Put(PutResponse::default()),
-            message.handle(context, immutable_store).await.unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hash_mismatch() {
-        let mut message = mock_message();
-        message.address.hash = Hash::hash_buffer(b"some bad hash");
-
-        let repository = random::<RepositoryId>();
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        match message.handle(context, immutable_store).await {
-            Err(MessageHandleError::HashMismatch) => (),
-            Err(e) => panic!("Expected hash mismatch error, but got {e:?}"),
-            _ => panic!("Expected hash mismatch error"),
-        }
-    }
-
-    mod validate_fragment {
-        // Metadata-only validation (flags, size_payload vs size_content,
-        // compressed+fragmented exclusion, etc.) is covered by
-        // `lore_storage::validate_fragment_metadata` and its tests. The tests
-        // here exercise `Put::validate_fragment`, which now only runs the
-        // payload-dependent fragment-list checks.
-        use lore_base::types::FragmentReference;
-        use zerocopy::IntoBytes;
-
-        use super::*;
-
-        fn make_fragment_ref_payload(refs: &[FragmentReference]) -> Bytes {
-            Bytes::copy_from_slice(refs.as_bytes())
-        }
-
-        fn fragmented_put(refs: &[FragmentReference], size_content: u64) -> Put {
-            let payload = make_fragment_ref_payload(refs);
-            let hash = Hash::hash_buffer(payload.as_ref());
-            Put {
-                address: Address {
-                    hash,
-                    context: rand::random(),
-                },
-                fragment: Fragment {
-                    flags: FragmentFlags::PayloadFragmented.into(),
-                    size_payload: payload.len() as u32,
-                    size_content,
-                },
-                payload: Some(payload),
-            }
-        }
-
-        #[test]
-        fn uncompressed_unfragmented_ok() {
-            let (fragment, address, payload) = fragment::generate_random();
-            let put = Put {
-                address,
-                fragment,
-                payload: Some(payload),
-            };
-            assert!(put.validate_fragment().is_ok());
-        }
-
-        #[test]
-        fn compressed_unfragmented_ok() {
-            let put = Put {
-                address: Address::default(),
-                fragment: Fragment {
-                    flags: FragmentFlags::PayloadCompressedLZ4.into(),
-                    size_payload: 100,
-                    size_content: 200,
-                },
-                payload: None,
-            };
-            assert!(put.validate_fragment().is_ok());
-        }
-
-        #[test]
-        fn fragmented_valid_two_refs() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(put.validate_fragment().is_ok());
-        }
-
-        #[test]
-        fn fragmented_valid_three_refs() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(put.validate_fragment().is_ok());
-        }
-
-        #[test]
-        fn fragmented_fewer_than_two_refs_one() {
-            let refs = [FragmentReference {
-                hash: Hash::default(),
-                offset_content: 0,
-            }];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_fewer_than_two_refs_zero() {
-            let payload = Bytes::from_static(&[0u8; 4]);
-            let hash = Hash::hash_buffer(payload.as_ref());
-            let put = Put {
-                address: Address {
-                    hash,
-                    context: rand::random(),
-                },
-                fragment: Fragment {
-                    flags: FragmentFlags::PayloadFragmented.into(),
-                    size_payload: payload.len() as u32,
-                    size_content: 2000,
-                },
-                payload: Some(payload),
-            };
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_first_offset_nonzero() {
-            // Non-zero first offset is valid (multi-level fragment list child blob)
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 10,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(put.validate_fragment().is_ok());
-        }
-
-        #[test]
-        fn fragmented_offset_span_exceeds_content_size() {
-            // Span (last - first) must be less than size_content
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 3000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_offsets_not_increasing() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 1000,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_offsets_equal() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 500,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_last_offset_equals_content_size() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 2000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_last_offset_exceeds_content_size() {
-            let refs = [
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 0,
-                },
-                FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 3000,
-                },
-            ];
-            let put = fragmented_put(&refs, 2000);
-            assert!(matches!(
-                put.validate_fragment(),
-                Err(MessageHandleError::InvalidFragment)
-            ));
-        }
-
-        #[test]
-        fn fragmented_dedup_put_no_payload_ok() {
-            // Dedup puts (payload omitted by the client; server relies on
-            // existing fragment in the repository) skip fragment-list
-            // validation because there's nothing to validate. Metadata
-            // validation — which runs earlier in the flow — already covers
-            // these fragments.
-            let put = Put {
-                address: Address::default(),
-                fragment: Fragment {
-                    flags: FragmentFlags::PayloadFragmented.into(),
-                    size_payload: 80,
-                    size_content: 2000,
-                },
-                payload: None,
-            };
-            assert!(put.validate_fragment().is_ok());
-        }
     }
 }

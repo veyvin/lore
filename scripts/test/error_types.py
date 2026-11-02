@@ -37,6 +37,11 @@ class NotFound(LoreException): ...
 class RevisionNotFound(NotFound): ...
 
 
+class FileNotFound(NotFound):
+    """Raised when a command names a path the revision it reads does not hold,
+    whether the path was never added or was deleted."""
+
+
 class BranchBehindLatest(LoreException): ...
 
 
@@ -115,6 +120,9 @@ class PathExistChildrenLinkError(LoreException): ...
 class NestedLinkError(LoreException): ...
 
 
+class NestedRepositoryError(LoreException): ...
+
+
 class PathExistLinkError(LoreException): ...
 
 
@@ -139,10 +147,19 @@ class NothingStagedError(LoreException): ...
 class LinkConflicts(LoreException): ...
 
 
+class UnresolvedConflictError(CommitFailed): ...
+
+
 class NotALinkError(LoreException): ...
 
 
 class LinkNotFoundError(LoreException): ...
+
+
+class LinkPinDivergedError(LoreException): ...
+
+
+class OverlappingLinkError(LoreException): ...
 
 
 class NotALayerError(LoreException): ...
@@ -156,7 +173,28 @@ class MissingIdentityError(LoreException):
     identity (no --identity arg, no config.toml identity, no cached auth)."""
 
 
+class NotAuthenticatedError(LoreException):
+    """Raised when an operation needs authentication the caller does not have,
+    e.g. a server-hitting command run against an auth-configured server with no
+    stored token (logged out)."""
+
+
+class NotSupportedError(LoreException):
+    """Raised when an operation is not supported in the current environment,
+    e.g. an auth command run against a server with no auth endpoint
+    configured."""
+
+
+class SwfsOutsideServiceError(LoreException): ...
+
+
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
+    # A refused revision specifier carries "Failed to find revision" on its
+    # trace, which a pattern below matches, so the refusal is named here by the
+    # one string only it carries rather than by the generic "Operation not
+    # supported" further down.
+    ("partial revision hash signature", NotSupportedError),
+    ("is still in conflict", UnresolvedConflictError),
     ("Unable to commit", CommitFailed),
     (
         "Target branch to merge into has a newer revision, merge target branch first",
@@ -170,6 +208,11 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Repository not found", UninitializedRepositoryError),
     ("Failed to find revision", RevisionNotFound),
     ("revision not found:", RevisionNotFound),
+    # Matched on the reported error line rather than as a bare substring: the
+    # patterns here are tested against the whole output, and `Root file not
+    # found:` from a clone naming a missing root path would otherwise be
+    # reported as this, which it is not.
+    (re.compile(r"\[Error\] file not found:"), FileNotFound),
     ("Not found", NotFound),
     ("Branch behind latest revision", BranchBehindLatest),
     ("Multiple files with case-only differences", CaseVariantConflict),
@@ -199,6 +242,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Link path already has children", PathExistChildrenLinkError),
     ("Link path is already a link", PathExistLinkError),
     ("Nested link", NestedLinkError),
+    ("path is a nested repository", NestedRepositoryError),
     ("A shared store was supposed to exist at", MissingSharedStore),
     ("Invalid repository path", InvalidRepositoryPath),
     ("Loading the shared store for a repo with remote url", WrongSharedStoreRemote),
@@ -211,10 +255,19 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
+    ("Link pin conflict at", LinkPinDivergedError),
+    ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
+    ("Operation not supported", NotSupportedError),
+    ("Not authenticated", NotAuthenticatedError),
+    (
+        "Attempting to create an SWFS instance outside the service",
+        SwfsOutsideServiceError,
+    ),
+    ("invalid arguments:", ImproperArgumentsError),
 ]
 
 

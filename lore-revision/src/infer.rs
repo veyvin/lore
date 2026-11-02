@@ -1,29 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
-
+use lore_storage::ContentSource;
+use lore_storage::WindowRead;
 use tokio::io;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
 
 use crate::util::encoding::decode_text_for_display;
 use crate::util::encoding::is_utf16_bom;
 
-async fn infer_into_buffer(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let mut file = tokio::fs::File::open(path).await?;
-
-    let metadata = file.metadata().await?;
-
-    let to_read: usize = std::cmp::min(max, metadata.len()) as usize;
-    if to_read == 0 {
-        return Ok(vec![]);
-    }
-
-    let mut buffer = vec![0u8; to_read];
-    file.read_exact(&mut buffer).await?;
-
-    Ok(buffer)
+/// The head of `source`, at most `max` bytes of it.
+async fn infer_into_buffer(source: &ContentSource<'_>, max: u64) -> io::Result<bytes::Bytes> {
+    // TODO(mjansson): Fuse the open and the head read through an `open_read_head` on
+    // `ContentSource`, which naming a host path did in one dispatch.
+    let (handle, size) = source.open_once().await?;
+    handle.read_all(std::cmp::min(max, size) as usize).await
 }
 
 pub fn infer_type_by_slice(buffer: &[u8]) -> Option<&str> {
@@ -44,12 +33,12 @@ pub fn infer_is_upackage_by_slice(buffer: &[u8]) -> bool {
     // Is it containing an unreal magic marker?
     if buffer.len() >= 4 {
         let package_file_tag = vec![0x9E, 0x2A, 0x83, 0xC1];
-        if buffer[..3] == package_file_tag {
+        if buffer[..4] == package_file_tag {
             return true;
         }
 
         let package_file_tag_swapped = vec![0xC1, 0x83, 0x2A, 0x9E];
-        if buffer[..3] == package_file_tag_swapped {
+        if buffer[..4] == package_file_tag_swapped {
             return true;
         }
     }
@@ -134,17 +123,21 @@ pub fn infer_is_conflicted_by_str(text: &str) -> bool {
     false
 }
 
-/// Check if conflict markers are present in file.
+/// Window size for the streaming line scan in [`infer_is_conflicted`].
+#[lore_macro::test_pub]
+const SCAN_WINDOW: usize = 64 * 1024;
+
+/// Check if conflict markers are present in content.
 ///
 /// # Arguments
 ///
-/// * `path` - A &Path that holds the path to inspect.
+/// * `source` - Where the content to inspect is read from.
 ///
 /// # Return value
 ///
-/// * `Ok(true)` if there are conflict markers in `path`.
-/// * `Ok(false)` if there are no conflict markers in `path`.
-/// * `Ok(false)` if `path` does not exist.
+/// * `Ok(true)` if there are conflict markers in `source`.
+/// * `Ok(false)` if there are no conflict markers in `source`.
+/// * `Ok(false)` if `source` cannot be opened, which a path holding nothing answers.
 /// * `Error()` if an I/O error occurs.
 ///
 /// # Notes
@@ -152,93 +145,95 @@ pub fn infer_is_conflicted_by_str(text: &str) -> bool {
 /// Streams line-by-line for UTF-8 (the hot path for large generated text).
 /// UTF-16 BOM-prefixed files — which `BufReader::lines` cannot decode — are
 /// read whole and routed through [`decode_text_for_display`].
-pub async fn infer_is_conflicted_by_path(path: &Path) -> Result<bool, std::io::Error> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(false);
+///
+/// Reads through the source rather than a host path, so content a provider serves rather than
+/// the filesystem is scanned where it is held.
+pub async fn infer_is_conflicted(source: &ContentSource<'_>) -> Result<bool, std::io::Error> {
+    /// Mirrors the previous line reader: a line that is not valid UTF-8
+    /// ends the scan as not-conflicted.
+    enum LineScan {
+        Conflicted,
+        Clean,
+        NotText,
+    }
+    fn scan_line(line: &[u8]) -> LineScan {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        match std::str::from_utf8(line) {
+            Ok(text) if infer_is_conflicted_by_line(text) => LineScan::Conflicted,
+            Ok(_) => LineScan::Clean,
+            Err(_) => LineScan::NotText,
+        }
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
+    // TODO(mjansson): Fuse the open and the first window read through an `open_read_head` on
+    // `ContentSource`, which naming a host path did in one dispatch.
+    let Ok((handle, file_size)) = source.open_once().await else {
+        return Ok(false);
+    };
 
-    let mut bom = [0u8; 2];
-    let bom_len = file.read(&mut bom).await?;
-    if bom_len == 2 && is_utf16_bom(&bom) {
-        let mut bytes = bom.to_vec();
-        file.read_to_end(&mut bytes).await?;
+    // One buffer for every window: the scan carries its trailing partial line in `carry`, so a
+    // window is scanned and refilled rather than held. Sized to the first window, the largest
+    // any of them asks for.
+    let mut filled = std::cmp::min(SCAN_WINDOW as u64, file_size) as usize;
+    // SAFETY: only `buffer[..filled]` is read, which the read before it filled exactly.
+    let mut buffer = unsafe { lore_io::uninit_buffer(filled) };
+    buffer = handle
+        .read_window(WindowRead::new(buffer, 0, filled), 0)
+        .await?;
+
+    if filled >= 2 && is_utf16_bom(&buffer[..2]) {
+        let bytes = if filled as u64 == file_size {
+            buffer.freeze()
+        } else {
+            handle.read_all(file_size as usize).await?
+        };
         return Ok(infer_is_conflicted_by_str(&decode_text_for_display(&bytes)));
     }
 
-    file.seek(std::io::SeekFrom::Start(0)).await?;
-    let reader = tokio::io::BufReader::new(file);
-
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if infer_is_conflicted_by_line(line.as_str()) {
-            return Ok(true);
+    // Stream fixed windows, scanning complete lines and carrying the
+    // trailing partial line across window boundaries.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let window = &buffer[..filled];
+        let mut start = 0usize;
+        while let Some(newline) = window[start..].iter().position(|&byte| byte == b'\n') {
+            let end = start + newline;
+            let result = if carry.is_empty() {
+                scan_line(&window[start..end])
+            } else {
+                carry.extend_from_slice(&window[start..end]);
+                let result = scan_line(&carry);
+                carry.clear();
+                result
+            };
+            match result {
+                LineScan::Conflicted => return Ok(true),
+                LineScan::NotText => return Ok(false),
+                LineScan::Clean => {}
+            }
+            start = end + 1;
         }
+        carry.extend_from_slice(&window[start..]);
+        offset += filled as u64;
+        if offset >= file_size {
+            break;
+        }
+        filled = std::cmp::min(SCAN_WINDOW as u64, file_size - offset) as usize;
+        buffer = handle
+            .read_window(WindowRead::new(buffer, 0, filled), offset)
+            .await?;
     }
-    Ok(false)
+    Ok(!carry.is_empty() && matches!(scan_line(&carry), LineScan::Conflicted))
 }
 
-/// Checks if a file contains diffable data.
+/// Checks if content contains diffable data.
 ///
 /// # Arguments
 ///
-/// * `path` - An absolute path to the file to check.
-pub async fn infer_is_diffable_by_path(path: &Path) -> io::Result<bool> {
-    // Inspect the first 4 KiB of the file at most.
-    let buffer = infer_into_buffer(path, 4 * 1024).await?;
-    Ok(infer_is_diffable_by_slice(buffer.as_slice()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::infer_is_diffable_by_slice;
-    use super::infer_is_utf8_by_slice;
-
-    #[test]
-    fn is_utf8() {
-        let one_sparkle_heart = vec![240, 159, 146, 150];
-        assert!(
-            infer_is_utf8_by_slice(&one_sparkle_heart),
-            "One sparkle heart is UTF-8"
-        );
-
-        let two_sparkle_hearts = vec![240, 159, 146, 150, 240, 159, 146, 150];
-        assert!(
-            infer_is_utf8_by_slice(&two_sparkle_hearts),
-            "Two sparkle hearts are UTF-8"
-        );
-
-        let two_sparkle_hearts_truncated = vec![240, 159, 146, 150, 240, 159, 146];
-        assert!(
-            !infer_is_utf8_by_slice(&two_sparkle_hearts_truncated),
-            "Two sparkle hearts with the last one truncated does not count as UTF-8"
-        );
-
-        let three_sparkle_heart_invalid = vec![240, 159, 146, 150, 240, 159, 240, 159, 146, 150];
-        assert!(
-            !infer_is_utf8_by_slice(&three_sparkle_heart_invalid),
-            "Three sparkle hearts with the middle one being invalid does not count as UTF-8"
-        );
-    }
-
-    #[test]
-    fn non_diffable_utf16_le_bom() {
-        let mut bytes = vec![0xFF, 0xFE];
-        bytes.extend("Hello\nWorld\n".encode_utf16().flat_map(u16::to_le_bytes));
-        assert!(
-            !infer_is_diffable_by_slice(&bytes),
-            "UTF-16 LE BOM must be non-diffable so merge falls into the binary-conflict path that preserves bytes"
-        );
-    }
-
-    #[test]
-    fn non_diffable_utf16_be_bom() {
-        let mut bytes = vec![0xFE, 0xFF];
-        bytes.extend("Hello\nWorld\n".encode_utf16().flat_map(u16::to_be_bytes));
-        assert!(
-            !infer_is_diffable_by_slice(&bytes),
-            "UTF-16 BE BOM must be non-diffable so merge falls into the binary-conflict path that preserves bytes"
-        );
-    }
+/// * `source` - Where the content to check is read from.
+pub async fn infer_is_diffable(source: &ContentSource<'_>) -> io::Result<bool> {
+    // Inspect the first 4 KiB of the content at most.
+    let buffer = infer_into_buffer(source, 4 * 1024).await?;
+    Ok(infer_is_diffable_by_slice(buffer.as_ref()))
 }

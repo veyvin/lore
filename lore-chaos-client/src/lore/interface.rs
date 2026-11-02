@@ -107,8 +107,11 @@ impl LoreInterface {
                 branch: other_branch.clone(),
                 message: Default::default(),
                 no_commit: 0,
+                link_paths: Default::default(),
+                link_messages: Default::default(),
                 link: Default::default(),
                 ignore_links: 0,
+                inherit_metadata: Default::default(),
             },
             Some(Box::new(move |event| match event {
                 LoreEvent::BranchMergeStartEnd(event) => {
@@ -272,6 +275,7 @@ impl LoreInterface {
                     .clone()
                     .map(LoreString::from)
                     .unwrap_or_default(),
+                link: LoreString::default(),
             },
             Some(Box::new(move |event| error_and_log!(span, event))),
         ));

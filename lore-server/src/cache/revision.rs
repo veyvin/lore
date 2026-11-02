@@ -13,9 +13,13 @@
 //! resulting hash is stored in the mutable store under a
 //! `revision_list_step_key`.
 //!
-//! All operations are best-effort: any failure aborts the cache write or
-//! returns `None`, so reads always have a correct fallback path.
+//! Cache writes are best-effort: any failure aborts the write, and the entry
+//! is rebuilt on the next lookup. Cache reads distinguish a missing entry —
+//! answered by the slower fallback path — from a store that is overloaded or
+//! failing, which is reported so the caller does not escalate to a full
+//! parent-chain walk against a store that cannot serve it.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -24,12 +28,19 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::typed_bytes::TypedBytes;
+use lore_error_set::prelude::*;
 use lore_revision::branch;
+use lore_revision::find::FindMatchResult;
+use lore_revision::find::find_revision;
 use lore_revision::immutable;
 use lore_revision::lore::BranchId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::revision;
+use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
+use lore_revision::state::StateError;
+use lore_storage::StoreError;
 use tracing::debug;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -37,6 +48,7 @@ use zerocopy::IntoBytes;
 use crate::grpc::get_write_token;
 
 /// Header size in bytes — written at offset 0 of every cached blob.
+#[lore_macro::test_pub]
 const HEADER_SIZE: usize = std::mem::size_of::<branch::CachedRevisionListHeader>();
 /// Item size in bytes — packed contiguously after the header.
 const ITEM_SIZE: usize = std::mem::size_of::<branch::CachedRevisionItem>();
@@ -55,6 +67,7 @@ pub(crate) struct SegmentWalk {
 /// `Bytes` slice into the original buffer; `items()` reinterprets that
 /// slice as `&[CachedRevisionItem]` without copying. The header has
 /// already been validated when the value exists.
+#[lore_macro::test_pub]
 pub(crate) struct CachedRevisionList {
     items_bytes: Bytes,
 }
@@ -100,15 +113,44 @@ impl CachedRevisionList {
     }
 }
 
+/// Interpret a cache read. `Ok(None)` is a miss the caller answers from the
+/// slower fallback path; `is_missing` decides which failures count as one.
+/// Every other failure is forwarded rather than reported as a miss.
+#[track_caller]
+fn interpret_cache_read<T, E: ErrorSet>(
+    result: Result<T, E>,
+    is_missing: impl FnOnce(&E) -> bool,
+) -> Result<Option<T>, StateError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_missing(&err) => Ok(None),
+        Err(err) => Err(err).forward_any::<StateError>("reading revision acceleration data"),
+    }
+}
+
+/// Acceleration data is an optimisation, so an entry that cannot be read
+/// costs time rather than correctness: every failure but backpressure is
+/// answered as a miss and left to the slower path. Backpressure is the one
+/// failure that must not be, since the slower path is more work against the
+/// store that asked for less.
+fn acceleration_miss<T>(result: Result<Option<T>, StateError>) -> Result<Option<T>, StateError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) if err.is_slow_down() => Err(err),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Load the cached list at the boundary containing `revision_number`.
-/// Returns `None` on any error or missing/invalid data. The returned
-/// list lets callers iterate items in place without copying.
+/// Returns `Ok(None)` when no valid entry exists. The returned list lets
+/// callers iterate items in place without copying.
+#[lore_macro::test_pub]
 pub(crate) async fn load_cached_list(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     revision_number: u64,
     step_size: u64,
-) -> Option<CachedRevisionList> {
+) -> Result<Option<CachedRevisionList>, StateError> {
     let (key, key_type) = branch::revision_list_step_key(
         repository::SALT_LORE,
         repository.id,
@@ -117,41 +159,52 @@ pub(crate) async fn load_cached_list(
         step_size,
     );
 
-    let blob_hash = repository
-        .clone()
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .ok()?;
+    let blob_hash = interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )?;
 
-    if blob_hash.is_zero() {
-        return None;
-    }
+    let Some(blob_hash) = blob_hash.filter(|hash| !hash.is_zero()) else {
+        return Ok(None);
+    };
 
-    let bytes = immutable::read(
-        repository.clone(),
-        Address::zero_context_hash(blob_hash),
-        None,
-        immutable::read_options_from_repository(repository).with_cache(),
-    )
-    .await
-    .ok()?
-    .to_aligned::<branch::CachedRevisionItem>();
+    // A blob whose payload has been reclaimed is as good as absent: the
+    // entry is rebuilt from the parent chain on the next backfill.
+    let bytes = interpret_cache_read(
+        immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(blob_hash),
+            None,
+            immutable::read_options_from_repository(repository).with_cache(),
+        )
+        .await,
+        |err| err.is_address_not_found() || err.is_payload_not_found() || err.is_not_found(),
+    )?;
 
-    CachedRevisionList::from_blob(bytes)
+    Ok(bytes.and_then(|bytes| {
+        CachedRevisionList::from_blob(bytes.to_aligned::<branch::CachedRevisionItem>())
+    }))
 }
 
 /// If segment B containing `revision_number` is closed (proven by the
 /// skip pointer at B + `step_size`), walk `parent_self` from that anchor to
-/// populate `List_B`. Returns the cached segment items on success.
+/// populate `List_B`. Returns the cached segment items on success, or
+/// `Ok(None)` when the segment is not provably closed.
+#[lore_macro::test_pub]
 pub(crate) async fn try_backfill_segment(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     revision_number: u64,
     step_size: u64,
-) -> Option<CachedRevisionList> {
+) -> Result<Option<CachedRevisionList>, StateError> {
     let target_b = revision_number.div_ceil(step_size) * step_size;
-    let next_b = target_b.checked_add(step_size)?;
+    let Some(next_b) = target_b.checked_add(step_size) else {
+        return Ok(None);
+    };
 
     let (next_key, next_key_type) = branch::revision_step_key(
         repository::SALT_LORE,
@@ -160,21 +213,23 @@ pub(crate) async fn try_backfill_segment(
         next_b,
         step_size,
     );
-    let anchor = repository
-        .clone()
-        .read_mutable_store()
-        .load(repository.id, next_key, next_key_type)
-        .await
-        .ok()?;
-    if anchor.is_zero() {
-        return None;
-    }
+    let anchor = interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, next_key, next_key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )?;
+    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+        return Ok(None);
+    };
 
     let stop_below = target_b.saturating_sub(step_size);
     let max_items = (step_size as usize).saturating_mul(2).saturating_add(2);
-    let walk = walk_segment_revisions(repository, anchor, stop_below, max_items).await;
+    let walk = walk_segment_revisions(repository, anchor, stop_below, max_items).await?;
     if !walk.reached_terminator {
-        return None;
+        return Ok(None);
     }
 
     let segments = partition_into_segments(&walk.items, step_size);
@@ -211,7 +266,10 @@ pub(crate) async fn store_cached_list(
     buffer.extend_from_slice(items_bytes);
     let buffer = buffer.freeze();
 
-    let Ok((address, _fragment)) = immutable::write(
+    // no filter_slow_down()? usage here: the read that prompted this write has
+    // already been answered, so a throttled blob write costs the next reader a
+    // slower lookup rather than failing anything.
+    let Ok(address) = immutable::write(
         repository.clone(),
         Context::default(),
         buffer,
@@ -230,6 +288,8 @@ pub(crate) async fn store_cached_list(
         step_size,
     );
     let write_token = get_write_token();
+    // no filter_slow_down()? usage here: same reason — a throttled key write
+    // leaves the entry to be rebuilt by a later backfill.
     if repository
         .clone()
         .write_mutable_store(&write_token)
@@ -251,13 +311,14 @@ pub(crate) async fn store_cached_list(
 /// pushed, (b) the parent chain reaches the root (zero hash), (c) the walk
 /// exceeds `max_items`, or (d) a state deserialization fails. Cases (a) and
 /// (b) set `reached_terminator = true`, signalling that the lowest segment
-/// touched is fully traversed.
+/// touched is fully traversed. A store asking the caller to back off aborts the
+/// walk instead of reporting a partial traversal as a complete one.
 pub(crate) async fn walk_segment_revisions(
     repository: &Arc<RepositoryContext>,
     anchor_hash: Hash,
     stop_below: u64,
     max_items: usize,
-) -> SegmentWalk {
+) -> Result<SegmentWalk, StateError> {
     let mut items: Vec<branch::CachedRevisionItem> = Vec::new();
     let mut hash = anchor_hash;
     let mut reached_terminator = false;
@@ -267,8 +328,10 @@ pub(crate) async fn walk_segment_revisions(
             reached_terminator = true;
             break;
         }
-        let Ok(state) = State::deserialize(repository.clone(), hash).await else {
-            break;
+        let state = match State::deserialize(repository.clone(), hash).await {
+            Ok(state) => state,
+            Err(err) if err.is_slow_down() => return Err(err),
+            Err(_) => break,
         };
         let number = state.revision_number();
         items.push(branch::CachedRevisionItem {
@@ -284,10 +347,10 @@ pub(crate) async fn walk_segment_revisions(
         hash = state.parent_self();
     }
 
-    SegmentWalk {
+    Ok(SegmentWalk {
         items,
         reached_terminator,
-    }
+    })
 }
 
 /// Partition a contiguous walk of items (highest number first) into per-segment
@@ -296,6 +359,7 @@ pub(crate) async fn walk_segment_revisions(
 /// items genuinely belong to them; this function makes no judgement about
 /// whether a segment is "fully traversed" — the caller must filter using the
 /// `reached_terminator` signal from `walk_segment_revisions`.
+#[lore_macro::test_pub]
 pub(crate) fn partition_into_segments(
     items: &[branch::CachedRevisionItem],
     step_size: u64,
@@ -324,98 +388,279 @@ pub(crate) fn partition_into_segments(
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use lore_base::types::Hash;
-    use lore_revision::branch::CachedRevisionItem;
-    use lore_revision::branch::CachedRevisionListHeader;
-    use lore_revision::state::StateData;
+/// Determine which segment boundaries are *newly closed* by this transition.
+/// A boundary `B` (multiple of `history_step_size`) is newly closed iff
+/// `older_revision_number <= B < newer_revision_number`.
+pub fn sealed_boundaries(
+    older_revision_number: u64,
+    newer_revision_number: u64,
+    history_step_size: u64,
+) -> Option<(u64, u64)> {
+    debug_assert!(older_revision_number <= newer_revision_number);
 
-    use super::*;
+    let lowest_b = older_revision_number.div_ceil(history_step_size) * history_step_size;
 
-    fn item(number: u64) -> CachedRevisionItem {
-        CachedRevisionItem {
-            number,
-            signature: Hash::default(),
-            metadata: Hash::default(),
-            state: StateData::default(),
+    let highest_b = if newer_revision_number > 0 {
+        ((newer_revision_number - 1) / history_step_size) * history_step_size
+    } else {
+        return None;
+    };
+
+    if lowest_b == 0 || lowest_b > highest_b {
+        return None;
+    }
+
+    Some((lowest_b, highest_b))
+}
+
+/// A branch push with long feature branches could increase the linear revision history
+/// number beyond several boundaries. Each boundary should be sealed and point to the
+/// last valid revision less than that boundary
+pub async fn seal_boundary_revision_number(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    history_step_size: u64,
+    boundary_revision_number: u64,
+    older_state: &Arc<State>,
+    newer_state: &Arc<State>,
+) -> Result<(), StoreError> {
+    let revision_to_point_to = if newer_state.revision_number() <= boundary_revision_number {
+        newer_state.revision()
+    } else {
+        debug_assert!(older_state.revision_number() <= boundary_revision_number);
+        older_state.revision()
+    };
+
+    let (key, key_type) = branch::revision_step_key(
+        repository::SALT_LORE,
+        repository.id,
+        branch,
+        boundary_revision_number,
+        history_step_size,
+    );
+    let write_token = get_write_token();
+    repository
+        .write_mutable_store(&write_token)
+        .store(repository.id, key, revision_to_point_to, key_type)
+        .await
+}
+
+/// Store the history-step skip pointer (if a boundary was crossed) and any
+/// revision-list cache entries for segments newly closed by this push.
+///
+/// A segment `B` (= `N * history_step_size`) is *closed* by this push iff
+/// `parent_revision_number <= B < revision_number`. A single push can close
+/// multiple segments (e.g. a merge that jumps past several boundaries). For
+/// each closed segment we walk `parent_self` from `state` and persist the
+/// items whose number falls in `(B - step, B]`.
+///
+/// Errors are ignored — this is purely an acceleration construct and will be
+/// recreated on the next lookup if any step fails.
+pub async fn store_history_step(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    older_state: Arc<State>,
+    newer_state: Arc<State>,
+) {
+    let Some((lowest_b, highest_b)) = sealed_boundaries(
+        older_state.revision_number(),
+        newer_state.revision_number(),
+        history_step_size,
+    ) else {
+        return;
+    };
+
+    if acceleration.step_keys {
+        for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+            // no filter_slow_down()? usage here: sealing is a best-effort
+            // acceleration write, so a throttled store costs the next reader a
+            // slower lookup rather than failing this push.
+            let _ = seal_boundary_revision_number(
+                repository.clone(),
+                branch,
+                history_step_size,
+                boundary,
+                &older_state,
+                &newer_state,
+            )
+            .await;
         }
     }
 
-    #[test]
-    fn partition_empty_input_returns_empty() {
-        assert!(partition_into_segments(&[], 100).is_empty());
+    if !acceleration.list_cache {
+        return;
     }
 
-    #[test]
-    fn partition_single_segment() {
-        // Items 200..101 all live in segment 200 (div_ceil(N, 100) * 100).
-        let items: Vec<_> = (101..=200).rev().map(item).collect();
-        let segments = partition_into_segments(&items, 100);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, 200);
-        assert_eq!(segments[0].1.len(), 100);
-        assert_eq!(segments[0].1[0].number, 200);
-        assert_eq!(segments[0].1[99].number, 101);
+    // Walk parent chain from the new revision until we cross below the lowest
+    // closed segment, capturing items for each closed boundary.
+    let stop_below = lowest_b.saturating_sub(history_step_size);
+    let span_segments = (highest_b.saturating_sub(lowest_b) / history_step_size) + 1;
+    let max_items = (span_segments as usize)
+        .saturating_mul(history_step_size as usize)
+        // Allow a small overshoot so partial segments above the closed range
+        // (the still-open one containing N) and the one terminator item can
+        // still be walked.
+        .saturating_add(history_step_size as usize)
+        .saturating_add(1);
+
+    // no filter_slow_down()? usage here: the list-cache write is best-effort,
+    // so a throttled walk leaves the entry to be rebuilt by a later backfill.
+    let Ok(walk) =
+        walk_segment_revisions(&repository, newer_state.revision(), stop_below, max_items).await
+    else {
+        return;
+    };
+
+    if !walk.reached_terminator {
+        // Walk was bounded by max_items; the last segment may be partial.
+        // Skip cache writes — next reader will rebuild them via backfill.
+        return;
     }
 
-    #[test]
-    fn partition_splits_at_segment_boundary() {
-        // 101 lives in segment 200, 100 lives in segment 100, 1 in segment 100.
-        let items: Vec<_> = [101, 100, 1].iter().map(|&n| item(n)).collect();
-        let segments = partition_into_segments(&items, 100);
-        assert_eq!(segments.len(), 2);
-        // Walk order: highest segment first.
-        assert_eq!(segments[0].0, 200);
-        assert_eq!(segments[0].1.len(), 1);
-        assert_eq!(segments[0].1[0].number, 101);
-        assert_eq!(segments[1].0, 100);
-        assert_eq!(segments[1].1.len(), 2);
-        assert_eq!(segments[1].1[0].number, 100);
-        assert_eq!(segments[1].1[1].number, 1);
+    let segments = partition_into_segments(&walk.items, history_step_size);
+    for (segment_b, list) in segments {
+        if segment_b >= lowest_b && segment_b <= highest_b {
+            store_cached_list(&repository, branch, segment_b, history_step_size, &list).await;
+        }
+    }
+}
+
+/// Resolve `branch` revision `revision_number` to its signature, consulting
+/// the step acceleration structures before walking history.
+///
+/// A cached segment covering the number answers it outright. Otherwise the
+/// sealed boundary at or above the number anchors a bounded walk. Anything not
+/// served from acceleration data falls through to [`revision::resolve`], so an
+/// absent or unusable entry costs time rather than correctness. The one
+/// exception is a store asking the caller to back off: the fallback is more
+/// work against that store, so it is reported instead of walked.
+pub async fn resolve_revision_number(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Hash, StateError> {
+    if let Some(signature) = resolve_from_acceleration(
+        repository,
+        branch,
+        revision_number,
+        history_step_size,
+        acceleration,
+    )
+    .await?
+    {
+        return Ok(signature);
     }
 
-    #[test]
-    fn partition_single_item_at_segment_top() {
-        // Revision 100 sits at the top of segment 100, not segment 200.
-        let segments = partition_into_segments(&[item(100)], 100);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, 100);
+    revision::resolve_boxed(
+        repository.clone(),
+        format!("{branch}@{revision_number}"),
+        ResolveSearchLocation::Local,
+    )
+    .await
+}
+
+/// Signature for `revision_number` if the acceleration structures can supply
+/// it, or `None` when the caller must walk history.
+async fn resolve_from_acceleration(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Option<Hash>, StateError> {
+    if acceleration.list_cache
+        && let Some(cached) = acceleration_miss(
+            load_cached_list(repository, branch, revision_number, history_step_size).await,
+        )?
+        && let Some(item) = cached
+            .items()
+            .iter()
+            .find(|item| item.number == revision_number)
+    {
+        debug!(
+            number = revision_number,
+            "Resolved revision number from cached segment"
+        );
+        return Ok(Some(item.signature));
     }
 
-    #[test]
-    fn partition_handles_run_of_segments() {
-        // Span four segments worth of items in walk order.
-        let items: Vec<_> = (1..=350).rev().map(item).collect();
-        let segments = partition_into_segments(&items, 100);
-        // Segments: 400 (350..301), 300 (300..201), 200 (200..101), 100 (100..1).
-        assert_eq!(segments.len(), 4);
-        assert_eq!(segments[0].0, 400);
-        assert_eq!(segments[0].1.len(), 50);
-        assert_eq!(segments[1].0, 300);
-        assert_eq!(segments[1].1.len(), 100);
-        assert_eq!(segments[2].0, 200);
-        assert_eq!(segments[2].1.len(), 100);
-        assert_eq!(segments[3].0, 100);
-        assert_eq!(segments[3].1.len(), 100);
+    if !acceleration.step_keys {
+        return Ok(None);
     }
 
-    /// Sanity check: the on-disk struct sizes don't accidentally
-    /// change. Any field/layout change must also bump
-    /// `CACHED_REVISION_LIST_VERSION` and update these numbers.
-    #[test]
-    fn cached_revision_item_size_is_stable() {
-        assert_eq!(std::mem::size_of::<CachedRevisionListHeader>(), 8);
-        assert_eq!(std::mem::align_of::<CachedRevisionListHeader>(), 4);
-        assert_eq!(std::mem::size_of::<CachedRevisionItem>(), 392);
-        assert_eq!(std::mem::align_of::<CachedRevisionItem>(), 8);
-    }
+    resolve_via_step_key(repository, branch, revision_number, history_step_size).await
+}
 
-    /// Header offset is item-aligned (8): items at offset
-    /// `HEADER_SIZE = 8` end up properly aligned for the
-    /// `as_type_slice::<CachedRevisionItem>` view in `items()`.
-    #[test]
-    fn header_size_preserves_item_alignment() {
-        assert_eq!(HEADER_SIZE % std::mem::align_of::<CachedRevisionItem>(), 0);
-    }
+/// Signature for `revision_number`, reached from the sealed boundary covering
+/// it. `None` when the boundary is unsealed or its anchor does not lead to the
+/// number, which leaves the caller to walk history.
+///
+/// The anchor is the highest revision numbered at or below its boundary, so a
+/// walk from it reaches every revision the boundary's segment contains. An
+/// anchor that does not lead to `revision_number` is reported as `None` rather
+/// than as absence: acceleration data can be stale or predate a key change, and
+/// a caller that treated that as "no such revision" would report an existing
+/// revision as missing.
+pub(crate) async fn resolve_via_step_key(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+) -> Result<Option<Hash>, StateError> {
+    let (key, key_type) = branch::revision_step_key(
+        repository::SALT_LORE,
+        repository.id,
+        branch,
+        revision_number,
+        history_step_size,
+    );
+    let anchor = acceleration_miss(interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    ))?;
+    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+        return Ok(None);
+    };
+
+    // An anchor holding the highest revision at or below its boundary is at
+    // most one segment above the target, so a walk longer than that is reading
+    // an anchor that does not describe the branch any more. Give up and let
+    // the caller walk history rather than following it.
+    let search_limit = (history_step_size as usize).saturating_add(1);
+    let signature = find_revision(
+        repository.clone(),
+        branch,
+        anchor,
+        false,
+        Some(search_limit),
+        |state, _metadata| match state.revision_number().cmp(&revision_number) {
+            Ordering::Equal => FindMatchResult::Match,
+            Ordering::Less => FindMatchResult::Abort,
+            Ordering::Greater => FindMatchResult::Continue,
+        },
+    )
+    .await;
+    let Some(signature) = acceleration_miss(
+        signature
+            .forward_any::<StateError>("resolving revision from history step key")
+            .map(Some),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    debug!(
+        number = revision_number,
+        key = %key,
+        "Resolved revision number from history step key"
+    );
+    Ok(Some(signature))
 }

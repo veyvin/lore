@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::UnknownCommand;
@@ -18,8 +19,13 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::client_identify::ClientIdentify;
 use crate::protocol::storage::authorize::AuthorizeAction;
 use crate::protocol::storage::authorize::parse_authorize;
 use crate::protocol::storage::copy::handle_copy;
@@ -66,6 +72,7 @@ pub enum ParsedStorageRequestV4 {
         opcode: QuicOpCode,
         payload: Bytes,
     },
+    ClientIdentify(ClientIdentify),
 }
 
 fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
@@ -84,27 +91,34 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
     }
 }
 
+#[lore_macro::test_pub]
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     session_map: Arc<SessionMap>,
+    user_agent_filter: Arc<UserAgentFilter>,
 }
 
 impl StorageServiceV4 {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
             session_map: Arc::new(SessionMap::default()),
+            user_agent_filter,
         }
     }
 }
@@ -129,6 +143,12 @@ impl QuicService for StorageServiceV4 {
 
         if opcode == RESERVED_OPCODE_PING || opcode == RESERVED_OPCODE_CORRELATE {
             return Err(MessageParseError::UnknownOpcode(opcode));
+        }
+
+        if opcode == Command::ClientIdentify as u8 {
+            return Ok(ParsedStorageRequestV4::ClientIdentify(
+                ClientIdentify::parse(bytes, false)?,
+            ));
         }
 
         if opcode == Command::Authorize as u8 {
@@ -159,16 +179,22 @@ impl QuicService for StorageServiceV4 {
 
     async fn run_request_handler(
         &self,
-        _context: Arc<AttributeMap>,
+        context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
         match request {
+            ParsedStorageRequestV4::ClientIdentify(msg) => {
+                msg.apply(&context, &self.user_agent_filter);
+                Ok(vec![])
+            }
             ParsedStorageRequestV4::AuthorizeStart {
                 repository,
                 correlation_id,
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let grants;
+                let mut token = None;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -186,14 +212,34 @@ impl QuicService for StorageServiceV4 {
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                    let verified = VerifiedToken {
+                        raw: &token_str,
+                        claims: &authorization,
+                    };
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(Some(&verified), repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
+                    token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
+                } else {
+                    // Enumerated without a token too, so each command is a set
+                    // lookup rather than an authorizer call.
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(None, repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, grants, token) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -226,6 +272,13 @@ impl QuicService for StorageServiceV4 {
                 opcode,
                 payload,
             } => {
+                // Parse the storage command payload using v4-aware parsers — Copy carries an
+                // extra `target_context` field on the wire that the legacy parser cannot decode.
+                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
+                    tracing::warn!("Failed to parse v4 storage command: {err}");
+                    MessageHandleError::InternalError
+                })?;
+
                 let session_map = self.session_map.clone();
                 let session = session_map
                     .get(session_id)
@@ -234,14 +287,32 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
-                drop(session);
+                let token = session.token.clone();
+                let authorized_sources = session.authorized_sources.clone();
 
-                // Parse the storage command payload using v4-aware parsers — Copy carries an
-                // extra `target_context` field on the wire that the legacy parser cannot decode.
-                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
-                    tracing::warn!("Failed to parse v4 storage command: {err}");
-                    MessageHandleError::InternalError
-                })?;
+                // Answered from the session's grants while they are borrowed, so
+                // the per-command check copies nothing. `Some(None)`: the
+                // authorizer could not enumerate, so it is asked below.
+                let action = parsed.required_action();
+                let enumerated = action
+                    .map(|action| session.grants.as_ref().map(|grants| grants.permits(action)));
+                drop(session);
+                let permitted = match (action, enumerated) {
+                    (Some(action), Some(None)) => {
+                        let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                        self.repository_authorizer
+                            .check_repository_access(verified.as_ref(), repository, action)
+                            .await
+                            .is_ok()
+                    }
+                    (_, Some(Some(permitted))) => permitted,
+                    _ => true,
+                };
+                if !permitted {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "Action not permitted".to_string(),
+                    ));
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {
@@ -294,6 +365,31 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Copy(copy) => {
+                        // The destination was checked at this session's start;
+                        // a cross-partition source is this command's own
+                        // question, asked with this session's token — another
+                        // session's authorization on the connection must not
+                        // vouch for it. A source this session's token already
+                        // cleared is remembered, so a repeated copy from it
+                        // skips the check.
+                        if copy.source_repository != repository
+                            && !authorized_sources.contains(&copy.source_repository)
+                        {
+                            let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                            self.repository_authorizer
+                                .check_repository_access(
+                                    verified.as_ref(),
+                                    copy.source_repository,
+                                    Action::Read,
+                                )
+                                .await
+                                .map_err(|status| {
+                                    MessageHandleError::AuthorizationFailure(
+                                        status.message().to_string(),
+                                    )
+                                })?;
+                            authorized_sources.insert(copy.source_repository);
+                        }
                         handle_copy(
                             copy.source_repository,
                             copy.source_address,
@@ -301,7 +397,6 @@ impl QuicService for StorageServiceV4 {
                             copy.target_context,
                             correlation_id,
                             user_id,
-                            Some(&session_map),
                             self.immutable_store.clone(),
                         )
                         .await
@@ -314,6 +409,32 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             user_id,
                             self.mutable_store.clone(),
+                        )
+                        .await
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::GetResolved(resolved) => {
+                        crate::protocol::storage::get_resolved::handle_get_resolved(
+                            resolved.key,
+                            resolved.context,
+                            resolved.flags,
+                            repository,
+                            correlation_id,
+                            user_id,
+                            self.mutable_store.clone(),
+                            self.immutable_store.clone(),
+                        )
+                        .await
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::PutResolved(resolved) => {
+                        crate::protocol::storage::put_resolved::handle_put_resolved(
+                            resolved.key,
+                            resolved.put(),
+                            resolved.address,
+                            repository,
+                            correlation_id,
+                            user_id,
+                            self.mutable_store.clone(),
+                            self.immutable_store.clone(),
                         )
                         .await
                     }
@@ -434,6 +555,7 @@ impl QuicService for StorageServiceV4 {
             ),
         };
 
+        let user_agent = context.get::<crate::protocol::client_identify::UserAgentValue>();
         build_storage_protocol_request_span(
             header.cmd,
             StorageProtocol::StorageV4,
@@ -441,80 +563,9 @@ impl QuicService for StorageServiceV4 {
             &repository_id,
             &correlation_id,
             &user_id,
+            user_agent
+                .as_ref()
+                .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_transport::quic::QuicServiceError;
-    use rand::random;
-
-    use super::*;
-    use crate::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
-    use crate::quic::QuicService;
-    use crate::store::test_store_create;
-
-    /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
-    /// verifying the handler returns `SlowDown` and that `transform_protocol_error`
-    /// classifies it the same way `stream_handler` would.
-    #[tokio::test]
-    async fn authorize_start_returns_slow_down_when_session_limit_reached() {
-        let (immutable_store, mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let service = StorageServiceV4::new(
-            Arc::new(None),
-            immutable_store.clone(),
-            immutable_store.clone(),
-            mutable_store,
-        );
-
-        let repo = random::<lore_revision::lore::RepositoryId>();
-
-        // Fill the session map to capacity via the handler (jwt_verifier is None,
-        // so each call goes straight to session_map.start with no I/O).
-        for i in 0..MAX_CONCURRENT_SESSIONS {
-            let result = service
-                .run_request_handler(
-                    AttributeMap::default().into(),
-                    ParsedStorageRequestV4::AuthorizeStart {
-                        repository: repo,
-                        correlation_id: format!("fill-{i}"),
-                        auth_token: vec![],
-                    },
-                )
-                .await;
-            assert!(result.is_ok(), "session {i} should succeed");
-        }
-
-        // One more must hit the limit.
-        let err = service
-            .run_request_handler(
-                AttributeMap::default().into(),
-                ParsedStorageRequestV4::AuthorizeStart {
-                    repository: repo,
-                    correlation_id: "over-limit".into(),
-                    auth_token: vec![],
-                },
-            )
-            .await
-            .expect_err("expected SlowDown when session limit is reached");
-
-        assert!(
-            matches!(err, MessageHandleError::SessionLimitReached),
-            "expected SessionLimitReached, got {err:?}"
-        );
-
-        // Verify stream_handler classification: SlowDown on the wire, not an internal
-        // error, and suppressed from logging (same suppression path as SlowDown).
-        let error_info = service.transform_protocol_error(&err);
-        assert_eq!(
-            error_info.response_error_code,
-            QuicServiceError::SlowDown as QuicErrorStatus,
-        );
-        assert_eq!(error_info.message_handle_label, "SessionLimitReached");
-        assert!(!error_info.is_internal_error);
-        assert!(!error_info.is_appropriate_for_logging);
     }
 }

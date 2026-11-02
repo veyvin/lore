@@ -10,16 +10,13 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use lore_base::error::NoRemote;
     use lore_revision::branch::BranchLatestHistory;
     use lore_revision::immutable;
     use lore_revision::immutable::ReadFromImmutable;
     use lore_revision::immutable::read_options_from_repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::options::WriteOptions;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use rand::random;
 
@@ -70,7 +67,6 @@ mod tests {
     async fn write_and_read_chunked() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let (immutable_store, mutable_store, execution) =
@@ -82,14 +78,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository),
                 ));
 
                 let options = immutable::read_options_from_repository(&repository);
@@ -108,7 +99,7 @@ mod tests {
                     .collect();
                 let payload = Bytes::copy_from_slice(payload.as_slice());
 
-                let (address, _fragment) = immutable::write(
+                let address = immutable::write(
                     repository.clone(),
                     context,
                     payload.clone(),
@@ -167,7 +158,6 @@ mod tests {
     async fn test_verify_fragment() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -261,7 +251,6 @@ mod tests {
     async fn test_verify_fragment_multiple_contexts() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -350,7 +339,6 @@ mod tests {
     async fn test_verify_fragment_not_found() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -429,7 +417,6 @@ mod tests {
     async fn test_verify_fragment_not_first_in_index() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -536,7 +523,6 @@ mod tests {
     async fn test_verify_fragment_match_repository() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -643,7 +629,6 @@ mod tests {
     async fn test_verify_fragment_match_full() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -732,7 +717,6 @@ mod tests {
     async fn test_verify_fragment_corrupted_no_heal() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -836,7 +820,6 @@ mod tests {
     async fn test_verify_fragment_corrupted_heal() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -922,16 +905,18 @@ mod tests {
                 // heal=true with corruption should heal
                 assert!(result.healed);
 
-                // Verify once more, now the verification should succeed, but the packfile should be
-                // set to 0
+                // Verify once more. Healing dropped the association that named the corrupt
+                // payload rather than clearing its pack file, so there is nothing left to verify
+                // and the store answers absence - which is what has the content offered again.
                 let result = store
                     .clone()
                     .verify_fragment(address, repository, StoreMatch::MatchFull, false)
-                    .await
-                    .expect("verify_fragment failed");
+                    .await;
 
-                assert_eq!(result.matches.len(), 1);
-                assert_eq!(result.matches[0].data.pack_file, 0);
+                assert!(
+                    result.is_err_and(|error| error.is_address_not_found()),
+                    "healing left behind an association naming a payload the store cannot serve"
+                );
             })
             .await;
     }
@@ -940,7 +925,6 @@ mod tests {
     async fn test_verify_fragment_match_full_wrong_context() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -1015,7 +999,6 @@ mod tests {
     async fn test_read_zero_hash_returns_zero_initialized() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -1025,14 +1008,9 @@ mod tests {
                 let repository = random::<RepositoryId>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository),
                 ));
 
                 let zero_address = Address::zero_context_hash(Hash::default());
@@ -1078,14 +1056,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // 2 MiB of random data with 256-byte fixed chunks creates ~8192
@@ -1098,17 +1071,9 @@ mod tests {
                 let payload = Bytes::copy_from_slice(payload.as_slice());
 
                 let flags = WriteOptions::default().with_fixed_size_chunk(256);
-                let (address, fragment) =
-                    immutable::write(repository.clone(), context, payload.clone(), flags)
-                        .await
-                        .expect("Failed writing to store");
-
-                // Verify the data is fragmented
-                assert!(
-                    fragment.flags & lore_storage::FragmentFlags::PayloadFragmented
-                        == lore_storage::FragmentFlags::PayloadFragmented,
-                    "Expected PayloadFragmented flag"
-                );
+                let address = immutable::write(repository.clone(), context, payload.clone(), flags)
+                    .await
+                    .expect("Failed writing to store");
 
                 // Read into file using the pipeline
                 let output_path = dir.join("output_file");
@@ -1117,11 +1082,18 @@ mod tests {
                     repository.clone(),
                     address,
                     output_path.as_path(),
+                    None,
                     options,
                 )
                 .await
                 .expect("read_into_file failed");
 
+                // Verify the data was stored fragmented
+                assert!(
+                    read_fragment.flags & lore_storage::FragmentFlags::PayloadFragmented
+                        == lore_storage::FragmentFlags::PayloadFragmented,
+                    "Expected PayloadFragmented flag"
+                );
                 assert_eq!(read_fragment.size_content, payload_size as u64);
 
                 // Verify file content matches original payload
@@ -1151,14 +1123,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 let payload_size = 2 * 1024 * 1024;
@@ -1168,16 +1135,16 @@ mod tests {
                 let payload = Bytes::copy_from_slice(payload.as_slice());
 
                 let flags = WriteOptions::default().with_fixed_size_chunk(256);
-                let (address, _fragment) =
-                    immutable::write(repository.clone(), context, payload.clone(), flags)
-                        .await
-                        .expect("Failed writing to store");
+                let address = immutable::write(repository.clone(), context, payload.clone(), flags)
+                    .await
+                    .expect("Failed writing to store");
 
                 // Read via stream and collect all buffers
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(64);
                 let options = immutable::read_options_from_repository(&repository);
                 let content_length =
-                    immutable::read_stream(repository.clone(), address, options, tx)
+                    immutable::read_stream(repository.clone(), address, None, options, tx)
                         .await
                         .expect("read_stream failed");
 
@@ -1185,6 +1152,7 @@ mod tests {
 
                 let mut reassembled = Vec::with_capacity(payload_size);
                 while let Some(chunk) = rx.recv().await {
+                    let chunk = chunk.expect("stream reported a mid-stream failure");
                     reassembled.extend_from_slice(chunk.as_ref());
                 }
 
@@ -1211,14 +1179,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // 1 MiB of random data — standard chunking produces a 1-level tree
@@ -1228,7 +1191,7 @@ mod tests {
                     .collect();
                 let payload = Bytes::copy_from_slice(payload.as_slice());
 
-                let (address, _fragment) = immutable::write(
+                let address = immutable::write(
                     repository.clone(),
                     context,
                     payload.clone(),
@@ -1243,6 +1206,7 @@ mod tests {
                     repository.clone(),
                     address,
                     output_path.as_path(),
+                    None,
                     options,
                 )
                 .await

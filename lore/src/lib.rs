@@ -3,7 +3,10 @@
 pub mod args;
 pub mod auth;
 pub mod branch;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
+#[cfg(feature = "test-util")]
+pub mod call;
 pub mod call_delegation;
 pub mod dependency;
 pub mod file;
@@ -23,48 +26,70 @@ pub mod storage;
 mod util;
 
 use interface::LoreString;
+pub use lore_base::lore_spawn;
+pub use lore_base::lore_spawn_blocking;
 pub use lore_base::version::LORE_LIBRARY_VERSION;
+/// Whole crate rather than a prelude: `#[error_set]` expands to paths rooted at the crate, so a
+/// consumer aliases this into scope as `lore_error_set`.
+pub use lore_error_set as error_set;
 
-pub fn shutdown() {
-    // Close every outstanding storage handle before connections drop and the runtime tears
-    // down. The close sequence (mark invalid, drain in-flight, spawn flush) must run inside
-    // an async context to await the per-handle drains. Three runtime contexts are possible:
-    //   1. No tokio runtime on the calling thread (typical FFI entry from C): use the
-    //      shared multi-thread runtime via `block_on`.
-    //   2. A multi-thread runtime is current: `block_in_place` lets us block this worker
-    //      thread while the runtime keeps other workers running.
-    //   3. A single-thread runtime is current (`#[tokio::test]`, embedders, etc.):
-    //      `block_in_place` would panic. Spawn the close into the current handle and run a
-    //      best-effort wait via `futures::executor::block_on`-style polling — but tokio
-    //      offers no clean primitive for that, so we instead spawn into the shared
-    //      multi-thread runtime and block there.
-    let close_future = async {
-        storage::close_all_handles().await;
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(move || {
-                handle.block_on(close_future);
+/// Time allowed for each wait shutdown drives from a synchronous caller: the drains before the
+/// runtime shutdown, whose timeout in `lore_revision::interface::shutdown` it matches, and the
+/// reads of calls cut short after it.
+const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shuts the library down, returning whether this call was the one that did it.
+///
+/// Only the first caller runs the teardown. Every other gets `false`, so a
+/// concurrent caller can report the library as already shut down rather than
+/// racing a second teardown against the first.
+///
+/// Claiming the shutdown also closes admission, so calls that arrive while the
+/// drains below are still running fail instead of being admitted onto runtimes
+/// that are about to go away.
+///
+/// Safe only once every call has completed. Calls still executing are cancelled at best effort: one
+/// not stopped in time may use the memory passed to it after this returns.
+pub fn shutdown() -> bool {
+    if !lore_base::runtime::claim_runtime_shutdown() {
+        lore_base::lore_warn!("Shutdown was already called");
+        return false;
+    }
+
+    // Garbage collection stops alongside the drains rather than before them, so neither
+    // takes the other's share of the budget. A tree writes through the stores its parent
+    // owns, so trees drain before storage handles. The storage close sequence (mark
+    // invalid, drain in-flight, spawn flush) must run inside an async context
+    // to await the per-handle drains, and this function is synchronous wherever it is called
+    // from — see `shutdown_block_on` for the three cases and why a `current_thread` caller
+    // can only be served with a bound rather than a guarantee.
+    if !lore_base::runtime::shutdown_block_on(
+        async {
+            tokio::join!(lore_revision::repository::stop_store_gc(), async {
+                revision_tree::close_all_handles().await;
+                storage::close_all_handles().await;
             });
-        }
-        Ok(_) => {
-            // Single-threaded current runtime: bouncing into the shared multi-thread runtime
-            // would deadlock if the caller's runtime is the one driving this thread. The
-            // safest option is to drive the close on the shared runtime via a fresh worker.
-            let shared = lore_base::runtime::runtime();
-            std::thread::scope(|s| {
-                s.spawn(|| shared.block_on(close_future));
-            });
-        }
-        Err(_) => {
-            // No tokio context: drive on the shared runtime directly.
-            lore_base::runtime::runtime().block_on(close_future);
-        }
+        },
+        SHUTDOWN_WAIT,
+    ) {
+        lore_base::lore_warn!(
+            "Timed out draining during shutdown; in-flight edits or writes may be incomplete"
+        );
     }
 
     lore_revision::interface::drop_connections();
 
     lore_revision::interface::shutdown();
+
+    storage::lent::await_abandoned(SHUTDOWN_WAIT);
+
+    // Services this process started are otherwise collected when the next
+    // service call comes, and after a shutdown none will. A program whose
+    // service has already exited — stopped by someone else, or died — would
+    // hold that child unreaped for however long it outlives its Lore use.
+    remote::service_process::collect_exited_services();
+
+    true
 }
 
 pub fn runtime() -> tokio::runtime::Handle {
@@ -77,6 +102,35 @@ pub fn runtime() -> tokio::runtime::Handle {
 /// applied, `false` if a limit was already set.
 pub fn set_thread_limit(count: usize) -> bool {
     lore_base::runtime::set_thread_limit(count)
+}
+
+/// Whether calls will be carried out by the Lore service rather than in this
+/// process.
+///
+/// Answered without a runtime, so a caller that builds one can ask first — see
+/// [`size_threads_for_relaying`]. Decided once per process and cached, so asking
+/// costs one config read however often it is asked.
+pub fn will_use_service() -> bool {
+    remote::service_process::service_in_use_blocking()
+}
+
+/// Sizes this process's thread pools for relaying its calls to the service, when
+/// that is what it will do. A no-op otherwise, and a no-op once a runtime exists.
+///
+/// Call it before the first Lore operation, and before building a runtime of your
+/// own. A relaying process writes a request to a socket and reads events back
+/// while the service does the work, so pools sized for that work are threads a
+/// whole machine's worth of clients pays for and none of them uses.
+///
+/// A program that runs the service itself must not call this: it does the work
+/// rather than relaying it, whatever this machine's clients do.
+pub fn size_threads_for_relaying() {
+    if !will_use_service() {
+        return;
+    }
+    lore_base::runtime::runtime_with_settings(
+        Some(lore_base::runtime::TokioSettings::relay_only()),
+    );
 }
 
 pub fn log_file_path() -> LoreString {

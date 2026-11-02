@@ -3,12 +3,10 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
 use crate::branch::BranchLatestStatus;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -97,7 +95,7 @@ impl EventError for ResetError {
 
 /// Event data reported when a branch is reset to a revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchResetEventData {
     /// Branch identifier.
@@ -114,6 +112,9 @@ pub async fn reset(
     branch: String,
     revision: String,
 ) -> Result<(), ResetError> {
+    let context = execution_context();
+    let global = context.globals();
+
     let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<ResetError>("loading current anchor")?;
@@ -149,9 +150,14 @@ pub async fn reset(
 
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
-        .emit_map_err(ResetError::from(BranchNotFound {
-            branch: branch.clone(),
-        }))?;
+        .map_err(|err| {
+            ResetError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch.clone(),
+                }
+                .chain_err_from(err, "resolving branch"),
+            )
+        })?;
 
     let branch_metadata = branch::metadata(repository.clone(), branch.id)
         .await
@@ -165,14 +171,14 @@ pub async fn reset(
         branch_stack[0].revision
     };
 
-    let revision = revision::resolve(
+    let resolved = revision::resolve_in_branch(
         repository.clone(),
         revision.as_str(),
-        execution_context().globals().search_limit(),
-        execution_context().globals().search_location(),
+        global.search_location(),
     )
     .await
     .forward::<ResetError>("resolving revision")?;
+    let revision = resolved.revision;
 
     let state = state::State::deserialize(repository.clone(), revision)
         .await
@@ -181,6 +187,21 @@ pub async fn reset(
         return Err(ResetError::internal(
             "Given revision is not on the same branch",
         ));
+    }
+
+    // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+    let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
+        .await
+        .unwrap_or_default();
+    if mapped != Context::default() && mapped != branch.id && !global.force() {
+        return Err(ResetError::internal(
+            "Given branch's name is already used by another branch",
+        ));
+    }
+    if mapped == Context::default() || global.force() {
+        branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
+            .await
+            .forward::<ResetError>("restoring name-to-id mapping")?;
     }
 
     let latest = branch::load_latest(repository.clone(), branch.id)
@@ -212,9 +233,15 @@ pub async fn reset(
 
     // We don't know if the revision is on the history line of the remote branch, set local flag
     // to force the next sync to do divergence check. Also remove the last sync cache.
+    // A reset deliberately moves the tip to an arbitrary revision, so it compares
+    // against whatever the pointer holds now rather than a tracked value.
+    let stored_latest = branch::load_latest(repository.clone(), branch.id)
+        .await
+        .unwrap_or_default();
     branch::store_latest(
         repository.clone(),
         branch.id,
+        stored_latest,
         revision,
         BranchLatestStatus::Divergent,
     )

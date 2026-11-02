@@ -24,40 +24,103 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::grpc::FilterSlowDownExt;
+use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryGet` handler.
 ///
 /// Resolves a repository by id or by name and returns the full
-/// `Repository` record. Honors auth when the environment configures an
-/// auth-service URL. Self-heals stale or missing name → id mappings the
-/// same way the legacy `RepositoryQuery` handler does.
+/// `Repository` record. Access is decided by the injected
+/// [`RepositoryAuthorizer`]. Self-heals stale or missing name → id mappings
+/// the same way the legacy `RepositoryQuery` handler does.
+///
+/// Depending on server configuration, this request may get completely delegated to another server
+/// via `ForwardedRepositoryService`
 #[tracing::instrument(name = "RepositoryGet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryGetRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+) -> Result<Response<RepositoryGetResponse>, Status> {
+    let caller_context = CallerContext {
+        repository_id: RepositoryId::default(), // the queried repository is named by the request
+        user_id: get_user_id(request.extensions()),
+        is_service_account: get_is_service_account(request.extensions()),
+        correlation_id: extract_correlation_id(&request).unwrap_or_default(),
+        authorization: extract_authorization_header(&request),
+    };
+    let (_, extensions, req) = request.into_parts();
+
+    if let Some(forwarded_requests) = forwarded_requests
+        && forwarded_requests.rpc_flags().repository_get
+    {
+        forward_repository_get(req, caller_context, forwarded_requests).await
+    } else {
+        repository_get_implementation(
+            req,
+            caller_context,
+            authorizer,
+            extensions,
+            immutable_store,
+            mutable_store,
+        )
+        .await
+    }
+}
+
+/// This `RepositoryGetRequest` should be handled by another server
+/// and the response forwarded on to the client
+async fn forward_repository_get(
+    req: RepositoryGetRequest,
+    context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<RepositoryGetResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_repository_service();
+    let request = context.to_forwarded_request(req)?;
+
+    let repository_get_result = client
+        .repository_get(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = repository_get_result?;
+    Ok(response)
+}
+
+/// This `RepositoryGetRequest` should be fulfilled by this server.
+pub async fn repository_get_implementation(
+    req: RepositoryGetRequest,
+    caller_context: CallerContext,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    extensions: tonic::Extensions,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
-    let user_id = get_user_id(request.extensions());
-    let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
-    let req = request.into_inner();
-
     let Some(query) = req.query else {
         return Err(Status::invalid_argument(
             "RepositoryGetRequest.query must be set (id or name)",
         ));
     };
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
 
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
@@ -67,16 +130,20 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let token = get_verified_token(&extensions);
             let (id, metadata, metadata_hash) = match query {
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     debug!(%id, "Get repository by id");
-                    let (metadata, metadata_hash) =
-                        repository_load_id(repository.clone(), id, auth_url, authorization)
-                            .await
-                            .map_err(|_err| {
-                                Status::not_found(format!("Repository {id} not found"))
-                            })?;
+                    let (metadata, metadata_hash) = repository_load_id(
+                        repository.clone(),
+                        id,
+                        Some(authorizer.as_ref()),
+                        token.as_ref(),
+                    )
+                    .await
+                    .filter_slow_down()?
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -84,10 +151,11 @@ pub async fn handler(
                     let (id, metadata, metadata_hash) = repository_load_name(
                         repository.clone(),
                         name.as_str(),
-                        auth_url,
-                        authorization,
+                        Some(authorizer.as_ref()),
+                        token.as_ref(),
                     )
                     .await
+                    .filter_slow_down()?
                     .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
                     (id, metadata, metadata_hash)
                 }
@@ -102,16 +170,17 @@ pub async fn handler(
 
 /// Resolve a repository by id, returning its metadata blob plus the
 /// metadata pointer hash. Performs the same authz check + name-mapping
-/// repair the legacy v0 handler does.
+/// repair the legacy v0 handler does. `authorizer: None` skips the access
+/// check for internal lookups.
 #[allow(clippy::map_err_ignore)]
 pub(super) async fn repository_load_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");
@@ -147,6 +216,8 @@ pub(super) async fn repository_load_id(
                 "Repairing missing name -> ID mapping: {} -> {}",
                 metadata.name, id
             );
+            // no filter_slow_down()? usage here: repairing the name mapping is
+            // best-effort, and the repository has already been resolved.
             let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
                 .await
                 .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));
@@ -165,20 +236,20 @@ pub(super) async fn repository_load_id(
 pub(super) async fn repository_load_name(
     repository: Arc<RepositoryContext>,
     name: &str,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
         let (metadata, metadata_hash) =
-            repository_load_id(repository, id, auth_url, authorization).await?;
+            repository_load_id(repository, id, authorizer, token).await?;
         return Ok((id, metadata, metadata_hash));
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");

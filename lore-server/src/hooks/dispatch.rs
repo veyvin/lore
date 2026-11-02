@@ -5,7 +5,7 @@
 //! The [`HookDispatcher`] is responsible for:
 //!
 //! - Maintaining a mapping from [`HookPoint`] to registered hooks
-//! - Executing pre-handlers synchronously with timeout protection
+//! - Awaiting pre-handlers in the request, cancelled at their timeout
 //! - Spawning post-handlers asynchronously in separate tasks
 //! - Isolating hook errors and panics to prevent cascade failures
 //! - Logging hook execution with correlation IDs for audit trails
@@ -14,9 +14,10 @@
 //!
 //! The dispatcher provides three methods for hook execution:
 //!
-//! 1. **`dispatch_pre()`** - Synchronous pre-handler execution
-//!    - All hooks execute in registration order
-//!    - Each hook has a timeout (default 200ms)
+//! 1. **`dispatch_pre()`** - Asynchronous pre-handler execution, awaited
+//!    - All hooks execute in registration order, one at a time
+//!    - Each hook is cancelled at its timeout (default 1s, overridable
+//!      per hook)
 //!    - Panics are caught and isolated
 //!    - Returns first error to enable veto capability
 //!
@@ -57,8 +58,8 @@
 //!     .repository(RepositoryId::default())
 //!     .build();
 //!
-//! // Dispatch pre-handlers (synchronous, can veto):
-//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)?;
+//! // Dispatch pre-handlers (awaited, can veto):
+//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx).await?;
 //!
 //! // Spawn post-handlers (asynchronous, non-blocking):
 //! // dispatcher.spawn_post(HookPoint::BranchPush, ctx);
@@ -84,7 +85,7 @@ use crate::hooks::traits::HookPoint;
 use crate::hooks::traits::HookResponse;
 
 /// Default timeout for pre-handler execution.
-pub const DEFAULT_PRE_HANDLER_TIMEOUT: Duration = Duration::from_millis(200);
+pub const DEFAULT_PRE_HANDLER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default timeout for post-handler execution.
 pub const DEFAULT_POST_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -157,7 +158,7 @@ impl HookDispatcher {
     /// Creates a new dispatcher with the given hooks and default timeouts.
     ///
     /// Uses:
-    /// - 200ms for pre-handler timeout
+    /// - 1s for pre-handler timeout
     /// - 30s for post-handler timeout
     pub fn from_hooks_default(hooks: Vec<(String, Box<dyn Hook>)>) -> Self {
         Self::new(
@@ -203,11 +204,11 @@ impl HookDispatcher {
         self.post_handler_timeout
     }
 
-    /// Dispatches pre-handlers synchronously for all enabled hooks.
+    /// Dispatches pre-handlers for all enabled hooks, awaiting each in turn.
     ///
     /// # Execution Model
     ///
-    /// 1. Executes all pre-handlers in registration order
+    /// 1. Executes all pre-handlers in registration order, one at a time
     /// 2. Each pre-handler is wrapped with timeout and panic isolation
     /// 3. All pre-handlers execute even if earlier ones fail
     /// 4. Returns the first error encountered (enables veto)
@@ -217,10 +218,12 @@ impl HookDispatcher {
     /// - `Ok(())` if all pre-handlers succeed
     /// - `Err(HookError)` if any pre-handler fails (first error)
     ///
-    /// # Blocking Behavior
+    /// # Timeouts
     ///
-    /// This method blocks until all pre-handlers complete or timeout.
-    /// Use before the operation to enable rejection/veto capability.
+    /// A pre-handler still running at its timeout is dropped at its current
+    /// await and reported as [`HookError::Timeout`]. The timeout is the hook's
+    /// [`pre_handler_timeout`](Hook::pre_handler_timeout) when set, the
+    /// dispatcher's otherwise.
     ///
     /// # Logging
     ///
@@ -231,20 +234,22 @@ impl HookDispatcher {
     /// - `phase` = "pre"
     /// - `duration_ms`
     /// - `result` (ok/error)
-    pub fn dispatch_pre(&self, point: HookPoint, ctx: &HookContext) -> Result<(), HookError> {
+    pub async fn dispatch_pre(&self, point: HookPoint, ctx: &HookContext) -> Result<(), HookError> {
         let hooks = match self.hooks_by_point.get(&point) {
             Some(hooks) if !hooks.is_empty() => hooks,
             _ => return Ok(()),
         };
 
-        let correlation_id = ctx.correlation_id().to_string();
+        let correlation_id = ctx.correlation_id();
         let mut first_error: Option<HookError> = None;
 
         for hook in hooks {
             let hook_name = hook.name();
             let start = Instant::now();
 
-            let result = self.execute_pre_handler_with_isolation(hook.clone(), ctx);
+            let result = self
+                .execute_pre_handler_with_isolation(hook.as_ref(), ctx)
+                .await;
 
             let duration = start.elapsed();
 
@@ -284,46 +289,52 @@ impl HookDispatcher {
     }
 
     /// Executes a single pre-handler with timeout and panic isolation.
-    fn execute_pre_handler_with_isolation(
+    async fn execute_pre_handler_with_isolation(
         &self,
-        hook: Arc<dyn Hook>,
+        hook: &dyn Hook,
         ctx: &HookContext,
     ) -> Result<(), HookError> {
-        let hook_name = hook.name().to_string();
-        let timeout = self.pre_handler_timeout;
+        let timeout = self.timeout_for(hook);
 
-        let start = Instant::now();
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| hook.pre_handler(ctx)));
-
-        let elapsed = start.elapsed();
-
-        if elapsed > timeout {
-            warn!(
-                hook_name = %hook_name,
-                timeout_ms = timeout.as_millis(),
-                actual_ms = elapsed.as_millis(),
-                "Pre-handler exceeded timeout"
-            );
-            return Err(HookError::Timeout { hook_name, timeout });
-        }
+        let result = tokio::time::timeout(
+            timeout,
+            AssertUnwindSafe(hook.pre_handler(ctx)).catch_unwind(),
+        )
+        .await;
 
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(hook_error)) => Err(hook_error),
-            Err(panic_err) => {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(hook_error))) => Err(hook_error),
+            Ok(Err(panic_err)) => {
                 let panic_msg = extract_panic_message(panic_err);
                 error!(
-                    hook_name = %hook_name,
+                    hook_name = hook.name(),
                     panic_message = %panic_msg,
                     "Pre-handler panicked"
                 );
                 Err(HookError::Panic {
-                    hook_name,
+                    hook_name: hook.name().to_string(),
                     message: panic_msg,
                 })
             }
+            Err(_elapsed) => {
+                warn!(
+                    hook_name = hook.name(),
+                    timeout_ms = timeout.as_millis(),
+                    "Pre-handler timed out"
+                );
+                Err(HookError::Timeout {
+                    hook_name: hook.name().to_string(),
+                    timeout,
+                })
+            }
         }
+    }
+
+    /// The pre-handler and response-handler timeout for `hook`.
+    fn timeout_for(&self, hook: &dyn Hook) -> Duration {
+        hook.pre_handler_timeout()
+            .unwrap_or(self.pre_handler_timeout)
     }
 
     /// Dispatches response handlers synchronously for all enabled hooks.
@@ -401,7 +412,7 @@ impl HookDispatcher {
         ctx: &HookContext,
     ) -> Result<HookResponse, HookError> {
         let hook_name = hook.name().to_string();
-        let timeout = self.pre_handler_timeout;
+        let timeout = self.timeout_for(hook.as_ref());
 
         let start = Instant::now();
 
@@ -586,1168 +597,5 @@ impl std::fmt::Debug for HookDispatcher {
             .field("pre_handler_timeout", &self.pre_handler_timeout)
             .field("post_handler_timeout", &self.post_handler_timeout)
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use async_trait::async_trait;
-    use lore_base::runtime::LORE_CONTEXT;
-    use lore_revision::lore::RepositoryId;
-
-    use super::*;
-
-    fn test_execution_context() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
-        crate::util::setup_execution("test", "test".to_string(), "test-user".to_string())
-    }
-
-    struct SuccessHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        pre_count: Arc<AtomicUsize>,
-        post_count: Arc<AtomicUsize>,
-    }
-
-    impl SuccessHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self {
-                name,
-                points,
-                pre_count: Arc::new(AtomicUsize::new(0)),
-                post_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn with_counters(
-            mut self,
-            pre_count: Arc<AtomicUsize>,
-            post_count: Arc<AtomicUsize>,
-        ) -> Self {
-            self.pre_count = pre_count;
-            self.post_count = post_count;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Hook for SuccessHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            self.pre_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            self.post_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    struct RejectingHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        pre_count: Arc<AtomicUsize>,
-    }
-
-    impl RejectingHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self {
-                name,
-                points,
-                pre_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn with_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
-            self.pre_count = counter;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Hook for RejectingHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            self.pre_count.fetch_add(1, Ordering::SeqCst);
-            Err(HookError::rejected(
-                self.name,
-                "Operation rejected",
-                crate::hooks::traits::StatusCode::PermissionDenied,
-            ))
-        }
-    }
-
-    struct FailingHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        execute_count: Arc<AtomicUsize>,
-    }
-
-    impl FailingHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self {
-                name,
-                points,
-                execute_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn with_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
-            self.execute_count = counter;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Hook for FailingHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            self.execute_count.fetch_add(1, Ordering::SeqCst);
-            Err(HookError::execution_failed(self.name, "Hook failed"))
-        }
-    }
-
-    struct SlowPreHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        delay: Duration,
-    }
-
-    impl SlowPreHook {
-        fn new(name: &'static str, points: &'static [HookPoint], delay: Duration) -> Self {
-            Self {
-                name,
-                points,
-                delay,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Hook for SlowPreHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            std::thread::sleep(self.delay);
-            Ok(())
-        }
-    }
-
-    struct SlowPostHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        delay: Duration,
-        post_count: Arc<AtomicUsize>,
-    }
-
-    impl SlowPostHook {
-        fn new(name: &'static str, points: &'static [HookPoint], delay: Duration) -> Self {
-            Self {
-                name,
-                points,
-                delay,
-                post_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn with_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
-            self.post_count = counter;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Hook for SlowPostHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            tokio::time::sleep(self.delay).await;
-            self.post_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    struct PanicPreHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-    }
-
-    impl PanicPreHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self { name, points }
-        }
-    }
-
-    #[async_trait]
-    impl Hook for PanicPreHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            panic!("Pre-handler panicked!");
-        }
-    }
-
-    struct PanicPostHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-    }
-
-    impl PanicPostHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self { name, points }
-        }
-    }
-
-    #[async_trait]
-    impl Hook for PanicPostHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            panic!("Post-handler panicked!");
-        }
-    }
-
-    /// Hook that reads context values (demonstrates read-only access)
-    struct ContextReadingHook {
-        name: &'static str,
-        points: &'static [HookPoint],
-        observed_user: Arc<parking_lot::Mutex<Option<String>>>,
-    }
-
-    impl ContextReadingHook {
-        fn new(name: &'static str, points: &'static [HookPoint]) -> Self {
-            Self {
-                name,
-                points,
-                observed_user: Arc::new(parking_lot::Mutex::new(None)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Hook for ContextReadingHook {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            self.points
-        }
-
-        fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
-            // Read-only access to context
-            *self.observed_user.lock() = ctx.user().map(|s| s.to_string());
-            Ok(())
-        }
-    }
-
-    fn create_test_context() -> HookContext {
-        HookContext::builder()
-            .correlation_id("test-correlation-123")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .build()
-    }
-
-    #[test]
-    fn test_empty_dispatcher() {
-        let dispatcher = HookDispatcher::empty();
-
-        assert_eq!(dispatcher.hook_count(HookPoint::BranchPush), 0);
-        assert!(!dispatcher.has_hooks(HookPoint::BranchPush));
-        assert_eq!(dispatcher.total_hook_registrations(), 0);
-        assert_eq!(
-            dispatcher.pre_handler_timeout(),
-            DEFAULT_PRE_HANDLER_TIMEOUT
-        );
-        assert_eq!(
-            dispatcher.post_handler_timeout(),
-            DEFAULT_POST_HANDLER_TIMEOUT
-        );
-    }
-
-    #[test]
-    fn test_dispatcher_from_hooks_default() {
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "hook1".to_string(),
-            Box::new(SuccessHook::new("hook1", &[HookPoint::BranchPush])),
-        )];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-
-        assert_eq!(
-            dispatcher.pre_handler_timeout(),
-            DEFAULT_PRE_HANDLER_TIMEOUT
-        );
-        assert_eq!(
-            dispatcher.post_handler_timeout(),
-            DEFAULT_POST_HANDLER_TIMEOUT
-        );
-    }
-
-    #[test]
-    fn test_dispatch_pre_no_hooks() {
-        let dispatcher = HookDispatcher::empty();
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_dispatch_pre_success() {
-        let pre_count = Arc::new(AtomicUsize::new(0));
-        let post_count = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "test".to_string(),
-            Box::new(
-                SuccessHook::new("test", &[HookPoint::BranchPush])
-                    .with_counters(pre_count.clone(), post_count.clone()),
-            ),
-        )];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        assert!(result.is_ok());
-        assert_eq!(pre_count.load(Ordering::SeqCst), 1);
-        assert_eq!(post_count.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_dispatch_pre_multiple_hooks() {
-        let pre_count1 = Arc::new(AtomicUsize::new(0));
-        let pre_count2 = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            (
-                "hook1".to_string(),
-                Box::new(
-                    SuccessHook::new("hook1", &[HookPoint::BranchPush])
-                        .with_counters(pre_count1.clone(), Arc::new(AtomicUsize::new(0))),
-                ),
-            ),
-            (
-                "hook2".to_string(),
-                Box::new(
-                    SuccessHook::new("hook2", &[HookPoint::BranchPush])
-                        .with_counters(pre_count2.clone(), Arc::new(AtomicUsize::new(0))),
-                ),
-            ),
-        ];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        assert!(result.is_ok());
-        assert_eq!(pre_count1.load(Ordering::SeqCst), 1);
-        assert_eq!(pre_count2.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_dispatch_pre_wrong_hook_point() {
-        let pre_count = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "test".to_string(),
-            Box::new(
-                SuccessHook::new("test", &[HookPoint::BranchPush])
-                    .with_counters(pre_count.clone(), Arc::new(AtomicUsize::new(0))),
-            ),
-        )];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchDelete, &ctx)
-        });
-        assert!(result.is_ok());
-        assert_eq!(pre_count.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_dispatch_pre_rejection() {
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "rejecting".to_string(),
-            Box::new(RejectingHook::new("rejecting", &[HookPoint::BranchPush])),
-        )];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            HookError::Rejected {
-                hook_name, status, ..
-            } => {
-                assert_eq!(hook_name, "rejecting");
-                assert_eq!(status, crate::hooks::traits::StatusCode::PermissionDenied);
-            }
-            _ => panic!("Expected Rejected error"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_pre_error_isolation() {
-        let counter1 = Arc::new(AtomicUsize::new(0));
-        let counter2 = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            (
-                "failing".to_string(),
-                Box::new(
-                    FailingHook::new("failing", &[HookPoint::BranchPush])
-                        .with_counter(counter1.clone()),
-                ),
-            ),
-            (
-                "success".to_string(),
-                Box::new(
-                    SuccessHook::new("success", &[HookPoint::BranchPush])
-                        .with_counters(counter2.clone(), Arc::new(AtomicUsize::new(0))),
-                ),
-            ),
-        ];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-
-        assert!(result.is_err());
-
-        assert_eq!(counter1.load(Ordering::SeqCst), 1);
-        assert_eq!(counter2.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_dispatch_pre_returns_first_error() {
-        let counter1 = Arc::new(AtomicUsize::new(0));
-        let counter2 = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            (
-                "fail1".to_string(),
-                Box::new(
-                    RejectingHook::new("fail1", &[HookPoint::BranchPush])
-                        .with_counter(counter1.clone()),
-                ),
-            ),
-            (
-                "fail2".to_string(),
-                Box::new(
-                    RejectingHook::new("fail2", &[HookPoint::BranchPush])
-                        .with_counter(counter2.clone()),
-                ),
-            ),
-        ];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-
-        match result.unwrap_err() {
-            HookError::Rejected { hook_name, .. } => {
-                assert_eq!(hook_name, "fail1");
-            }
-            _ => panic!("Expected Rejected error"),
-        }
-
-        assert_eq!(counter1.load(Ordering::SeqCst), 1);
-        assert_eq!(counter2.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_dispatch_pre_timeout() {
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "slow".to_string(),
-            Box::new(SlowPreHook::new(
-                "slow",
-                &[HookPoint::BranchPush],
-                Duration::from_millis(500),
-            )),
-        )];
-
-        let dispatcher = HookDispatcher::new(
-            hooks,
-            Duration::from_millis(50),
-            DEFAULT_POST_HANDLER_TIMEOUT,
-        );
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-
-        match result.unwrap_err() {
-            HookError::Timeout { hook_name, .. } => {
-                assert_eq!(hook_name, "slow");
-            }
-            _ => panic!("Expected Timeout error"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_pre_panic_isolation() {
-        // Temporarily set a silent panic hook to suppress the custom panic output
-        // from urc-core's execution_initialize(). The panic is still caught by
-        // catch_unwind, but we don't want it printing to stderr during tests.
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {
-            // Intentionally silent - this test verifies panic isolation
-        }));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-            "panic".to_string(),
-            Box::new(PanicPreHook::new("panic", &[HookPoint::BranchPush])),
-        )];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-
-        // Restore previous panic hook before assertions (so assertion failures are visible)
-        std::panic::set_hook(prev_hook);
-
-        match result.unwrap_err() {
-            HookError::Panic { hook_name, message } => {
-                assert_eq!(hook_name, "panic");
-                assert!(message.contains("panicked"));
-            }
-            _ => panic!("Expected Panic error"),
-        }
-    }
-
-    #[test]
-    fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
-        // Temporarily set a silent panic hook to suppress the custom panic output
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            (
-                "panic".to_string(),
-                Box::new(PanicPreHook::new("panic", &[HookPoint::BranchPush])),
-            ),
-            (
-                "success".to_string(),
-                Box::new(
-                    SuccessHook::new("success", &[HookPoint::BranchPush])
-                        .with_counters(counter.clone(), Arc::new(AtomicUsize::new(0))),
-                ),
-            ),
-        ];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-
-        // Restore previous panic hook before assertions
-        std::panic::set_hook(prev_hook);
-
-        assert!(result.is_err());
-
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_dispatch_pre_context_read_only() {
-        // Test that hooks can read context values
-        let reader = ContextReadingHook::new("reader", &[HookPoint::BranchPush]);
-        let observed = reader.observed_user.clone();
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![("reader".to_string(), Box::new(reader))];
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = HookContext::builder()
-            .correlation_id("test")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .user("test_user")
-            .build();
-
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        assert!(result.is_ok());
-
-        // Hook should have read the user value
-        assert_eq!(*observed.lock(), Some("test_user".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_no_hooks() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let dispatcher = HookDispatcher::empty();
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_executes_hooks() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let post_count = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-                    "test".to_string(),
-                    Box::new(
-                        SuccessHook::new("test", &[HookPoint::BranchPush])
-                            .with_counters(Arc::new(AtomicUsize::new(0)), post_count.clone()),
-                    ),
-                )];
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                assert_eq!(post_count.load(Ordering::SeqCst), 1);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_returns_immediately() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let post_count = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-                    "slow".to_string(),
-                    Box::new(
-                        SlowPostHook::new(
-                            "slow",
-                            &[HookPoint::BranchPush],
-                            Duration::from_millis(200),
-                        )
-                        .with_counter(post_count.clone()),
-                    ),
-                )];
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                let start = Instant::now();
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-                let elapsed = start.elapsed();
-
-                assert!(elapsed < Duration::from_millis(50));
-
-                assert_eq!(post_count.load(Ordering::SeqCst), 0);
-
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                assert_eq!(post_count.load(Ordering::SeqCst), 1);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_multiple_hooks() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let post_count1 = Arc::new(AtomicUsize::new(0));
-                let post_count2 = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-                    (
-                        "hook1".to_string(),
-                        Box::new(
-                            SuccessHook::new("hook1", &[HookPoint::BranchPush])
-                                .with_counters(Arc::new(AtomicUsize::new(0)), post_count1.clone()),
-                        ),
-                    ),
-                    (
-                        "hook2".to_string(),
-                        Box::new(
-                            SuccessHook::new("hook2", &[HookPoint::BranchPush])
-                                .with_counters(Arc::new(AtomicUsize::new(0)), post_count2.clone()),
-                        ),
-                    ),
-                ];
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                assert_eq!(post_count1.load(Ordering::SeqCst), 1);
-                assert_eq!(post_count2.load(Ordering::SeqCst), 1);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_wrong_hook_point() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let post_count = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-                    "test".to_string(),
-                    Box::new(
-                        SuccessHook::new("test", &[HookPoint::BranchPush])
-                            .with_counters(Arc::new(AtomicUsize::new(0)), post_count.clone()),
-                    ),
-                )];
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchDelete, ctx);
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                assert_eq!(post_count.load(Ordering::SeqCst), 0);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_panic_isolation() {
-        // Temporarily set a silent panic hook to suppress the custom panic output
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let post_count = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-                    (
-                        "panic".to_string(),
-                        Box::new(PanicPostHook::new("panic", &[HookPoint::BranchPush])),
-                    ),
-                    (
-                        "success".to_string(),
-                        Box::new(
-                            SuccessHook::new("success", &[HookPoint::BranchPush])
-                                .with_counters(Arc::new(AtomicUsize::new(0)), post_count.clone()),
-                        ),
-                    ),
-                ];
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                // Restore previous panic hook before assertions
-                std::panic::set_hook(prev_hook);
-
-                assert_eq!(post_count.load(Ordering::SeqCst), 1);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_timeout_isolation() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let slow_count = Arc::new(AtomicUsize::new(0));
-                let fast_count = Arc::new(AtomicUsize::new(0));
-
-                let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-                    (
-                        "slow".to_string(),
-                        Box::new(
-                            SlowPostHook::new(
-                                "slow",
-                                &[HookPoint::BranchPush],
-                                Duration::from_secs(10),
-                            )
-                            .with_counter(slow_count.clone()),
-                        ),
-                    ),
-                    (
-                        "fast".to_string(),
-                        Box::new(
-                            SuccessHook::new("fast", &[HookPoint::BranchPush])
-                                .with_counters(Arc::new(AtomicUsize::new(0)), fast_count.clone()),
-                        ),
-                    ),
-                ];
-
-                let dispatcher = HookDispatcher::new(
-                    hooks,
-                    DEFAULT_PRE_HANDLER_TIMEOUT,
-                    Duration::from_millis(50),
-                );
-                let ctx = create_test_context();
-
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                assert_eq!(fast_count.load(Ordering::SeqCst), 1);
-
-                assert_eq!(slow_count.load(Ordering::SeqCst), 0);
-            })
-            .await;
-    }
-
-    #[test]
-    fn test_dispatch_pre_performance_many_hooks() {
-        let mut hooks: Vec<(String, Box<dyn Hook>)> = Vec::new();
-
-        for i in 0..100 {
-            hooks.push((
-                format!("hook_{i}"),
-                Box::new(SuccessHook::new(
-                    Box::leak(format!("hook_{i}").into_boxed_str()),
-                    &[HookPoint::BranchPush],
-                )),
-            ));
-        }
-
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let start = std::time::Instant::now();
-        let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-        });
-        let elapsed = start.elapsed();
-
-        assert!(result.is_ok());
-        assert!(elapsed < Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_post_performance_many_hooks() {
-        LORE_CONTEXT
-            .scope(test_execution_context(), async {
-                let mut hooks: Vec<(String, Box<dyn Hook>)> = Vec::new();
-                let counters: Vec<Arc<AtomicUsize>> =
-                    (0..100).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-
-                for (i, counter) in counters.iter().enumerate() {
-                    hooks.push((
-                        format!("hook_{i}"),
-                        Box::new(
-                            SuccessHook::new(
-                                Box::leak(format!("hook_{i}").into_boxed_str()),
-                                &[HookPoint::BranchPush],
-                            )
-                            .with_counters(Arc::new(AtomicUsize::new(0)), counter.clone()),
-                        ),
-                    ));
-                }
-
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
-                let ctx = create_test_context();
-
-                let start = std::time::Instant::now();
-                dispatcher.spawn_post(HookPoint::BranchPush, ctx);
-                let spawn_elapsed = start.elapsed();
-
-                assert!(spawn_elapsed < Duration::from_millis(50));
-
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                for counter in &counters {
-                    assert_eq!(counter.load(Ordering::SeqCst), 1);
-                }
-            })
-            .await;
-    }
-
-    // ==================== dispatch_response tests ====================
-
-    #[test]
-    fn test_dispatch_response_no_hooks() {
-        let dispatcher = HookDispatcher::empty();
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert!(response.message.is_none());
-    }
-
-    #[test]
-    fn test_dispatch_response_single_hook_with_message() {
-        struct MessageHook;
-
-        #[async_trait]
-        impl Hook for MessageHook {
-            fn name(&self) -> &'static str {
-                "message_hook"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("hello from hook"))
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> =
-            vec![("message_hook".to_string(), Box::new(MessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert_eq!(response.message, Some("hello from hook".to_string()));
-    }
-
-    #[test]
-    fn test_dispatch_response_no_message() {
-        struct NoMessageHook;
-
-        #[async_trait]
-        impl Hook for NoMessageHook {
-            fn name(&self) -> &'static str {
-                "no_msg"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::empty())
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> =
-            vec![("no_msg".to_string(), Box::new(NoMessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert!(response.message.is_none());
-    }
-
-    #[test]
-    fn test_dispatch_response_multiple_hooks_merge_messages() {
-        struct HookA;
-        struct HookB;
-
-        #[async_trait]
-        impl Hook for HookA {
-            fn name(&self) -> &'static str {
-                "hook_a"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("message A"))
-            }
-        }
-
-        #[async_trait]
-        impl Hook for HookB {
-            fn name(&self) -> &'static str {
-                "hook_b"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("message B"))
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            ("hook_a".to_string(), Box::new(HookA)),
-            ("hook_b".to_string(), Box::new(HookB)),
-        ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert_eq!(response.message, Some("message A\nmessage B".to_string()));
-    }
-
-    #[test]
-    fn test_dispatch_response_error_is_non_fatal() {
-        struct FailingHook;
-        struct GoodHook;
-
-        #[async_trait]
-        impl Hook for FailingHook {
-            fn name(&self) -> &'static str {
-                "failing"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Err(HookError::execution_failed("failing", "something broke"))
-            }
-        }
-
-        #[async_trait]
-        impl Hook for GoodHook {
-            fn name(&self) -> &'static str {
-                "good"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("still works"))
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            ("failing".to_string(), Box::new(FailingHook)),
-            ("good".to_string(), Box::new(GoodHook)),
-        ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert_eq!(response.message, Some("still works".to_string()));
-    }
-
-    #[test]
-    fn test_dispatch_response_panic_isolation() {
-        struct PanicHook;
-        struct SafeHook;
-
-        #[async_trait]
-        impl Hook for PanicHook {
-            fn name(&self) -> &'static str {
-                "panic"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                panic!("response handler panic");
-            }
-        }
-
-        #[async_trait]
-        impl Hook for SafeHook {
-            fn name(&self) -> &'static str {
-                "safe"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchPush]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("safe message"))
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![
-            ("panic".to_string(), Box::new(PanicHook)),
-            ("safe".to_string(), Box::new(SafeHook)),
-        ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert_eq!(response.message, Some("safe message".to_string()));
-    }
-
-    #[test]
-    fn test_dispatch_response_wrong_hook_point() {
-        struct MessageHook;
-
-        #[async_trait]
-        impl Hook for MessageHook {
-            fn name(&self) -> &'static str {
-                "msg"
-            }
-            fn hook_points(&self) -> &'static [HookPoint] {
-                &[HookPoint::BranchCreate]
-            }
-            fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
-                Ok(HookResponse::with_message("should not appear"))
-            }
-        }
-
-        let hooks: Vec<(String, Box<dyn Hook>)> = vec![("msg".to_string(), Box::new(MessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
-        let ctx = create_test_context();
-
-        let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
-        assert!(response.message.is_none());
     }
 }

@@ -8,7 +8,10 @@
 //! process-global registry) and [`call`] (the shared dispatcher).
 
 pub mod add;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
+#[cfg(feature = "test-util")]
+pub mod call;
 pub mod close;
 pub mod commit;
 pub mod delete;
@@ -16,6 +19,7 @@ pub mod handle;
 pub mod info;
 pub mod list_children;
 pub mod load;
+pub mod metadata_clear;
 pub mod metadata_get;
 pub mod metadata_set;
 pub mod modify;
@@ -24,149 +28,65 @@ pub mod node_info;
 pub mod node_path;
 pub mod resolve_path;
 
-#[cfg(test)]
-mod tests {
-    /// Round-trip a `RevisionTreeInternal` through the registry: a fresh
-    /// registration produces a non-zero handle; `lookup` returns the same
-    /// `Arc`; `unregister` removes the entry so subsequent `lookup`
-    /// returns `None`.
-    #[tokio::test]
-    async fn registry_register_lookup_unregister_round_trip() {
-        use std::sync::Arc;
+use std::sync::Arc;
+use std::time::Duration;
 
-        use super::handle;
-        use super::handle::test_support;
+use crate::revision_tree::handle::RevisionTreeInternal;
 
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal.clone());
-        assert_ne!(handle_value.handle_id, 0);
-        let looked_up = handle::lookup(handle_value).expect("registered handle must look up");
-        assert!(Arc::ptr_eq(&looked_up, &internal));
-        let removed =
-            handle::unregister(handle_value).expect("first unregister returns the held Arc");
-        assert!(Arc::ptr_eq(&removed, &internal));
-        assert!(handle::lookup(handle_value).is_none());
+/// Bound on a teardown's wait for in-flight ops. The budget shutdown allows per stage.
+const TEARDOWN_DRAIN_WAIT: Duration = crate::SHUTDOWN_WAIT;
+
+/// Close every registered revision tree handle: drain the registry, then mark each
+/// invalid and await its in-flight counter. Returns once every handle is drained.
+pub async fn close_all_handles() {
+    drain_in_parallel(handle::drain_all()).await;
+}
+
+/// Close every revision tree handle loaded against `storage_handle_id`, waiting at most
+/// [`TEARDOWN_DRAIN_WAIT`] for their in-flight ops.
+///
+/// Connection teardown reaches this through [`crate::storage::close_for_connection`], and
+/// is the only path that closes a revision tree handle for its caller: elsewhere the
+/// handle holds its own `Arc` to the store and stays usable after its parent closes.
+///
+/// Abandoning the wait is safe: the handles are unregistered before it starts, so an op
+/// that outlives it completes into a tree nobody can reach.
+pub(crate) async fn close_for_storage_handle(storage_handle_id: u64) {
+    close_for_storage_handle_within(storage_handle_id, TEARDOWN_DRAIN_WAIT).await;
+}
+
+/// [`close_for_storage_handle`] with the bound supplied, so a test can reach the timeout
+/// branch in milliseconds.
+#[lore_macro::test_pub]
+async fn close_for_storage_handle_within(storage_handle_id: u64, wait: Duration) {
+    let entries = handle::drain_for_storage_handle(storage_handle_id);
+    let count = entries.len();
+    if count == 0 {
+        return;
     }
-
-    /// Unregistering an already-removed handle returns `None`. The second
-    /// close call from the C side must see a defined miss, not a panic or
-    /// a stale double-drop.
-    #[tokio::test]
-    async fn registry_double_unregister_returns_none() {
-        use super::handle;
-        use super::handle::test_support;
-
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal);
-        assert!(handle::unregister(handle_value).is_some());
-        assert!(handle::unregister(handle_value).is_none());
+    if tokio::time::timeout(wait, drain_in_parallel(entries))
+        .await
+        .is_err()
+    {
+        lore_base::lore_warn!(
+            "Timed out draining {count} revision tree handle(s) on storage handle \
+             {storage_handle_id} during connection teardown; they are unreachable but their \
+             in-flight work is still running"
+        );
     }
+}
 
-    /// The `INVALID` sentinel must never match a real registry entry.
-    /// Lookup and unregister on it return `None` unconditionally.
-    #[test]
-    fn registry_invalid_sentinel_misses() {
-        use super::handle;
-        use super::handle::LoreRevisionTree;
-
-        assert!(handle::lookup(LoreRevisionTree::INVALID).is_none());
-        assert!(handle::unregister(LoreRevisionTree::INVALID).is_none());
+/// Mark each entry invalid and await its in-flight counter, concurrently, so the wall
+/// time is the slowest drain rather than their sum.
+///
+/// No flush: the stores belong to the parent storage handle, whose own close flushes them.
+#[lore_macro::test_pub]
+pub(crate) async fn drain_in_parallel(entries: Vec<(u64, Arc<RevisionTreeInternal>)>) {
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for (_, internal) in entries {
+        lore_base::lore_spawn!(tasks, async move {
+            internal.mark_invalid_and_await().await;
+        });
     }
-
-    /// Each call to `register` produces a distinct `handle_id`.
-    /// Two concurrent registrations against the same `Arc` must not
-    /// collide.
-    #[tokio::test]
-    async fn registry_two_registrations_produce_distinct_ids() {
-        use super::handle;
-        use super::handle::test_support;
-
-        let a_internal = test_support::new_for_testing().await;
-        let b_internal = test_support::new_for_testing().await;
-        let a = handle::register(a_internal);
-        let b = handle::register(b_internal);
-        assert_ne!(a.handle_id, b.handle_id);
-        handle::unregister(a);
-        handle::unregister(b);
-    }
-
-    /// `RevisionTreeGuard::enter` increments the in-flight counter while
-    /// the guard is live; dropping it decrements. Concurrent enters
-    /// observe the counter at or above the number of live guards.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn guard_increments_and_drops_decrement_in_flight_counter() {
-        use std::sync::Arc;
-        use std::sync::Barrier;
-        use std::sync::atomic::Ordering;
-        use std::thread;
-
-        use super::handle;
-        use super::handle::RevisionTreeGuard;
-        use super::handle::test_support;
-
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal.clone());
-        assert_eq!(internal.in_flight.load(Ordering::Acquire), 0);
-
-        const THREADS: usize = 8;
-        let start = Arc::new(Barrier::new(THREADS + 1));
-        let observed = Arc::new(Barrier::new(THREADS + 1));
-        let release = Arc::new(Barrier::new(THREADS + 1));
-        let mut joins = Vec::new();
-        for _ in 0..THREADS {
-            let start = start.clone();
-            let observed = observed.clone();
-            let release = release.clone();
-            joins.push(thread::spawn(move || {
-                start.wait();
-                let guard = RevisionTreeGuard::enter(handle_value)
-                    .expect("enter must succeed on a registered, non-invalid handle");
-                observed.wait();
-                release.wait();
-                drop(guard);
-            }));
-        }
-        start.wait();
-        observed.wait();
-        assert_eq!(internal.in_flight.load(Ordering::Acquire), THREADS as u64);
-        release.wait();
-        for j in joins {
-            j.join().unwrap();
-        }
-        assert_eq!(internal.in_flight.load(Ordering::Acquire), 0);
-        handle::unregister(handle_value);
-    }
-
-    /// `RevisionTreeGuard::enter` returns `None` when the handle has
-    /// already been marked invalid. The increment-then-check ordering
-    /// ensures the counter is balanced even on the rejection path.
-    #[tokio::test]
-    async fn guard_enter_after_mark_invalid_returns_none() {
-        use std::sync::atomic::Ordering;
-
-        use super::handle;
-        use super::handle::RevisionTreeGuard;
-        use super::handle::test_support;
-
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal.clone());
-        internal.invalid.store(true, Ordering::Release);
-        assert!(RevisionTreeGuard::enter(handle_value).is_none());
-        assert_eq!(internal.in_flight.load(Ordering::Acquire), 0);
-        handle::unregister(handle_value);
-    }
-
-    /// `RevisionTreeGuard::enter` returns `None` when the handle is
-    /// unknown (never registered or already unregistered).
-    #[tokio::test]
-    async fn guard_enter_unregistered_handle_returns_none() {
-        use super::handle;
-        use super::handle::RevisionTreeGuard;
-        use super::handle::test_support;
-
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal);
-        handle::unregister(handle_value);
-        assert!(RevisionTreeGuard::enter(handle_value).is_none());
-    }
+    while tasks.join_next().await.is_some() {}
 }

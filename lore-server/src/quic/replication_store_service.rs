@@ -65,17 +65,33 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
-    ImmutableExistBatch = 0,
-    ImmutableGet = 1,
+    // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (17) and
+    // `LocalQuery` (18). Left unused rather than reassigned, so a peer that still sends one is
+    // rejected instead of misread.
     ImmutablePut = 2,
     ImmutableObliterate = 3,
-    ImmutableQuery = 4,
-    ImmutableLocalExistBatch = 5,
-    ImmutableLocalGet = 6,
-    ImmutableLocalQuery = 7,
+    // 4 and 7 were the single-address `Query`, whose operation no longer exists. Left unused rather
+    // than reassigned, so a peer that still sends one is rejected instead of misread.
     ImmutableLocalPut = 8,
+    // 11 and 12 were `Query` / `LocalQuery` under the old response shape (without context in each
+    // result). Left unused rather than reassigned, so a peer that still sends one is rejected
+    // instead of misread.
+    // 1, 6, 9, 10 were `Get`, `LocalGet`, `GetMetadata`, `LocalGetMetadata` under the old response
+    // shape. Left unused rather than reassigned, so a peer that still sends one is rejected instead
+    // of misread.
+    ImmutableGet = 13,
+    ImmutableLocalGet = 14,
+    ImmutableGetMetadata = 15,
+    ImmutableLocalGetMetadata = 16,
+    ImmutableQuery = 17,
+    ImmutableLocalQuery = 18,
+    // 19 - old ImmutableCopy with only 1 flag that isn't backward compatible
+    /// Announces the client's user agent; see
+    /// [`send_client_identify`](lore_transport::quic::client::send_client_identify).
+    ClientIdentify = 20,
+    ImmutableCopy = 21,
 }
 
 impl From<Command> for QuicOpCode {
@@ -87,110 +103,20 @@ impl TryFrom<QuicOpCode> for Command {
     type Error = UnknownCommand;
     fn try_from(value: QuicOpCode) -> Result<Self, Self::Error> {
         match value {
-            v if v == Command::ImmutableExistBatch as u8 => Ok(Command::ImmutableExistBatch),
             v if v == Command::ImmutableGet as u8 => Ok(Command::ImmutableGet),
             v if v == Command::ImmutablePut as u8 => Ok(Command::ImmutablePut),
             v if v == Command::ImmutableObliterate as u8 => Ok(Command::ImmutableObliterate),
-            v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
-            v if v == Command::ImmutableLocalExistBatch as u8 => {
-                Ok(Command::ImmutableLocalExistBatch)
-            }
+            v if v == Command::ImmutableGetMetadata as u8 => Ok(Command::ImmutableGetMetadata),
             v if v == Command::ImmutableLocalGet as u8 => Ok(Command::ImmutableLocalGet),
-            v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
+            v if v == Command::ImmutableLocalGetMetadata as u8 => {
+                Ok(Command::ImmutableLocalGetMetadata)
+            }
             v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
+            v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
+            v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
+            v if v == Command::ImmutableCopy as u8 => Ok(Command::ImmutableCopy),
+            v if v == Command::ClientIdentify as u8 => Ok(Command::ClientIdentify),
             _ => Err(UnknownCommand(value)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::error::AddressNotFound;
-    use lore_base::error::PayloadNotFound;
-    use lore_base::error::SlowDown;
-    use lore_base::types::Address;
-    use lore_base::types::Hash;
-    use lore_storage::StoreError;
-
-    use super::*;
-
-    #[test]
-    fn store_error_address_not_found_maps_to_address_not_found_code() {
-        let err = StoreError::from(AddressNotFound::from(Address::default()));
-        let code = ReplicationServiceErrorCode::from(&err);
-        assert_eq!(code, ReplicationServiceErrorCode::AddressNotFound);
-        assert_eq!(code as u32, 201);
-    }
-
-    #[test]
-    fn store_error_internal_maps_to_internal_code() {
-        let err = StoreError::internal("test");
-        let code = ReplicationServiceErrorCode::from(&err);
-        assert_eq!(code, ReplicationServiceErrorCode::Internal);
-        assert_eq!(code as u32, 200);
-    }
-
-    #[test]
-    fn store_error_slow_down_maps_to_slow_down_code() {
-        let err = StoreError::from(SlowDown);
-        let code = ReplicationServiceErrorCode::from(&err);
-        assert_eq!(code, ReplicationServiceErrorCode::SlowDown);
-        assert_eq!(code as u32, 202);
-    }
-
-    #[test]
-    fn store_error_payload_not_found_maps_to_payload_not_found_code() {
-        let err = StoreError::from(PayloadNotFound::from(Hash::default()));
-        let code = ReplicationServiceErrorCode::from(&err);
-        assert_eq!(code, ReplicationServiceErrorCode::PayloadNotFound);
-        assert_eq!(code as u32, 203);
-    }
-
-    #[test]
-    fn error_code_address_not_found_converts_to_client_service_error() {
-        let client_err =
-            client::ReplicationStoreClientError::from(ReplicationServiceErrorCode::AddressNotFound);
-        assert!(matches!(
-            client_err,
-            client::ReplicationStoreClientError::ServiceError(
-                ReplicationServiceErrorCode::AddressNotFound
-            )
-        ));
-    }
-
-    #[test]
-    fn error_code_slow_down_converts_to_client_service_error() {
-        let client_err =
-            client::ReplicationStoreClientError::from(ReplicationServiceErrorCode::SlowDown);
-        assert!(matches!(
-            client_err,
-            client::ReplicationStoreClientError::ServiceError(
-                ReplicationServiceErrorCode::SlowDown
-            )
-        ));
-    }
-
-    #[test]
-    fn error_code_internal_converts_to_client_service_error() {
-        let client_err =
-            client::ReplicationStoreClientError::from(ReplicationServiceErrorCode::Internal);
-        assert!(matches!(
-            client_err,
-            client::ReplicationStoreClientError::ServiceError(
-                ReplicationServiceErrorCode::Internal
-            )
-        ));
-    }
-
-    #[test]
-    fn error_code_payload_not_found_converts_to_client_service_error() {
-        let client_err =
-            client::ReplicationStoreClientError::from(ReplicationServiceErrorCode::PayloadNotFound);
-        assert!(matches!(
-            client_err,
-            client::ReplicationStoreClientError::ServiceError(
-                ReplicationServiceErrorCode::PayloadNotFound
-            )
-        ));
     }
 }

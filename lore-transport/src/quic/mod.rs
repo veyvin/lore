@@ -1,20 +1,27 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod chunking;
 pub mod client;
 pub mod command_header;
+pub mod net_runtime;
+#[cfg(not(feature = "test-util"))]
 mod response_reader;
+#[cfg(feature = "test-util")]
+pub mod response_reader;
 pub mod storage_service;
 
 use std::sync::Arc;
 use std::sync::Weak;
 
 use command_header::CommandHeader;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_credential::domain_from_url_str_or_url;
 use lore_error_set::prelude::*;
 use thiserror::Error;
 
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::storage_service::client::StorageClient;
 use crate::traits::Storage;
@@ -81,6 +88,11 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    /// The command's session was issued on an earlier connection than the one it would be written
+    /// to, which knows another session or none by its id, or on no connection. Raised by the
+    /// client, never the server.
+    #[error("Session not issued on this connection")]
+    StaleSession,
 }
 
 #[derive(Debug)]
@@ -89,23 +101,26 @@ pub struct UnknownCommand(pub QuicOpCode);
 pub async fn storage(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
-    repository: RepositoryId,
+    partition: Partition,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
-        .internal(&format!("remote {remote_url} is invalid"))?;
+        .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let storage = StorageClient::connect(
         connection,
         remote_url,
         remote_domain,
-        auth_url,
+        auth_endpoint,
         identity,
-        repository,
+        partition,
+        credentials,
+        None,
     )
     .await
-    .internal(&format!("connecting to {remote_url}"))?;
+    .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;
 
-    Ok(Arc::new(storage))
+    Ok(storage)
 }

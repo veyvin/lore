@@ -47,11 +47,15 @@ mod tests {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
                 user_id: "my_user_id".into(),
-                name: "my_name".into(),
+                identity: None,
+                identity_namespaced: None,
+                name: Some("my_name".into()),
                 preferred_username: None,
                 is_service_account: None,
                 expires: 1,
                 audience,
+                root_domains: None,
+                root_domains_namespaced: None,
             }
         }
 
@@ -66,7 +70,6 @@ mod tests {
             assert_eq!(
                 acceptable_domains,
                 vec![
-                    "my_test_issuer.example.com".to_string(),
                     "lore-1.example.com".to_string(),
                     "lore-2.example.com".to_string(),
                 ]
@@ -94,6 +97,71 @@ mod tests {
             let token = make_jwt_with_audience(vec!["lore.example.com".to_string()]);
 
             verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
+        }
+
+        #[test]
+        fn leading_dot_aud_matches_subdomains_and_apex() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            // Subdomains ("*.lore.example.com") match.
+            verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
+            // The bare apex domain ("lore.example.com") also matches.
+            verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap();
+        }
+
+        #[test]
+        fn leading_dot_aud_rejects_unrelated_domain() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            verify_jwt_usage_for_remote(&token, "attackerlore.example.com").unwrap_err();
+        }
+
+        #[test]
+        fn naked_aud_rejects_mid_label_suffix_domain() {
+            // A dotless `aud` must respect the label boundary.
+            let token = make_jwt_with_audience(vec!["epicgames.net".to_string()]);
+
+            // The apex and true subdomains match.
+            verify_jwt_usage_for_remote(&token, "epicgames.net").unwrap();
+            verify_jwt_usage_for_remote(&token, "lore.epicgames.net").unwrap();
+            // The look-alike registrable domain does not.
+            verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
+        }
+
+        #[test]
+        fn legacy_audience_yields_only_the_suffix() {
+            let token = make_jwt_with_audience(vec!["URC".into(), ".epicgames.net".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec![".epicgames.net"]);
+        }
+
+        #[test]
+        fn https_audience_yields_its_host() {
+            let token = make_jwt_with_audience(vec!["https://lore.example.com/api".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
+        }
+
+        #[test]
+        fn opaque_audience_fails_closed() {
+            let token = make_jwt_with_audience(vec!["lore-api".into()]);
+            assert!(token.acceptable_root_domains().is_empty());
+            let err = verify_jwt_usage_for_remote(&token, "my_test_issuer.example.com")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("root_domains") && err.contains("audience"));
+        }
+
+        #[test]
+        fn root_domains_claim_wins_over_audience() {
+            let mut token = make_jwt_with_audience(vec!["other.example.org".into()]);
+            token.root_domains = Some(vec!["lore.example.com".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
+        }
+
+        #[test]
+        fn namespaced_alias_is_read_identically() {
+            let mut token = make_jwt_with_audience(vec!["other.example.org".into()]);
+            token.root_domains_namespaced = Some(vec!["lore.example.com".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
         }
     }
 }

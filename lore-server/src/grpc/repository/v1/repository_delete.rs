@@ -22,11 +22,14 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_registry::RepositoryRegistry;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
+use crate::grpc::may_administer_repository;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -38,29 +41,16 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
-    let req = request.into_inner();
-
-    // TODO(mjansson): Once the authz model has read/write/admin, replace
-    // the service-account bypass with a proper permission check.
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    let authorization = extract_authorization_header(&request);
+    let (_metadata, extensions, req) = request.into_parts();
 
     let id: RepositoryId = Context::from(req.id).into();
     let execution = setup_execution(module_path!(), correlation_id, user_id);
@@ -74,18 +64,20 @@ pub async fn handler(
         .scope(execution, async move {
             let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if let Some(auth_url) = auth_url {
-                repository_delete_auth_resource(auth_url, authorization, id).await?;
-            } else if metadata.creator != user_id && !bypass_protection {
+            if !may_administer_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
+                .await
+            {
                 info!(
-                    "Repository delete refused, user {user_id} is not creator {}",
+                    "Repository delete refused for user {user_id}, creator {}",
                     metadata.creator
                 );
                 return Err(Status::permission_denied("Not repository owner"));
             }
+            registry.remove(authorization, id).await?;
 
             repository::store_name_to_id(
                 repository.clone(),
@@ -93,16 +85,22 @@ pub async fn handler(
                 RepositoryId::default(),
             )
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to delete repository name mapping: {err}"))
             })?;
 
             repository::metadata_store_hash(repository.clone(), Hash::default())
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to delete repository metadata: {err}"))
                 })?;
 
+            // no filter_slow_down()? usage here: the repository record is
+            // already torn down above, so this purge is past the point of no
+            // return. A retryable status would invite a retry that only finds
+            // the repository gone, leaving these keys orphaned.
             if let Ok(mut branch_stream) = branch::list(repository.clone()).await {
                 let mut branch_list = vec![];
                 while let Some(branch) = branch_stream.next().await {

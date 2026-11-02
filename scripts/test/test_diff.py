@@ -7,6 +7,7 @@ import pytest
 
 from error_types import ImproperArgumentsError
 from lore import Lore
+from lore_parsers import parse_jsonl
 from lore_parsers import parse_status_json
 
 logger = logging.getLogger(__name__)
@@ -492,9 +493,7 @@ def test_file_diff_context(new_lore_repo):
 
     # --context 0: only the changed line, no surrounding context.
     zero_output = repo.file_diff(test_file, context=0, offline=True)
-    expected_zero = (
-        "@@ -5 +5 @@\n" + "-Line 05\n" + "+Line 05 (modified)\n"
-    )
+    expected_zero = "@@ -5 +5 @@\n" + "-Line 05\n" + "+Line 05 (modified)\n"
     assert expected_zero in zero_output, (
         "context=0 should show only the changed line with no surrounding context\n"
         + "Expected:\n"
@@ -652,9 +651,7 @@ def test_file_diff_ignore_space_at_eol(new_lore_repo):
     # Line 1 should appear as context, preserving the committed (OLD) trailing whitespace.
     with repo.open_file(test_file, "w+") as output_file:
         output_file.writelines(["foo\n", "BAR\n", "baz\n"])
-    faithful_output = repo.file_diff(
-        test_file, ignore_space_at_eol=True, offline=True
-    )
+    faithful_output = repo.file_diff(test_file, ignore_space_at_eol=True, offline=True)
     assert " foo   \n" in faithful_output, (
         f"Context line should preserve the OLD side's original trailing whitespace\nOutput:\n{faithful_output}"
     )
@@ -991,7 +988,8 @@ def test_file_diff3_auto_resolved(new_lore_repo):
 
     # Reviewed branch contribution (feature addition) appears as + line
     assert "+feature addition" in output, (
-        "diff3 auto-resolved should show source additions as + lines\nOutput:\n" + output
+        "diff3 auto-resolved should show source additions as + lines\nOutput:\n"
+        + output
     )
 
     # Target's change (main addition) should NOT appear as +/- since it's context
@@ -999,7 +997,8 @@ def test_file_diff3_auto_resolved(new_lore_repo):
         "diff3 auto-resolved should not show target additions\nOutput:\n" + output
     )
     assert "-main addition" not in output, (
-        "diff3 auto-resolved should not show target content as removed\nOutput:\n" + output
+        "diff3 auto-resolved should not show target content as removed\nOutput:\n"
+        + output
     )
 
     # No conflict markers
@@ -1232,10 +1231,12 @@ def test_file_diff3_utf16le(new_lore_repo):
     # conflict markers showing readable text, not garbled bytes.
     # mine=source (<<<<<<< source@N), theirs=target (>>>>>>> target@N)
     assert "<<<<<<< source@2" in output, (
-        "diff3 UTF-16 conflict mine marker should be source (baseline)\nOutput:\n" + output
+        "diff3 UTF-16 conflict mine marker should be source (baseline)\nOutput:\n"
+        + output
     )
     assert ">>>>>>> target@2" in output, (
-        "diff3 UTF-16 conflict theirs marker should be target (reviewed)\nOutput:\n" + output
+        "diff3 UTF-16 conflict theirs marker should be target (reviewed)\nOutput:\n"
+        + output
     )
     assert "||||||| base@1" in output, (
         "diff3 UTF-16 conflict base marker should be present\nOutput:\n" + output
@@ -1390,9 +1391,7 @@ def test_branch_merge_utf16le_conflict_preserves_bytes(new_lore_repo):
 
     raw_status = repo.status(offline=True, json=True)
     entries = parse_status_json(raw_status)
-    conflicted = {
-        e["path"] for e in entries if e.get("flagConflictUnresolved") is True
-    }
+    conflicted = {e["path"] for e in entries if e.get("flagConflictUnresolved") is True}
     assert text_file in conflicted, (
         f"{text_file} should appear in `lore status` as unresolved conflict; "
         f"got conflicted set: {conflicted}"
@@ -1526,16 +1525,140 @@ def test_branch_diff_auto_resolve_no_write_required(new_lore_repo):
     )
 
     assert "Write access required" not in output, (
-        "branch diff --auto-resolve regressed to read-only failure\n"
-        "Output:\n" + output
+        "branch diff --auto-resolve regressed to read-only failure\nOutput:\n" + output
     )
     assert f"C {shared}" not in output, (
         "Auto-resolvable change should not be reported as a conflict\n"
         "Output:\n" + output
     )
     assert f"M {shared}" in output, (
-        "Auto-resolved file should appear as modified\n"
+        "Auto-resolved file should appear as modified\nOutput:\n" + output
+    )
+
+
+@pytest.mark.smoke
+def test_branch_diff_auto_resolve_keeps_a_conflict_the_merge_cannot_resolve(
+    new_lore_repo,
+):
+    """`branch diff --auto-resolve` reports a file both branches changed on the
+    same line as a conflict: the text merge leaves markers, so the conflict
+    passes through unresolved."""
+    repo: Lore = new_lore_repo()
+
+    shared = "shared.txt"
+    repo.write_commit_push(
+        "Base commit",
+        {shared: "line 1\nline 2\nline 3\n"},
+        offline=True,
+    )
+
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push(
+        "Feature edits line 2",
+        {shared: "line 1\nfeature line 2\nline 3\n"},
+        offline=True,
+    )
+
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push(
+        "Main edits line 2",
+        {shared: "line 1\nmain line 2\nline 3\n"},
+        offline=True,
+    )
+
+    output = repo.branch_diff("main", source="feature", auto_resolve=True, offline=True)
+
+    assert f"C {shared}" in output, (
+        "A conflict the text merge cannot resolve should stay a conflict\n"
         "Output:\n" + output
+    )
+
+
+@pytest.mark.smoke
+def test_branch_diff_change_carries_the_move_source_path(new_lore_repo):
+    """A file moved on a branch must come out of `branch diff` as one move
+    event naming the path it was moved from. Without the source path a
+    receiver reads the move as an unrelated add at the new path and cannot
+    reproduce it."""
+    repo: Lore = new_lore_repo()
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    # Base commit on main, so the move below is the only difference the
+    # branch carries.
+    repo.write_commit_push(
+        "Base commit",
+        {original_path: "line 1\nline 2\n"},
+        offline=True,
+    )
+
+    repo.branch_create("move-branch", offline=True)
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file on the branch", offline=True)
+
+    output = repo.branch_diff("main", source="move-branch", json=True, offline=True)
+    changes = [entry["change"] for entry in parse_jsonl(output, "branchDiffChange")]
+    moved = [change for change in changes if change["path"] == moved_path]
+
+    assert len(moved) == 1, (
+        f"Expected exactly one change at {moved_path}, got {changes}"
+    )
+    assert moved[0]["action"] == "move", (
+        f"The change at {moved_path} should be a move, got {moved[0]}"
+    )
+    assert moved[0]["fromPath"] == original_path, (
+        f"The move should report fromPath={original_path!r}, got {moved[0]}"
+    )
+
+    # The human-readable listing must name both ends of the move, otherwise it
+    # reads as an add at the new path.
+    output = repo.branch_diff("main", source="move-branch", offline=True)
+    assert f"V {original_path} -> {moved_path}" in output.splitlines(), (
+        f"Branch diff did not print the move source path, got:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_revision_diff_reports_a_move_as_one_change(new_lore_repo):
+    """A file moved between two revisions must come out of `revision diff` as
+    one move naming the path it was moved from. Reported as an unrelated
+    delete plus add, the two ends cannot be tied back together."""
+    repo: Lore = new_lore_repo()
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    repo.write_commit_push(
+        "Base commit",
+        {original_path: "line 1\nline 2\n"},
+        offline=True,
+    )
+    base_revision = repo.revision_info(offline=True).signature
+
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file", offline=True)
+
+    output = repo.revision_diff(base_revision, json=True, offline=True)
+    files = parse_jsonl(output, "revisionDiffFile")
+    moved = [entry for entry in files if entry["path"] == moved_path]
+
+    assert len(moved) == 1, f"Expected exactly one change at {moved_path}, got {files}"
+    assert moved[0]["action"] == "move", (
+        f"The change at {moved_path} should be a move, got {moved[0]}"
+    )
+    assert moved[0]["fromPath"] == original_path, (
+        f"The move should report fromPath={original_path!r}, got {moved[0]}"
+    )
+    assert not [entry for entry in files if entry["path"] == original_path], (
+        f"The move source must not also be reported as a delete, got {files}"
+    )
+
+    output = repo.revision_diff(base_revision, offline=True)
+    assert f"V {original_path} -> {moved_path}" in output.splitlines(), (
+        f"Revision diff did not print the move source path, got:\n{output}"
     )
 
 
@@ -1547,8 +1670,25 @@ def test_file_diff_binary_emits_marker(new_lore_repo):
 
     binary_file = "binary-test.bin"
     base_bytes = bytes(
-        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
-         0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF]
+        [
+            0x00,
+            0x01,
+            0x02,
+            0xFF,
+            0xFE,
+            0x89,
+            0x50,
+            0x4E,
+            0x47,
+            0x0D,
+            0x0A,
+            0x1A,
+            0x0A,
+            0xDE,
+            0xAD,
+            0xBE,
+            0xEF,
+        ]
     )
 
     repo.write_commit_push(
@@ -1560,8 +1700,25 @@ def test_file_diff_binary_emits_marker(new_lore_repo):
     repo.branch_create("feature", offline=True)
 
     feature_bytes = bytes(
-        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
-         0x1A, 0x0A, 0xCA, 0xFE, 0xBA, 0xBE]
+        [
+            0x00,
+            0x01,
+            0x02,
+            0xFF,
+            0xFE,
+            0x89,
+            0x50,
+            0x4E,
+            0x47,
+            0x0D,
+            0x0A,
+            0x1A,
+            0x0A,
+            0xCA,
+            0xFE,
+            0xBA,
+            0xBE,
+        ]
     )
     repo.write_commit_push(
         "Modify binary on feature",
@@ -1578,16 +1735,13 @@ def test_file_diff_binary_emits_marker(new_lore_repo):
     )
 
     assert "Binary files differ" in output, (
-        "Binary diff should emit a `Binary files differ` marker.\nOutput:\n"
-        + output
+        "Binary diff should emit a `Binary files differ` marker.\nOutput:\n" + output
     )
     assert "\ufffd" not in output, (
-        "Binary diff must not render replacement characters.\nOutput:\n"
-        + repr(output)
+        "Binary diff must not render replacement characters.\nOutput:\n" + repr(output)
     )
     assert "@@" not in output, (
-        "Binary diff must not emit a unified-diff hunk header.\nOutput:\n"
-        + output
+        "Binary diff must not emit a unified-diff hunk header.\nOutput:\n" + output
     )
 
 
@@ -1599,8 +1753,25 @@ def test_file_diff3_binary_emits_marker(new_lore_repo):
 
     binary_file = "binary-test.bin"
     base_bytes = bytes(
-        [0x00, 0x01, 0x02, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A,
-         0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF]
+        [
+            0x00,
+            0x01,
+            0x02,
+            0xFF,
+            0xFE,
+            0x89,
+            0x50,
+            0x4E,
+            0x47,
+            0x0D,
+            0x0A,
+            0x1A,
+            0x0A,
+            0xDE,
+            0xAD,
+            0xBE,
+            0xEF,
+        ]
     )
 
     repo.write_commit_push(
@@ -1632,12 +1803,10 @@ def test_file_diff3_binary_emits_marker(new_lore_repo):
     )
 
     assert "Binary files differ" in output, (
-        "Binary diff3 should emit a `Binary files differ` marker.\nOutput:\n"
-        + output
+        "Binary diff3 should emit a `Binary files differ` marker.\nOutput:\n" + output
     )
     assert "\ufffd" not in output, (
-        "Binary diff3 must not render replacement characters.\nOutput:\n"
-        + repr(output)
+        "Binary diff3 must not render replacement characters.\nOutput:\n" + repr(output)
     )
     for marker in ("<<<<<<<", "=======", ">>>>>>>"):
         assert marker not in output, (
@@ -1688,8 +1857,7 @@ def test_diff_staged_move_shown_as_move(new_lore_repo):
     # the original path as the move source and the renamed path as the move
     # destination.
     assert f"move from {original}" in output, (
-        "Diff did not name the original path as the move source.\nOutput:\n"
-        + output
+        "Diff did not name the original path as the move source.\nOutput:\n" + output
     )
     assert f"move to {renamed}" in output, (
         "Diff did not name the renamed path as the move destination.\nOutput:\n"

@@ -30,6 +30,10 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_registry::RepositoryRegistry;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -53,38 +57,40 @@ impl InstrumentProvider for RepositoryServiceInstrumentProvider {
 /// only holds the dependencies the handlers need.
 #[derive(Clone)]
 pub struct LoreRepositoryV1Service {
-    environment: EnvironmentConfig,
+    registry: RepositoryRegistry,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     instrument_provider: RepositoryServiceInstrumentProvider,
 }
 
 impl LoreRepositoryV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         environment: EnvironmentConfig,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         Self {
-            environment,
+            registry: RepositoryRegistry::of(&environment),
+            authorizer,
+            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
+            forwarded_requests,
             rpc_timeout,
             instrument_provider: RepositoryServiceInstrumentProvider,
         }
-    }
-
-    /// Auth-service URL extracted from the environment, if configured.
-    fn auth_url(&self) -> Option<String> {
-        self.environment
-            .endpoint
-            .clone()
-            .and_then(|endpoint| endpoint.auth_url)
     }
 }
 
@@ -98,9 +104,10 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.auth_url(),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -116,7 +123,8 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                self.auth_url(),
+                &self.registry,
+                &self.authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,
@@ -133,9 +141,10 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_get::handler(
                 request,
-                self.auth_url(),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
             ),
         )
         .await
@@ -149,7 +158,8 @@ impl RepositoryService for LoreRepositoryV1Service {
     ) -> Result<Response<Self::RepositoryListStream>, Status> {
         repository_list::handler(
             request,
-            self.auth_url(),
+            self.repository_catalog.clone(),
+            self.rpc_timeout,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
         )
@@ -164,6 +174,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -179,27 +190,11 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
         )
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::repository::v1::repository_service_server::RepositoryServiceServer;
-
-    use super::*;
-
-    /// Compile-time check that `LoreRepositoryV1Service` fully implements
-    /// the generated `RepositoryService` trait — wrapping it in
-    /// `RepositoryServiceServer` requires the trait bound to hold.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreRepositoryV1Service,
-    ) -> RepositoryServiceServer<LoreRepositoryV1Service> {
-        RepositoryServiceServer::new(service)
     }
 }

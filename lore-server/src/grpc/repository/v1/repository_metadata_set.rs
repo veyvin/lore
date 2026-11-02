@@ -19,9 +19,14 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -39,12 +44,13 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryMetadataSetRequest>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
@@ -63,9 +69,19 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            authorizer
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository_id.into(),
+                    Action::Write,
+                )
+                .await
+                .map_err(|_err| no_repository_access_status())?;
+
             let current_metadata = if !expected.is_zero() {
                 Metadata::deserialize(repository.clone(), expected)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn_error_to_status(&err, |err| {
                             Status::invalid_argument(format!(
@@ -79,6 +95,7 @@ pub async fn handler(
 
             let proposed_metadata = Metadata::deserialize(repository.clone(), updated)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::invalid_argument(format!(
@@ -106,6 +123,7 @@ pub async fn handler(
                     KeyType::RepositoryMetadata,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::internal(format!("failed to update metadata: {err}"))
@@ -125,6 +143,7 @@ pub async fn handler(
 }
 
 /// Reject a proposed metadata blob that mutates a read-only field.
+#[lore_macro::test_pub]
 fn validate_read_only_fields(current: &Metadata, proposed: &Metadata) -> Result<(), Status> {
     for key in READ_ONLY_KEYS {
         let current_value = current.get_typed(key);
@@ -156,27 +175,22 @@ async fn validate_binary_blobs(
     proposed: &Metadata,
 ) -> Result<(), Status> {
     let mut addresses = vec![];
-    proposed
-        .walk(
-            |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-                if value_type == MetadataType::Address
-                    && value_slice.len() == std::mem::size_of::<Address>()
-                {
-                    let address: Address = value_slice.into();
-                    addresses.push(address);
-                }
-            },
-        )
-        .map_err(|err| {
-            warn_error_to_status(&err, |err| {
-                Status::internal(format!("failed to walk proposed metadata: {err}"))
-            })
-        })?;
+    proposed.walk(
+        |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
+            if value_type == MetadataType::Address
+                && value_slice.len() == std::mem::size_of::<Address>()
+            {
+                let address: Address = value_slice.into();
+                addresses.push(address);
+            }
+        },
+    );
 
     for address in addresses {
         let options = lore_revision::immutable::read_options_from_repository(&repo).with_cache();
         if lore_revision::immutable::read(repo.clone(), address, None, options)
             .await
+            .filter_slow_down()?
             .is_err()
         {
             return Err(Status::not_found(format!(
@@ -185,150 +199,4 @@ async fn validate_binary_blobs(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    mod validate_read_only_fields {
-        use lore_base::types::Context;
-        use lore_revision::repository;
-
-        use super::super::validate_read_only_fields;
-        use super::super::*;
-
-        /// Build a metadata blob with every read-only key populated to a
-        /// known value so individual tests can mutate exactly one field
-        /// and assert the rejection is attributable to that mutation.
-        fn baseline() -> Metadata {
-            let mut metadata = Metadata::new();
-            metadata.set_string(repository::NAME, "repo").unwrap();
-            metadata
-                .set_context(repository::DEFAULT_BRANCH, Context::default())
-                .unwrap();
-            metadata
-                .set_string(repository::DEFAULT_BRANCH_NAME, "main")
-                .unwrap();
-            metadata.set_string(repository::CREATOR, "alice").unwrap();
-            metadata.set_u64(repository::CREATED, 100).unwrap();
-            metadata
-        }
-
-        #[test]
-        fn accepts_unchanged_read_only_fields_with_writable_change() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed
-                .set_string(repository::DESCRIPTION, "edited description")
-                .unwrap();
-            validate_read_only_fields(&current, &proposed)
-                .expect("description is writable, all read-only fields unchanged");
-        }
-
-        #[test]
-        fn rejects_name_modification() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed.set_string(repository::NAME, "renamed").unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("mutating name must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::NAME));
-        }
-
-        #[test]
-        fn rejects_creator_modification() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed.set_string(repository::CREATOR, "mallory").unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("mutating creator must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::CREATOR));
-        }
-
-        #[test]
-        fn rejects_default_branch_modification() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed
-                .set_context(repository::DEFAULT_BRANCH, Context::from([1u8; 16]))
-                .unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("mutating default-branch must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::DEFAULT_BRANCH));
-        }
-
-        #[test]
-        fn rejects_default_branch_name_modification() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed
-                .set_string(repository::DEFAULT_BRANCH_NAME, "trunk")
-                .unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("mutating default-branch-name must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::DEFAULT_BRANCH_NAME));
-        }
-
-        #[test]
-        fn rejects_created_modification() {
-            let current = baseline();
-            let mut proposed = baseline();
-            proposed.set_u64(repository::CREATED, 200).unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("mutating created must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::CREATED));
-        }
-
-        #[test]
-        fn rejects_read_only_key_removal() {
-            let current = baseline();
-            let mut proposed = baseline();
-            assert!(proposed.remove_key(repository::CREATOR));
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("removing a read-only key must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::CREATOR));
-            assert!(err.message().contains("remove"));
-        }
-
-        #[test]
-        fn accepts_setting_read_only_keys_when_current_is_empty() {
-            // CAS-from-zero path: `expected` was Hash::default(), so the
-            // server passes an empty `current` Metadata. Every key in
-            // proposed is being set for the first time and must be
-            // allowed.
-            let current = Metadata::new();
-            let proposed = baseline();
-            validate_read_only_fields(&current, &proposed)
-                .expect("first-time write of read-only keys must be allowed");
-        }
-
-        #[test]
-        fn ignores_read_only_keys_absent_from_both() {
-            // No read-only key is present in either blob; the validator
-            // must not invent rejections.
-            let current = Metadata::new();
-            let proposed = Metadata::new();
-            validate_read_only_fields(&current, &proposed)
-                .expect("absence on both sides is a no-op");
-        }
-
-        #[test]
-        fn type_mismatch_on_read_only_key_is_rejected() {
-            // Same key, same logical value, different MetadataType: the
-            // validator compares (bytes, type) and must catch this.
-            let mut current = Metadata::new();
-            current.set_string(repository::CREATED, "100").unwrap();
-            let mut proposed = Metadata::new();
-            proposed.set_u64(repository::CREATED, 100).unwrap();
-            let err = validate_read_only_fields(&current, &proposed)
-                .expect_err("type change on a read-only key must be rejected");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains(repository::CREATED));
-        }
-    }
 }

@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::atomic;
 
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
-use crate::concurrency::LOCAL_ISOLATION;
 use crate::fragment_flags::FragmentFlags;
 
 /// Options controlling how a fragment is written to storage.
@@ -17,8 +15,14 @@ pub struct WriteOptions {
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
     pub fixed_size_chunk: usize,
-    /// Clone the memory buffer before hashing for consistent reads
-    pub clone_buffer: bool,
+    /// Compute the address the content would be stored under, storing nothing.
+    ///
+    /// Every fragment is still cut and hashed, since an address is a function of the chunking as
+    /// much as of the content, but none is written locally or remotely.
+    ///
+    /// Not for a resolved write, which exists to publish a mapping to stored content and would
+    /// publish one to content nobody stored.
+    pub hash_only: bool,
 }
 
 impl WriteOptions {
@@ -54,6 +58,17 @@ impl WriteOptions {
         self
     }
 
+    /// The size to cut fixed-size chunks at, or `None` for content-defined chunking.
+    ///
+    /// The clamp lives here, not only in the builder, because `fixed_size_chunk` is `pub` and a
+    /// struct literal bypasses it. Every cutting path asks this, so none can omit the bound.
+    ///
+    /// An oversized leaf is not just different chunking: `store_fragment` refuses it, and the
+    /// compare walk reads any entry above the threshold as a nested list.
+    pub fn cut_size(&self) -> Option<usize> {
+        (self.fixed_size_chunk > 0).then(|| self.fixed_size_chunk.clamp(1, FRAGMENT_SIZE_THRESHOLD))
+    }
+
     pub fn with_fixed_size_chunk(mut self, size: usize) -> Self {
         self.fixed_size_chunk = std::cmp::min(FRAGMENT_SIZE_THRESHOLD, size);
         self
@@ -61,6 +76,12 @@ impl WriteOptions {
 
     pub fn with_max_size_chunk(mut self) -> Self {
         self.fixed_size_chunk = FRAGMENT_SIZE_THRESHOLD;
+        self
+    }
+
+    /// Address the content without storing it. See [`hash_only`](Self::hash_only).
+    pub fn hash_only(mut self) -> Self {
+        self.hash_only = true;
         self
     }
 }
@@ -72,14 +93,17 @@ impl From<WriteOptions> for u32 {
 }
 
 /// Options controlling how a fragment is read from storage.
+///
+/// A payload the local store holds is read as stored. One fetched from a remote is checked against
+/// its address on receipt, unless the remote is trusted ([`trust_remote`](Self::trust_remote)).
 #[derive(Copy, Clone, Debug)]
 pub struct ReadOptions {
-    /// Enforce repository isolation
-    pub isolate: bool,
     /// Decompress data
     pub decompress: bool,
-    /// Verify data
-    pub verify: bool,
+    /// Treat the remote as a trusted source, as a client within its infrastructure may: a fetched
+    /// payload has only its sizes checked against its length, is decompressed only where
+    /// `decompress` asks, and is never hashed.
+    pub trust_remote: bool,
     /// Probe the local store before falling through to remote. Setting this to `false` makes
     /// reads bypass the local store entirely; combined with `remote: true` and a session, the
     /// reader always fetches from the peer. Used by handles bound to remote-only mode.
@@ -90,12 +114,14 @@ pub struct ReadOptions {
     pub cache: bool,
     /// Write to file directly
     pub direct_write: bool,
-    /// Use file read/write instead of memory mapping
-    pub direct_file_io: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
+    /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
+    /// store or fetch of the address, and never reaches the remote itself. The local probe still
+    /// takes the store's own locks.
+    pub never_wait: bool,
     /// Refuse to read if the fragment's declared `size_content` exceeds this
     /// cap. `None` means "no cap" (existing behavior). Callers that know the
     /// maximum legitimate blob size for the data they are reading should set
@@ -107,16 +133,15 @@ pub struct ReadOptions {
 impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
-            isolate: LOCAL_ISOLATION.load(atomic::Ordering::Relaxed),
             decompress: true,
-            verify: true,
+            trust_remote: false,
             local: true,
             remote: true,
             cache: false,
             direct_write: false,
-            direct_file_io: false,
             sync_data: false,
             priority: false,
+            never_wait: false,
             max_content_size: None,
         }
     }
@@ -133,28 +158,14 @@ impl ReadOptions {
         self
     }
 
-    pub fn with_verify(mut self) -> Self {
-        self.verify = true;
-        self
-    }
-
-    pub fn no_verify(mut self) -> Self {
-        self.verify = false;
-        self
-    }
-
-    pub fn with_remote(mut self) -> Self {
-        self.remote = true;
+    /// See [`ReadOptions::trust_remote`].
+    pub fn trusting_remote(mut self) -> Self {
+        self.trust_remote = true;
         self
     }
 
     pub fn no_remote(mut self) -> Self {
         self.remote = false;
-        self
-    }
-
-    pub fn with_local(mut self) -> Self {
-        self.local = true;
         self
     }
 
@@ -173,43 +184,19 @@ impl ReadOptions {
         self
     }
 
-    pub fn no_cache(mut self) -> Self {
-        self.cache = false;
-        self
-    }
-
-    pub fn with_isolation(mut self) -> Self {
-        self.isolate = true;
-        self
-    }
-
-    pub fn no_isolation(mut self) -> Self {
-        self.isolate = false;
-        self
-    }
-
-    pub fn with_direct_write(mut self) -> Self {
-        self.direct_write = true;
-        self
-    }
-
-    pub fn with_direct_file_io(mut self) -> Self {
-        self.direct_file_io = true;
-        self
-    }
-
     pub fn with_priority(mut self) -> Self {
         self.priority = true;
         self
     }
 
-    pub fn with_max_content_size(mut self, max: u64) -> Self {
-        self.max_content_size = Some(max);
+    /// See [`ReadOptions::never_wait`].
+    pub fn never_wait(mut self) -> Self {
+        self.never_wait = true;
         self
     }
 
-    pub fn no_max_content_size(mut self) -> Self {
-        self.max_content_size = None;
+    pub fn with_max_content_size(mut self, max: u64) -> Self {
+        self.max_content_size = Some(max);
         self
     }
 }

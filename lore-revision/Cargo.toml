@@ -6,15 +6,17 @@ publish = false
 
 [lib]
 name = "lore_revision"
+test = false
 
 [dependencies]
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
 fastcdc = { workspace = true }
@@ -25,9 +27,7 @@ hex = { workspace = true }
 http = { workspace = true }
 infer = { workspace = true }
 jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
 libc = { workspace = true }
-memmap2 = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
@@ -52,28 +52,49 @@ url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 lore-credential = { workspace = true }
+lore-io = { workspace = true }
 lore-storage = { workspace = true }
 lore-macro = { workspace = true }
 lore-proto = { workspace = true }
 lore-telemetry = { workspace = true }
 lore-transport = { workspace = true }
 uuid = { workspace = true, features = ["zerocopy"] }
-windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 xxhash-rust = { workspace = true }
 zerocopy = { workspace = true }
 
+[target.'cfg(target_family = "windows")'.dependencies]
+# `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and instance
+# staleness reads its error constants from the latter, so both are named here.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
+
 [dev-dependencies]
-lore-storage = { workspace = true }
+ctor = { workspace = true }
+keyring-core = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
+lore-revision = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 serde = { workspace = true }
-tempfile = "3"
+# `start_paused` for the tests that drive a polling loop on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]
 default = []
 oodle = ["lore-storage/oodle"]
 integration_tests = []
+compile_fail_tests = []
 failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
+swfs = []
+test-util = []
+
+[[test]]
+name = "compile_fail"
+required-features = ["compile_fail_tests"]
+
+[lints]
+workspace = true

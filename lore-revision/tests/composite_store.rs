@@ -24,9 +24,11 @@ mod tests {
     use lore_storage::ImmutableStore;
     use lore_storage::KeyValueStream;
     use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
+    use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::local::immutable_store as immutable;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::random;
@@ -37,25 +39,51 @@ mod tests {
     struct TestStore<'a> {
         succeed: bool,
         match_result: Option<StoreMatch>,
+        /// The context a match reports having found the content under, where it is not the one
+        /// asked about.
+        match_context: Option<Context>,
+        /// Whether a match reports the durable store as holding the association.
+        match_durable: bool,
         invocations: RwLock<HashMap<&'a str, u32>>,
+        /// What each `put` this store received carried: the fragment describing the content, and
+        /// the payload's size where one came with it.
+        puts: RwLock<Vec<(Fragment, Option<usize>)>>,
         compare_and_swap_result: Option<Hash>,
-        get_immutable_result: Option<(Fragment, Bytes)>,
+        get_immutable_result: Option<StoreGetData>,
+        /// The representation `get_metadata` reports, where a test needs it to differ from what
+        /// was put.
+        metadata_fragment: Option<Fragment>,
         max_query_batch: Option<usize>,
     }
 
+    /// What a succeeding store hands back from `get` where a test has not named a payload of its
+    /// own, so any path that reads content has bytes to carry.
+    const DEFAULT_PAYLOAD: &[u8] = b"test store payload";
+
     impl TestStore<'_> {
         fn succeeding() -> Self {
+            let payload = Bytes::from_static(DEFAULT_PAYLOAD);
             Self {
                 succeed: true,
+                get_immutable_result: Some(StoreGetData {
+                    fragment: Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    match_made: StoreMatch::MatchFull,
+                    partition: Partition::default(),
+                    payload: Some(payload),
+                    content: None,
+                }),
                 ..Default::default()
             }
         }
 
         fn succeeding_limited(limit: usize) -> Self {
             Self {
-                succeed: true,
                 max_query_batch: Some(limit),
-                ..Default::default()
+                ..Self::succeeding()
             }
         }
 
@@ -64,7 +92,18 @@ mod tests {
         }
 
         fn with_mock_get_immutable(mut self, fragment: &Fragment, payload: &Bytes) -> Self {
-            self.get_immutable_result = Some((*fragment, payload.clone()));
+            self.get_immutable_result = Some(StoreGetData {
+                fragment: *fragment,
+                match_made: StoreMatch::MatchFull,
+                partition: Partition::default(),
+                payload: Some(payload.clone()),
+                content: None,
+            });
+            self
+        }
+
+        fn with_mock_metadata_fragment(mut self, fragment: Fragment) -> Self {
+            self.metadata_fragment = Some(fragment);
             self
         }
 
@@ -73,14 +112,50 @@ mod tests {
             self
         }
 
+        /// Report a match found under `context` and already held by the durable store, which is what
+        /// a put needs before it can duplicate an association instead of storing the payload.
+        fn with_mock_durable_match(mut self, context: Context) -> Self {
+            self.match_context = Some(context);
+            self.match_durable = true;
+            self
+        }
+
         fn track_invocation(&self, name: &'static str) {
             let mut invocations = self.invocations.write().unwrap();
             invocations.entry(name).and_modify(|v| *v += 1).or_insert(1);
         }
+
+        /// The one `put` this store was given, for a test asserting on what it carried.
+        fn only_put(&self) -> (Fragment, Option<usize>) {
+            let puts = self.puts.read().unwrap();
+            assert_eq!(
+                puts.len(),
+                1,
+                "expected exactly one put, got {}",
+                puts.len()
+            );
+            puts[0]
+        }
+    }
+
+    /// Whether a fragment describes its payload as held by the durable store, which is what a
+    /// store receiving it reports as `stored_durable`.
+    fn claims_durable(fragment: Fragment) -> bool {
+        fragment.flags & FragmentFlags::PayloadStoredDurable.bits() != 0
     }
 
     #[async_trait]
     impl lore_storage::MutableStore for TestStore<'_> {
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
         async fn load(
             self: Arc<Self>,
             _repository: Partition,
@@ -161,84 +236,116 @@ mod tests {
 
     #[async_trait]
     impl lore_storage::ImmutableStore for TestStore<'static> {
-        async fn exist(
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn get_metadata(
             self: Arc<Self>,
-            _repository: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.track_invocation("exist");
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.track_invocation("get_metadata");
+            let _ = address;
 
             if self.succeed {
-                if let Some(match_result) = self.match_result {
-                    Ok(match_result)
-                } else {
-                    Ok(StoreMatch::MatchFull)
+                // Describes the payload as the store's own `query` reports it, so a caller reading
+                // one and then the other is not told two different things about the same content.
+                let mut fragment = self.metadata_fragment.unwrap_or_default();
+                if self.match_durable {
+                    fragment.flags |= FragmentFlags::PayloadStoredDurable.bits();
                 }
+                Ok(StoreGetData::metadata(
+                    fragment,
+                    self.match_result.unwrap_or(StoreMatch::MatchFull),
+                    partition,
+                ))
             } else {
                 Err(StoreError::internal("Mock store failure"))
             }
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            repository: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            let mut result = vec![];
-            for address in addresses {
-                result.push(
-                    self.clone()
-                        .exist(repository, *address, match_requested)
-                        .await?,
-                );
-            }
-            Ok(result)
         }
 
         async fn query(
             self: Arc<Self>,
             _repository: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.track_invocation("query");
+            addresses: &[Address],
+            results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.track_invocation("resolve");
 
-            if self.succeed {
-                Ok(StoreQueryResult {
-                    fragment: Fragment::default(),
-                    match_made: StoreMatch::MatchFull,
-                })
-            } else {
-                Err(StoreError::internal("Mock store failure"))
+            if !self.succeed {
+                return Err(StoreError::internal("Mock store failure"));
             }
+
+            let match_made = self.match_result.unwrap_or(StoreMatch::MatchFull);
+            for (result, address) in results.iter_mut().zip(addresses.iter()) {
+                *result = lore_storage::StoreMatchResult {
+                    match_made,
+                    partition: _repository,
+                    context: self.match_context.unwrap_or(address.context),
+                    stored_local: false,
+                    stored_durable: self.match_durable,
+                };
+            }
+
+            Ok(())
         }
 
         async fn get(
             self: Arc<Self>,
             _repository: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             self.track_invocation("get");
 
-            if self.succeed {
-                Ok(self.get_immutable_result.clone().unwrap())
-            } else {
-                Err(StoreError::internal("Mock store failure"))
+            if !self.succeed {
+                return Err(StoreError::internal("Mock store failure"));
             }
+            let mut data = self.get_immutable_result.clone().unwrap();
+            // One knob sets the level every verb reports, so a store cannot answer `get` at a
+            // level its own `query` and `get_metadata` contradict.
+            if let Some(match_result) = self.match_result {
+                data.match_made = match_result;
+            }
+            Ok(data)
         }
 
         async fn put(
             self: Arc<Self>,
             _repository: Partition,
             _address: Address,
-            _fragment: Fragment,
-            _payload: Option<Bytes>,
+            fragment: Fragment,
+            payload: Option<Bytes>,
             _force: bool,
         ) -> Result<(), StoreError> {
             self.track_invocation("put");
+            self.puts
+                .write()
+                .unwrap()
+                .push((fragment, payload.as_ref().map(Bytes::len)));
+
+            if self.succeed {
+                Ok(())
+            } else {
+                Err(StoreError::internal("Mock store failure"))
+            }
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _behavior: CopyBehavior,
+        ) -> Result<(), StoreError> {
+            self.track_invocation("copy");
 
             if self.succeed {
                 Ok(())
@@ -280,8 +387,6 @@ mod tests {
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             None
         }
-
-        async fn compact_stop(self: Arc<Self>) {}
 
         fn max_query_batch(&self) -> Option<usize> {
             self.max_query_batch
@@ -425,13 +530,22 @@ mod tests {
 
                 // The result is just hard coded in the TestStore impl, so we don't really care what it is,
                 // just whether it was successful.
-                store
-                    .query(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("Store query failed");
+                lore_storage::immutable_store::query_one(
+                    &(store as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await
+                .expect("Store resolve failed");
 
-                assert_eq!(*store1.invocations.read().unwrap().get("query").unwrap(), 1);
-                assert_eq!(*store2.invocations.read().unwrap().get("query").unwrap(), 1);
+                assert_eq!(
+                    *store1.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *store2.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
             })
             .await;
     }
@@ -459,15 +573,180 @@ mod tests {
                     context: random::<Context>(),
                 };
 
+                lore_storage::immutable_store::query_one(
+                    &(store.clone() as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await
+                .expect("Store resolve failed");
+
+                assert_eq!(
+                    *store1.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
+
+                assert!(store2.invocations.read().unwrap().get("resolve").is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_metadata_local_hit_short_circuits() {
+        let store1 = Arc::new(TestStore::succeeding());
+        let store2 = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("successful, local".to_string(), store1.clone())
+                    .expect("Failed add local")
+                    .with_durable("successful, durable".to_string(), store2.clone())
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
                 store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
-                    .expect("Store query failed");
+                    .expect("get_metadata should succeed");
 
-                assert_eq!(*store1.invocations.read().unwrap().get("query").unwrap(), 1);
+                assert_eq!(
+                    *store1
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                // durable should not be consulted when local hits
+                assert!(
+                    store2
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .is_none()
+                );
+            })
+            .await;
+    }
 
-                assert!(store2.invocations.read().unwrap().get("query").is_none());
+    #[tokio::test]
+    async fn get_metadata_falls_back_to_durable_when_local_misses() {
+        let store1 = Arc::new(TestStore::failing());
+        let store2 = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), store1.clone())
+                    .expect("Failed add local")
+                    .with_durable("successful, durable".to_string(), store2.clone())
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
+                store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("get_metadata should succeed via durable");
+
+                assert_eq!(
+                    *store1
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *store2
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_metadata_consults_replica_when_local_misses() {
+        let local = Arc::new(TestStore::failing());
+        let durable = Arc::new(TestStore::failing());
+        let replica = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), local.clone())
+                    .expect("Failed add local")
+                    .with_durable("failing, durable".to_string(), durable.clone())
+                    .expect("Failed add durable")
+                    .with_replica(
+                        "successful, replica".to_string(),
+                        replica.clone(),
+                        true,
+                        false,
+                    )
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
+                store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("get_metadata should succeed via replica");
+
+                assert_eq!(
+                    *local
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *replica
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
             })
             .await;
     }
@@ -503,8 +782,9 @@ mod tests {
                 assert_eq!(
                     fragment,
                     store
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("Get immutable failed")
                         .0
                 );
@@ -575,14 +855,14 @@ mod tests {
                 let repository: Partition = random::<RepositoryId>();
                 let addresses = [random::<Address>(), random::<Address>()];
 
-                let result = store
-                    .exist_batch(repository, &addresses, StoreMatch::MatchFull)
+                let mut result = [lore_storage::StoreMatchResult::default(); 2];
+                store
+                    .query(repository, &addresses, &mut result)
                     .await
-                    .expect("Exist batch failed");
+                    .expect("Resolve failed");
 
-                assert_eq!(result.len(), addresses.len());
-                assert_eq!(result[0], StoreMatch::MatchFull);
-                assert_eq!(result[1], StoreMatch::MatchFull);
+                assert_eq!(result[0].match_made, StoreMatch::MatchFull);
+                assert_eq!(result[1].match_made, StoreMatch::MatchFull);
             })
             .await;
     }
@@ -606,8 +886,183 @@ mod tests {
         assert_eq!(store.max_query_batch().unwrap(), 100);
     }
 
+    /// The answer the copy path is built on: a cache holding content under a partition the caller
+    /// also reaches, surviving the fan-out to a caller that can act on it.
+    ///
+    /// The local store keeps several partitions and does not isolate them, so it is the only thing
+    /// in the stack that can establish a hash match. The durable store below has nothing, and the
+    /// merge must keep the weaker-but-useful answer rather than let the miss overwrite it - along
+    /// with the partition, which is what a caller names as the source of a copy.
     #[tokio::test]
-    async fn match_full_query_results_are_cached_locally() {
+    async fn a_foreign_partition_survives_the_merge_to_the_caller() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+
+                let held_under: Partition = random::<RepositoryId>();
+                let asked_under: Partition = random::<RepositoryId>();
+
+                // Only the local store has this one, and only under another partition.
+                let (elsewhere_fragment, elsewhere, elsewhere_payload) = generate_random();
+                local_store
+                    .put(
+                        held_under,
+                        elsewhere,
+                        elsewhere_fragment,
+                        Some(elsewhere_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put under the holding partition failed");
+
+                // Only the durable store has this one, under the partition being asked about.
+                let (here_fragment, here, here_payload) = generate_random();
+                durable_store
+                    .put(asked_under, here, here_fragment, Some(here_payload), false)
+                    .await
+                    .expect("put under the asked partition failed");
+
+                let addresses = [elsewhere, here];
+                let mut resolved = [lore_storage::StoreMatchResult::default(); 2];
+                store
+                    .query(asked_under, &addresses, &mut resolved)
+                    .await
+                    .expect("query failed");
+
+                assert_eq!(resolved[0].match_made, StoreMatch::MatchHash);
+                assert_eq!(
+                    resolved[0].partition, held_under,
+                    "the merged answer must name where the content actually is, not where it was \
+                     asked for"
+                );
+                assert!(resolved[0].stored_local);
+
+                // The two answers came from different stores in one merge, so each partition has to
+                // travel with the level that carried it - swapping them would point a copy at a
+                // store that never saw the content.
+                assert_eq!(resolved[1].match_made, StoreMatch::MatchFull);
+                assert_eq!(resolved[1].partition, asked_under);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_merges_answers_from_every_store() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+
+                let repository: Partition = random::<RepositoryId>();
+                let (local_fragment, local_address, local_payload) = generate_random();
+                let (durable_fragment, durable_address, durable_payload) = generate_random();
+                let (_, missing_address, _) = generate_random();
+
+                local_store
+                    .put(
+                        repository,
+                        local_address,
+                        local_fragment,
+                        Some(local_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put to local failed");
+                durable_store
+                    .put(
+                        repository,
+                        durable_address,
+                        durable_fragment,
+                        Some(durable_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put to durable failed");
+
+                let addresses = [local_address, missing_address, durable_address];
+                let mut results = [lore_storage::StoreMatchResult::default(); 3];
+                store
+                    .query(repository, &addresses, &mut results)
+                    .await
+                    .expect("resolve failed");
+
+                assert_eq!(results[0].match_made, StoreMatch::MatchFull);
+                assert!(results[0].stored_local);
+                assert!(!results[0].stored_durable);
+
+                assert_eq!(results[1].match_made, StoreMatch::MatchNone);
+                assert!(!results[1].stored_local);
+                assert!(!results[1].stored_durable);
+
+                // Answered by the durable store, which is a local store in this topology and so
+                // reports content on its own disk. That is not our local store, and the composite
+                // is the only thing that knows the difference.
+                assert_eq!(results[2].match_made, StoreMatch::MatchFull);
+                assert!(!results[2].stored_local);
+                assert!(results[2].stored_durable);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -629,7 +1084,46 @@ mod tests {
                 .expect("local should have been created");
 
                 let store = CompositeStoreBuilder::default()
-                    .with_cache_query_results(true)
+                    .with_durable("test-durable".to_string(), durable_store)
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store)
+                    .expect("local should have worked")
+                    .build()
+                    .expect("build should have worked");
+
+                lore_storage::conformance::verify_immutable_store(
+                    Arc::new(store),
+                    lore_storage::conformance::Capabilities::new("CompositeStore"),
+                )
+                .await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn durable_store_get_metadata_results_are_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
                     .with_durable("test-durable".to_string(), durable_store.clone())
                     .expect("durable should have worked")
                     .with_local("test-local".to_string(), local_store.clone())
@@ -644,7 +1138,7 @@ mod tests {
                 // confirm we don't find the address via composite store
                 let result = composite_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("Initial query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchNone));
@@ -660,15 +1154,15 @@ mod tests {
                 // confirm local store doesn't know about this address before going via composite
                 let result = local_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchNone));
 
-                // now composite query should find the address
+                // now composite get_metadata should find the address
                 let result = composite_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
@@ -678,7 +1172,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
@@ -686,10 +1180,569 @@ mod tests {
                 // but local 'get' still fails as it does not have the payload
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get didn't fail");
                 assert!(result.is_payload_not_found());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replicas_get_metadata_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("Initial query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // write to the replica store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to replica failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // now composite get_metadata should find the address
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store won't have the cache because composite store won't
+                // cache read replicas
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("replica confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn durable_store_get_results_are_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("Initial query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // write to the durable store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                durable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // now composite get should find the address
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store should have the cache because composite store will
+                // populate it out of band
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    /// **A get that caches what the durable store returned keeps the local store claimed past the
+    /// span it ran in, until the cache write ends.** The get returns once it has spawned the
+    /// write, so it claims the local store before the spawn: the span's end then leaves the flock
+    /// held rather than releasing it before the write first runs, which on a single-threaded
+    /// runtime is after the span has ended.
+    #[tokio::test]
+    async fn a_cached_get_keeps_the_local_flock_past_its_span_until_the_cache_write_ends() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let dir = lore_base::test_util::TempDir::new("composite-cache-claim-");
+                let local = immutable::LocalImmutableStore::new(
+                    Some(dir.to_path_buf()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let lock = local.lock.clone().expect("a disk-backed store has a lock");
+                let local_store: Arc<dyn ImmutableStore> = local;
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+                durable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                let span = composite_store
+                    .clone()
+                    .hold_for_command()
+                    .await
+                    .expect("span");
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("get");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+                drop(span);
+                assert!(
+                    lock.is_held(),
+                    "the cache write keeps the local flock past the span"
+                );
+
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+                    while !matches!(
+                        local_store.clone().get(repository, address).await,
+                        Ok(StoreGetData {
+                            match_made: StoreMatch::MatchFull,
+                            ..
+                        })
+                    ) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the cache write lands");
+                local_store.clone().flush(true).await.expect("flush");
+                assert!(
+                    !lock.is_held(),
+                    "the flock goes once the cache write has ended and been flushed"
+                );
+            })
+            .await;
+    }
+
+    /// A composite store passes on the content a durable store expanded where it checked a payload
+    /// on receipt, so a read into a buffer through the composite places that content.
+    #[tokio::test]
+    async fn a_durable_stores_checked_content_is_placed_through_the_composite() {
+        let content = Bytes::from_static(b"content a durable store expanded to check its payload");
+        let plain = Fragment {
+            flags: 0,
+            size_payload: content.len() as u32,
+            size_content: content.len() as u64,
+        };
+        let payload = Bytes::from_static(b"payload");
+        let durable = TestStore {
+            get_immutable_result: Some(StoreGetData {
+                fragment: Fragment {
+                    flags: FragmentFlags::PayloadCompressedLZ4.bits(),
+                    size_payload: payload.len() as u32,
+                    size_content: content.len() as u64,
+                },
+                match_made: StoreMatch::MatchFull,
+                partition: Partition::default(),
+                payload: Some(payload),
+                content: Some((plain, content.clone())),
+            }),
+            ..TestStore::succeeding()
+        };
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), Arc::new(TestStore::failing()))
+                    .expect("Failed add local")
+                    .with_durable("checking, durable".to_string(), Arc::new(durable))
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+                let mut buffer = vec![0u8; content.len()];
+                // SAFETY: the buffer outlives the read and nothing else touches it.
+                let mut dst =
+                    unsafe { lore_storage::CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+
+                let (fragment, read) = Arc::new(store)
+                    .get_into(random::<RepositoryId>(), address, &mut dst)
+                    .await
+                    .expect("the composite reads the durable store's content");
+
+                assert!(matches!(
+                    read,
+                    lore_storage::store_types::PayloadRead::IntoBuffer
+                ));
+                assert_eq!(fragment, plain);
+                assert_eq!(buffer, content.as_ref());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replicas_get_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // write to the replica store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to replica failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // now composite get should find the address
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store won't have the cache because composite store won't
+                // cache read replicas
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn durable_query_match_full_results_are_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // write to durable directly so the local store has no entry
+                durable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                // query via composite: durable resolves MatchFull with a non-zero partition, so
+                // a background get_metadata is spawned to populate the local store
+                let mut results = [StoreMatchResult::default()];
+                composite_store
+                    .clone()
+                    .query(repository, &[address], &mut results)
+                    .await
+                    .expect("query failed");
+                assert!(matches!(results[0].match_made, StoreMatch::MatchFull));
+                assert!(!results[0].partition.is_zero());
+
+                // wait for the background cache write-back
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // local store should now have the metadata cached
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("local get_metadata failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replica_query_match_full_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // write to replica directly so the local store has no entry
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                // query via composite: replica resolves MatchFull with a non-zero partition.
+                // because the results came from the replica no caching takes place
+                let mut results = [StoreMatchResult::default()];
+                composite_store
+                    .clone()
+                    .query(repository, &[address], &mut results)
+                    .await
+                    .expect("query failed");
+                assert!(matches!(results[0].match_made, StoreMatch::MatchFull));
+                assert!(!results[0].partition.is_zero());
+
+                // wait for an erroneous background cache write-back
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // local store should not have the metadata cached
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("local get_metadata failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
             })
             .await;
     }
@@ -739,8 +1792,9 @@ mod tests {
                 // Get through composite — should fetch from durable
                 let (got_fragment, got_payload) = composite_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Composite get failed");
                 assert_eq!(got_fragment.size_payload, fragment.size_payload);
                 assert_eq!(got_payload, payload);
@@ -748,18 +1802,17 @@ mod tests {
                 // Wait for detached local cache task
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                // Local store should have the fragment (exist works)
-                let match_result = local_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("local exist failed");
-                assert_eq!(match_result, StoreMatch::MatchFull);
+                // Local store should have the fragment (resolve works)
+                let match_result =
+                    lore_storage::immutable_store::query_one(&local_store, repository, address)
+                        .await
+                        .expect("local resolve failed");
+                assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                 // But local get should fail with PayloadNotFound (no payload cached)
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get should have failed — payload not cached");
                 assert!(result.is_payload_not_found());
@@ -813,17 +1866,16 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Local store should have the fragment metadata
-                let match_result = local_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("local exist failed");
-                assert_eq!(match_result, StoreMatch::MatchFull);
+                let match_result =
+                    lore_storage::immutable_store::query_one(&local_store, repository, address)
+                        .await
+                        .expect("local resolve failed");
+                assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                 // But local get should fail — payload was stripped
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get should have failed — payload not cached");
                 assert!(result.is_payload_not_found());
@@ -831,12 +1883,1430 @@ mod tests {
                 // Durable should have the full payload
                 let (_, durable_payload) = durable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Durable get failed");
                 assert_eq!(durable_payload, payload);
             })
             .await;
+    }
+
+    mod copy {
+        use super::*;
+
+        struct Fixture {
+            composite: Arc<lore_revision::store::composite::CompositeStore>,
+            local: Arc<dyn ImmutableStore>,
+            durable: Arc<dyn ImmutableStore>,
+            partition: Partition,
+        }
+
+        /// A composite over two real stores, so the match levels a local store reports for an
+        /// address it holds under another context are the ones production sees.
+        async fn fixture(cache_metadata: bool, semaphore_size: Option<usize>) -> Fixture {
+            let durable = immutable::create(
+                None::<&Path>,
+                immutable::ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("durable should have been created");
+            let local = immutable::create(
+                None::<&Path>,
+                immutable::ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("local should have been created");
+
+            let composite = CompositeStoreBuilder::default()
+                .with_cache_metadata(cache_metadata, semaphore_size)
+                .with_durable("test-durable".to_string(), durable.clone())
+                .expect("durable should have worked")
+                .with_local("test-local".to_string(), local.clone())
+                .expect("local should have worked")
+                .build()
+                .expect("build should have worked");
+
+            Fixture {
+                composite: Arc::new(composite),
+                local,
+                durable,
+                partition: random::<RepositoryId>(),
+            }
+        }
+
+        /// The content the local store serves for `address` on its own, read after the detached
+        /// caching task has had a chance to run.
+        async fn local_payload(fixture: &Fixture, address: Address) -> Bytes {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            fixture
+                .local
+                .clone()
+                .get(fixture.partition, address)
+                .await
+                .and_then(lore_storage::StoreGetData::into_payload)
+                .expect("local get failed")
+                .1
+        }
+
+        /// The level the local store resolves `context` at for the copied hash, read after the
+        /// detached caching task has had a chance to run.
+        async fn local_match(fixture: &Fixture, address: Address) -> StoreMatch {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            fixture
+                .local
+                .clone()
+                .get_metadata(fixture.partition, address)
+                .await
+                .expect("local get_metadata failed")
+                .match_made
+        }
+
+        fn destination(source: Address) -> Address {
+            Address {
+                hash: source.hash,
+                context: random::<Context>(),
+            }
+        }
+
+        /// The same composite over stores that record which verb each leg was asked for, for the
+        /// cases about who is told about a copy rather than what is resolvable afterwards.
+        struct Recording {
+            composite: Arc<lore_revision::store::composite::CompositeStore>,
+            local: Arc<TestStore<'static>>,
+            replica: Arc<TestStore<'static>>,
+            partition: Partition,
+            source: Address,
+            payload: Bytes,
+        }
+
+        /// `local_match` is what the local store answers for the destination, which decides whether
+        /// the composite has anything to record there.
+        fn recording(local_match: StoreMatch, durable: TestStore<'static>) -> Recording {
+            recording_with_out_of_band(local_match, durable, None)
+        }
+
+        /// `record_out_of_band` is passed to the builder as the setting arrives from configuration,
+        /// so `None` exercises the default.
+        fn recording_with_out_of_band(
+            local_match: StoreMatch,
+            durable: TestStore<'static>,
+            record_out_of_band: Option<bool>,
+        ) -> Recording {
+            let payload = Bytes::from_static(b"the payload the copy's destination reads back as");
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            // The source is durably stored, which is the condition under which a caller reaches
+            // `copy` at all rather than storing the payload.
+            let local: Arc<TestStore<'static>> = Arc::new(
+                TestStore::succeeding()
+                    .with_mock_match(local_match)
+                    .with_mock_durable_match(random::<Context>())
+                    .with_mock_get_immutable(&fragment, &payload),
+            );
+            let replica: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+            let composite = CompositeStoreBuilder::default()
+                .with_cache_metadata(true, None)
+                .with_record_copy_out_of_band(record_out_of_band)
+                .with_local("local".to_string(), local.clone())
+                .expect("local should have worked")
+                .with_durable("durable".to_string(), Arc::new(durable))
+                .expect("durable should have worked")
+                .with_replica("replica".to_string(), replica.clone(), false, true)
+                .build()
+                .expect("build should have worked");
+
+            Recording {
+                composite: Arc::new(composite),
+                local,
+                replica,
+                partition: random::<RepositoryId>(),
+                source: Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                },
+                payload,
+            }
+        }
+
+        /// Copies `source` to a fresh context and waits out the detached work the copy spawns.
+        async fn copy_recorded(
+            recording: &Recording,
+            durable: bool,
+            do_not_replicate: bool,
+        ) -> Result<(), StoreError> {
+            let result = recording
+                .composite
+                .clone()
+                .copy(
+                    recording.partition,
+                    recording.source,
+                    recording.partition,
+                    random::<Context>(),
+                    CopyBehavior {
+                        durable,
+                        do_not_replicate,
+                    },
+                )
+                .await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            result
+        }
+
+        fn count(store: &Arc<TestStore<'static>>, verb: &str) -> u32 {
+            store
+                .invocations
+                .read()
+                .unwrap()
+                .get(verb)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        /// The destination the copy created is readable in process afterwards, content and all, so
+        /// the next read of it does not leave for a partition and hash the durable store has
+        /// already answered for.
+        #[tokio::test]
+        async fn caches_the_destination_locally() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(true, None).await;
+                    let (fragment, source, payload) = generate_random();
+                    fixture
+                        .durable
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            source,
+                            fragment,
+                            Some(payload.clone()),
+                            false,
+                        )
+                        .await
+                        .expect("put to durable failed");
+
+                    let destination = destination(source);
+                    fixture
+                        .composite
+                        .clone()
+                        .copy(
+                            fixture.partition,
+                            source,
+                            fixture.partition,
+                            destination.context,
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+
+                    assert_eq!(
+                        local_match(&fixture, destination).await,
+                        StoreMatch::MatchFull
+                    );
+                    assert_eq!(local_payload(&fixture, destination).await, payload);
+                })
+                .await;
+        }
+
+        /// The same, for a destination whose hash the local store already resolves under another
+        /// context. A weaker level there is not the association the copy created, so it is no
+        /// answer for the destination and it still has to be recorded.
+        #[tokio::test]
+        async fn caches_the_destination_over_a_partial_local_match() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(true, None).await;
+                    let (fragment, source, payload) = generate_random();
+                    fixture
+                        .durable
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            source,
+                            fragment,
+                            Some(payload.clone()),
+                            false,
+                        )
+                        .await
+                        .expect("put to durable failed");
+                    fixture
+                        .local
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            source,
+                            fragment,
+                            Some(payload.clone()),
+                            false,
+                        )
+                        .await
+                        .expect("put to local failed");
+
+                    let destination = destination(source);
+                    assert_eq!(
+                        fixture
+                            .local
+                            .clone()
+                            .get_metadata(fixture.partition, destination)
+                            .await
+                            .expect("local get_metadata failed")
+                            .match_made,
+                        StoreMatch::MatchPartition,
+                        "the fixture only tests what it means to if the local store answers the \
+                         destination with a level below a full match"
+                    );
+
+                    fixture
+                        .composite
+                        .clone()
+                        .copy(
+                            fixture.partition,
+                            source,
+                            fixture.partition,
+                            destination.context,
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+
+                    assert_eq!(
+                        local_match(&fixture, destination).await,
+                        StoreMatch::MatchFull
+                    );
+                    assert_eq!(local_payload(&fixture, destination).await, payload);
+                })
+                .await;
+        }
+
+        /// Metadata caching governs what a `query` or `get_metadata` miss writes back, not what a
+        /// copy records: the destination is read back for its content, and a read that reaches the
+        /// durable store caches what it carried either way. `record_copy_out_of_band` is the
+        /// setting that stops a copy being recorded.
+        /// A local store asked to hold metadata alone is given the destination without its
+        /// content, as it is on a put or a read. The write replicas are told separately and are
+        /// not subject to the setting.
+        #[tokio::test]
+        async fn strips_the_payload_where_the_local_store_holds_metadata_only() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let durable = immutable::create(
+                        None::<&Path>,
+                        immutable::ImmutableStoreCreateOptions::none(),
+                        false,
+                        ImmutableStoreSettings::default(),
+                    )
+                    .await
+                    .expect("durable should have been created");
+                    let local = immutable::create(
+                        None::<&Path>,
+                        immutable::ImmutableStoreCreateOptions::none(),
+                        false,
+                        ImmutableStoreSettings::default(),
+                    )
+                    .await
+                    .expect("local should have been created");
+                    let composite = CompositeStoreBuilder::default()
+                        .with_cache_metadata(true, None)
+                        .with_local_metadata_only(true)
+                        .with_durable("test-durable".to_string(), durable.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked");
+
+                    let partition: Partition = random::<RepositoryId>();
+                    let (fragment, source, payload) = generate_random();
+                    durable
+                        .clone()
+                        .put(partition, source, fragment, Some(payload), false)
+                        .await
+                        .expect("put to durable failed");
+
+                    let destination = destination(source);
+                    Arc::new(composite)
+                        .copy(
+                            partition,
+                            source,
+                            partition,
+                            destination.context,
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                    assert_eq!(
+                        lore_storage::immutable_store::query_one(&local, partition, destination)
+                            .await
+                            .expect("local query failed")
+                            .match_made,
+                        StoreMatch::MatchFull
+                    );
+                    let error = local
+                        .clone()
+                        .get(partition, destination)
+                        .await
+                        .expect_err("the local store must not hold the content");
+                    assert!(error.is_payload_not_found(), "{error:?}");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn records_the_destination_when_metadata_caching_is_disabled() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(false, None).await;
+                    let (fragment, source, payload) = generate_random();
+                    fixture
+                        .durable
+                        .clone()
+                        .put(fixture.partition, source, fragment, Some(payload), false)
+                        .await
+                        .expect("put to durable failed");
+
+                    let destination = destination(source);
+                    fixture
+                        .composite
+                        .clone()
+                        .copy(
+                            fixture.partition,
+                            source,
+                            fixture.partition,
+                            destination.context,
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+
+                    assert_eq!(
+                        local_match(&fixture, destination).await,
+                        StoreMatch::MatchFull
+                    );
+                })
+                .await;
+        }
+
+        /// The write replicas are sent the destination's payload, not its fragment alone, so a
+        /// replica holding none of the bytes can still answer for the address afterwards.
+        #[tokio::test]
+        async fn tells_the_write_replicas_of_the_destination() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let recording = recording(StoreMatch::MatchPartition, TestStore::succeeding());
+
+                    copy_recorded(&recording, true, false)
+                        .await
+                        .expect("copy failed");
+
+                    let (fragment, payload) = recording.replica.only_put();
+                    assert_eq!(payload, Some(recording.payload.len()));
+                    assert!(
+                        claims_durable(fragment),
+                        "the durable store made the association, so a replica must not be left \
+                         describing the destination as content only this store holds"
+                    );
+                })
+                .await;
+        }
+
+        /// A caller that has taken replication on itself gets no fan-out. This is what stops a
+        /// copy arriving from a peer being sent back to the region it came from.
+        #[tokio::test]
+        async fn honours_do_not_replicate() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let recording = recording(StoreMatch::MatchPartition, TestStore::succeeding());
+
+                    copy_recorded(&recording, true, true)
+                        .await
+                        .expect("copy failed");
+
+                    assert_eq!(count(&recording.replica, "put"), 0);
+                    assert_eq!(
+                        count(&recording.local, "put"),
+                        1,
+                        "holding the copy back from peers does not hold it back from this process"
+                    );
+                    assert!(claims_durable(recording.local.only_put().0));
+                })
+                .await;
+        }
+
+        /// Recording a copy beyond the durable store is a deployment's to switch off, and doing so
+        /// leaves the durable store the only holder of the destination association. Every other
+        /// case here builds the composite without naming the setting, so the default is what they
+        /// exercise.
+        #[tokio::test]
+        async fn records_nothing_out_of_band_when_switched_off() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let recording = recording_with_out_of_band(
+                        StoreMatch::MatchPartition,
+                        TestStore::succeeding(),
+                        Some(false),
+                    );
+
+                    copy_recorded(&recording, true, false)
+                        .await
+                        .expect("copy failed");
+
+                    assert_eq!(count(&recording.local, "put"), 0);
+                    assert_eq!(count(&recording.replica, "put"), 0);
+                    assert_eq!(
+                        count(&recording.local, "get"),
+                        0,
+                        "nothing is recorded, so there is no reason to read the destination back \
+                         either"
+                    );
+                })
+                .await;
+        }
+
+        /// A local answer below a full match is not the association the copy created, so the
+        /// destination is recorded whatever weaker level the read back resolved at.
+        #[tokio::test]
+        async fn records_the_destination_over_any_partial_local_level() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    for level in [StoreMatch::MatchHash, StoreMatch::MatchPartition] {
+                        let recording = recording(level, TestStore::succeeding());
+
+                        copy_recorded(&recording, true, false)
+                            .await
+                            .expect("copy failed");
+
+                        assert_eq!(count(&recording.local, "put"), 1, "{level:?}");
+                        assert_eq!(
+                            count(&recording.replica, "put"),
+                            1,
+                            "a replica's holdings are not this store's to infer from its own"
+                        );
+                    }
+                })
+                .await;
+        }
+
+        /// Copies a random source to a fresh context through `composite` and waits out the
+        /// detached work the copy spawns.
+        async fn copy_through(composite: lore_revision::store::composite::CompositeStore) {
+            Arc::new(composite)
+                .copy(
+                    random::<RepositoryId>(),
+                    Address {
+                        hash: random::<Hash>(),
+                        context: random::<Context>(),
+                    },
+                    random::<RepositoryId>(),
+                    random::<Context>(),
+                    CopyBehavior {
+                        durable: true,
+                        do_not_replicate: false,
+                    },
+                )
+                .await
+                .expect("copy failed");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        /// A read back the local store cannot answer and the durable store does is cached locally
+        /// by the read itself, so the destination is written to the local store once, not once
+        /// for the read and again for the copy.
+        #[tokio::test]
+        async fn writes_the_destination_locally_once_when_the_durable_store_answers_the_read() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let composite = CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local.clone())
+                        .expect("local should have worked")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("durable should have worked")
+                        .build()
+                        .expect("build should have worked");
+
+                    copy_through(composite).await;
+
+                    assert_eq!(count(&durable, "get"), 1);
+                    assert_eq!(count(&local, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A read back answered by a replica is not cached locally by the read, so the copy is
+        /// what records the destination there.
+        #[tokio::test]
+        async fn records_the_destination_locally_when_a_replica_answers_the_read() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let replica: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let composite = CompositeStoreBuilder::default()
+                        .with_durable_delay(tokio::time::Duration::from_secs(10))
+                        .with_local("local".to_string(), local.clone())
+                        .expect("local should have worked")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("durable should have worked")
+                        .with_replica("replica".to_string(), replica.clone(), true, false)
+                        .build()
+                        .expect("build should have worked");
+
+                    copy_through(composite).await;
+
+                    assert_eq!(
+                        count(&durable, "get"),
+                        0,
+                        "the durable read is held back long enough for the replica to answer"
+                    );
+                    assert_eq!(count(&replica, "get"), 1);
+                    assert_eq!(count(&local, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A destination the local store answers in full, content included, is already the record
+        /// the copy would write, so it is not written again. The write replicas are told either
+        /// way, since what they hold is not this store's to infer from its own.
+        #[tokio::test]
+        async fn writes_nothing_locally_for_a_destination_already_held_in_full() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let payload = Bytes::from_static(b"content the local store already holds");
+                    let held = Fragment {
+                        flags: FragmentFlags::PayloadStoredLocal.bits(),
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    };
+                    let local: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchFull)
+                            .with_mock_durable_match(random::<Context>())
+                            .with_mock_get_immutable(&held, &payload),
+                    );
+                    let replica: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let composite = CompositeStoreBuilder::default()
+                        .with_cache_metadata(true, None)
+                        .with_local("local".to_string(), local.clone())
+                        .expect("local should have worked")
+                        .with_durable("durable".to_string(), Arc::new(TestStore::succeeding()))
+                        .expect("durable should have worked")
+                        .with_replica("replica".to_string(), replica.clone(), false, true)
+                        .build()
+                        .expect("build should have worked");
+
+                    Arc::new(composite)
+                        .copy(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            random::<RepositoryId>(),
+                            random::<Context>(),
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    assert_eq!(count(&local, "put"), 0);
+                    assert_eq!(
+                        count(&replica, "put"),
+                        1,
+                        "a replica's holdings are not this store's to infer from its own"
+                    );
+                })
+                .await;
+        }
+
+        /// A refused copy is the caller's to retry, and nothing may be recorded as though it
+        /// happened — a local or replica record of an association the durable store never made
+        /// would answer for content no one holds.
+        #[tokio::test]
+        async fn a_refused_copy_records_nothing_anywhere() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let recording = recording(StoreMatch::MatchPartition, TestStore::failing());
+
+                    let error = copy_recorded(&recording, true, false)
+                        .await
+                        .expect_err("a refused copy must fail");
+                    assert!(error.is_internal(), "{error:?}");
+
+                    assert_eq!(count(&recording.local, "put"), 0);
+                    assert_eq!(count(&recording.replica, "put"), 0);
+                })
+                .await;
+        }
+
+        /// A composite with no local store has nowhere to cache, and the copy is the durable
+        /// store's own.
+        #[tokio::test]
+        async fn a_durable_only_composite_caches_nothing() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let composite = CompositeStoreBuilder::default()
+                        .with_cache_metadata(true, None)
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("durable should have worked")
+                        .build()
+                        .expect("build should have worked");
+
+                    Arc::new(composite)
+                        .copy(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            random::<RepositoryId>(),
+                            random::<Context>(),
+                            CopyBehavior {
+                                durable: true,
+                                do_not_replicate: false,
+                            },
+                        )
+                        .await
+                        .expect("copy failed");
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    let invocations = durable.invocations.read().unwrap();
+                    assert_eq!(invocations.get("copy").copied(), Some(1));
+                    assert_eq!(
+                        invocations.get("get").copied(),
+                        None,
+                        "the durable store is the local store, so there is no cache to fill and no \
+                         reason to read the destination back"
+                    );
+                })
+                .await;
+        }
+    }
+
+    /// **A composite claims the local store it wraps**, for a command and for a task.
+    ///
+    /// The replicas and the durable upstream are remote and have nothing to claim, so
+    /// the local target's claim is the whole of it. A composite answering `None` would
+    /// let a storage handle open holding nothing and then read and write a store no
+    /// process has claimed — silently, since an empty claim is indistinguishable from
+    /// a store that needed none.
+    #[tokio::test]
+    async fn a_composite_claims_the_local_store_it_wraps() {
+        use lore_storage::local::immutable_store::ImmutableStoreSettings;
+        use lore_storage::local::immutable_store::LocalImmutableStore;
+
+        let local_dir = lore_base::test_util::TempDir::new("lore-composite-claim-local-");
+        let durable_dir = lore_base::test_util::TempDir::new("lore-composite-claim-durable-");
+
+        let execution = setup_test_execution();
+        let local_path = local_dir.path().to_path_buf();
+        let durable_path = durable_dir.path().to_path_buf();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let local_store = LocalImmutableStore::new(
+                    Some(local_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local store");
+                let local_lock = local_store
+                    .lock
+                    .clone()
+                    .expect("a disk-backed store has a lock");
+                let local: Arc<dyn lore_storage::ImmutableStore> = local_store;
+                // A store of its own as the durable target, so the claim can be seen to land
+                // on the local store and not on the one a durable read would reach.
+                let durable: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                    Some(durable_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable store");
+                let composite = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("local target")
+                        .with_durable("durable".to_string(), durable)
+                        .expect("durable target")
+                        .build()
+                        .expect("composite builds"),
+                );
+
+                let claim = composite
+                    .clone()
+                    .hold_for_command()
+                    .await
+                    .expect("claim taken");
+                assert!(
+                    claim.is_some(),
+                    "a composite wrapping a store with files on disk must claim it, \
+                     not inherit the default that claims nothing"
+                );
+                // A lock opened on a store directory shares that directory's state, so it
+                // reports what the composite's claim holds.
+                let held = |path: &std::path::Path| {
+                    lore_storage::local::store_lock::StoreLock::new(path.join("immutable"), false)
+                        .expect("a store directory")
+                        .is_held()
+                };
+                assert!(held(&local_path), "the claim holds the local store");
+                assert!(!held(&durable_path), "and not the durable one");
+                drop(claim);
+
+                let task_claim = composite.hold_for_task().await.expect("claim taken");
+                assert!(
+                    task_claim.is_some(),
+                    "a task's claim lands on the local store too"
+                );
+                assert!(held(&local_path), "the task's claim holds the local store");
+                assert!(
+                    !local_lock.covers(lore_storage::local::store_lock::Intent::Read),
+                    "and covers no operation, as the local store's own task claim does"
+                );
+            })
+            .await;
+    }
+
+    /// A put whose content the durable store already holds, under an association the local store
+    /// can name, is a write the durable store can answer with a copy. The caller supplying the
+    /// payload is what makes naming that source its own to use, since ingress verified the payload
+    /// against this address.
+    mod put_duplicates_a_durable_association {
+        use super::*;
+
+        struct Fixture {
+            store: Arc<lore_revision::store::composite::CompositeStore>,
+            local: Arc<TestStore<'static>>,
+            durable: Arc<TestStore<'static>>,
+            replica: Arc<TestStore<'static>>,
+            partition: Partition,
+            address: Address,
+        }
+
+        /// A composite whose local store answers `match` for the address, and a durable store that
+        /// records whichever verb it is asked for.
+        fn fixture(local: TestStore<'static>) -> Fixture {
+            build_fixture(local, false, false)
+        }
+
+        fn fixture_with_replica(local: TestStore<'static>, write_replica: bool) -> Fixture {
+            build_fixture(local, write_replica, false)
+        }
+
+        /// The same with a write replica, over a local store asked to hold metadata alone.
+        fn fixture_with_metadata_only_local(local: TestStore<'static>) -> Fixture {
+            build_fixture(local, true, true)
+        }
+
+        fn build_fixture(
+            local: TestStore<'static>,
+            write_replica: bool,
+            local_metadata_only: bool,
+        ) -> Fixture {
+            let local_store: Arc<TestStore<'static>> = Arc::new(local);
+            let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+            let replica: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+            let store = CompositeStoreBuilder::default()
+                .with_local_metadata_only(local_metadata_only)
+                .with_local("local".to_string(), local_store.clone())
+                .expect("Failed add local")
+                .with_durable("durable".to_string(), durable.clone())
+                .expect("Failed add durable")
+                .with_replica("replica".to_string(), replica.clone(), false, write_replica)
+                .build()
+                .expect("Failed store build");
+            Fixture {
+                store: Arc::new(store),
+                local: local_store,
+                durable,
+                replica,
+                partition: random::<RepositoryId>(),
+                address: Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                },
+            }
+        }
+
+        async fn put(fixture: &Fixture, payload: Option<Bytes>) {
+            fixture
+                .store
+                .clone()
+                .put(
+                    fixture.partition,
+                    fixture.address,
+                    Fragment {
+                        flags: 0,
+                        size_payload: 128,
+                        size_content: 128,
+                    },
+                    payload,
+                    false,
+                )
+                .await
+                .expect("Put failed");
+            // The local mirror of a copy is detached.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        fn count(store: &Arc<TestStore<'static>>, verb: &str) -> u32 {
+            store
+                .invocations
+                .read()
+                .unwrap()
+                .get(verb)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        #[tokio::test]
+        async fn a_durable_partition_match_is_copied_not_stored() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(
+                        count(&fixture.durable, "copy"),
+                        1,
+                        "the durable store holds these bytes already, so it must be asked for the \
+                         association rather than the payload"
+                    );
+                    assert_eq!(
+                        count(&fixture.durable, "put"),
+                        0,
+                        "no payload should reach the durable store"
+                    );
+                    assert_eq!(
+                        count(&fixture.local, "put"),
+                        1,
+                        "the local cache must be given the association too, or the next read of the \
+                         target address leaves the process for bytes it already holds"
+                    );
+                    let (fragment, payload) = fixture.local.only_put();
+                    assert_eq!(
+                        payload,
+                        Some(128),
+                        "the caller's own payload is carried into the copy, so the local record of \
+                         the destination can answer a read without the content being read back"
+                    );
+                    assert!(
+                        claims_durable(fragment),
+                        "the durable store made this association, so the local record of it must \
+                         say so or a later put will store the payload again"
+                    );
+                })
+                .await;
+        }
+
+        /// The same for a hash held in another partition, which only a local store that reads across
+        /// them reports — the ownership the payload proves is what makes it usable as a source.
+        #[tokio::test]
+        async fn a_durable_hash_match_is_copied_not_stored() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchHash)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.durable, "put"), 0);
+                })
+                .await;
+        }
+
+        /// Without a payload the caller has proved nothing, so it gets no association it did not
+        /// already have.
+        #[tokio::test]
+        async fn a_match_without_a_payload_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, None).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A match the local cache holds but the durable store does not names a source the copy
+        /// would not find, so the payload is stored as before.
+        #[tokio::test]
+        async fn a_match_the_durable_store_lacks_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding().with_mock_match(StoreMatch::MatchPartition),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// Nothing matched, so there is no association to duplicate.
+        #[tokio::test]
+        async fn a_miss_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture =
+                        fixture(TestStore::succeeding().with_mock_match(StoreMatch::MatchNone));
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A put's contract includes replicating it, and satisfying the durable leg with a copy must
+        /// not drop that. The destination is read back and the replica sent the content, so a
+        /// replica holding none of the bytes can still answer a read for the address rather than
+        /// only accelerating `query` for it.
+        #[tokio::test]
+        async fn a_copied_put_still_reaches_the_write_replicas() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        true,
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.durable, "put"), 0);
+                    assert_eq!(
+                        count(&fixture.replica, "put"),
+                        1,
+                        "the write replica must be told of the destination association too"
+                    );
+                    let (fragment, payload) = fixture.replica.only_put();
+                    assert_eq!(
+                        payload,
+                        Some(128),
+                        "the replica is sent the destination's content, not the representation \
+                         alone, and on this path that content is the caller's own payload"
+                    );
+                    assert!(
+                        claims_durable(fragment),
+                        "a replica holds no opinion on durability of its own, so what it reports \
+                         for the destination is what this store told it"
+                    );
+                })
+                .await;
+        }
+
+        /// The caller's fragment and payload already describe the destination, so recording the
+        /// copy reads nothing back. Reading the content would be the transfer the copy was taken to
+        /// avoid, paid immediately after avoiding it.
+        #[tokio::test]
+        async fn a_copied_put_does_not_read_the_content_back() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        true,
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(
+                        count(&fixture.local, "get"),
+                        0,
+                        "the put supplied the content, so no store is asked for it again"
+                    );
+                    assert_eq!(count(&fixture.durable, "get"), 0);
+                    assert_eq!(
+                        count(&fixture.local, "get_metadata"),
+                        0,
+                        "the put supplied the representation, so no store is asked for it either"
+                    );
+                    assert_eq!(count(&fixture.durable, "get_metadata"), 0);
+                })
+                .await;
+        }
+
+        /// The durable source can hold the content in another representation than the one the put
+        /// supplies, so the destination is recorded with the put's fragment: it is the only one
+        /// that describes the payload it travels with.
+        #[tokio::test]
+        async fn a_copied_put_pairs_its_payload_with_its_own_fragment() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>())
+                            .with_mock_metadata_fragment(Fragment {
+                                flags: FragmentFlags::PayloadCompressedZstd.bits(),
+                                size_payload: 64,
+                                size_content: 128,
+                            }),
+                        true,
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    for (name, store) in [("local", &fixture.local), ("replica", &fixture.replica)]
+                    {
+                        let (fragment, payload) = store.only_put();
+                        assert_eq!(payload, Some(128), "{name} must be sent the put's payload");
+                        assert_eq!(
+                            fragment.flags & FragmentFlags::PayloadCompressed.bits(),
+                            0,
+                            "{name} must not be told uncompressed bytes are compressed"
+                        );
+                        assert_eq!(
+                            (fragment.size_payload, fragment.size_content),
+                            (128, 128),
+                            "{name} must be given the sizes of the payload it holds"
+                        );
+                        assert!(claims_durable(fragment));
+                    }
+                })
+                .await;
+        }
+
+        /// `local_metadata_only` is the local store's setting and no one else's, so a replica is
+        /// still sent the content even where the local record is the representation alone.
+        #[tokio::test]
+        async fn a_copied_put_strips_the_local_payload_alone() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_metadata_only_local(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(
+                        fixture.local.only_put().1,
+                        None,
+                        "a local store asked to hold metadata alone is given no content"
+                    );
+                    assert_eq!(
+                        fixture.replica.only_put().1,
+                        Some(128),
+                        "the replica holds no such setting, and one that is sent no content cannot \
+                         answer a read for the destination"
+                    );
+                })
+                .await;
+        }
+
+        /// A replica that refuses the association leaves the put succeeding: the durable store
+        /// holds it, which is what the put was for.
+        #[tokio::test]
+        async fn a_replica_refusing_the_association_does_not_fail_the_put() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let replica: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let store = CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("Failed add local")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .with_replica("replica".to_string(), replica.clone(), false, true)
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("a replica that cannot duplicate must not fail the put");
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(count(&replica, "put"), 1);
+                })
+                .await;
+        }
+
+        /// And a replica that was never configured is not a reason to hold the payload.
+        #[tokio::test]
+        async fn a_copied_put_without_replicas_sends_nothing_further() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.replica, "put"), 0);
+                })
+                .await;
+        }
+
+        /// The consequence of releasing the payload first: a refused copy has nothing to fall back
+        /// on, so the put fails and nothing is stored. Recovery is the caller's retry.
+        #[tokio::test]
+        async fn a_refused_copy_fails_the_put_without_storing_the_payload() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let store = CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("Failed add local")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect_err("a refused copy must fail the put");
+
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(
+                        count(&durable, "put"),
+                        0,
+                        "the payload was released, so there is nothing to fall back to and nothing \
+                         may be stored"
+                    );
+                })
+                .await;
+        }
+
+        /// `PayloadDoNotReplicate` governs the copy fan-out as it governs the put one.
+        #[tokio::test]
+        async fn a_copied_put_honours_do_not_replicate() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        true,
+                    );
+
+                    fixture
+                        .store
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            fixture.address,
+                            Fragment {
+                                flags: FragmentFlags::PayloadDoNotReplicate.into(),
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("Put failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(
+                        count(&fixture.replica, "put"),
+                        0,
+                        "do_not_replicate must hold the copy back as it holds the put back"
+                    );
+                })
+                .await;
+        }
+
+        /// A composite with no local store answers its own query from the durable store, so a
+        /// partial match there is duplicated too — and there is no local mirror to spawn.
+        #[tokio::test]
+        async fn a_durable_only_composite_copies_from_its_own_match() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let durable: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let store = CompositeStoreBuilder::default()
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("Put failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(count(&durable, "put"), 0);
+                })
+                .await;
+        }
+
+        /// A forced put is a write the caller asked for outright, so it is neither short-circuited
+        /// by a full match nor turned into a copy.
+        #[tokio::test]
+        async fn a_forced_put_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    fixture
+                        .store
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            fixture.address,
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            true,
+                        )
+                        .await
+                        .expect("Put failed");
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
     }
 
     #[tokio::test]
@@ -984,16 +3454,18 @@ mod tests {
         use lore_base::lore_spawn;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_base::types::Address;
+        use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_revision::fragment::generate_random;
         use lore_revision::lore::RepositoryId;
+        use lore_revision::store::composite::CompositeStore;
         use lore_revision::store::composite::CompositeStoreBuilder;
         use lore_storage::ImmutableStore;
         use lore_storage::StoreError;
-        use lore_storage::StoreMatch;
+        use lore_storage::StoreGetData;
         use lore_storage::StoreObliterateStats;
-        use lore_storage::StoreQueryResult;
+        use lore_storage::immutable_store::CopyBehavior;
         use lore_storage::local::immutable_store as immutable;
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
         use rand::random;
@@ -1003,16 +3475,24 @@ mod tests {
 
         struct DelayStore {
             get_delay: Duration,
-            get_result: RwLock<Result<(Fragment, Bytes), StoreError>>,
+            get_result: RwLock<Result<StoreGetData, StoreError>>,
             get_count: AtomicU32,
+            get_metadata_count: AtomicU32,
         }
 
         impl DelayStore {
             fn succeeding(fragment: Fragment, payload: Bytes, delay: Duration) -> Self {
                 Self {
                     get_delay: delay,
-                    get_result: RwLock::new(Ok((fragment, payload))),
+                    get_result: RwLock::new(Ok(StoreGetData {
+                        fragment,
+                        match_made: lore_storage::StoreMatch::MatchFull,
+                        partition: Partition::default(),
+                        payload: Some(payload),
+                        content: None,
+                    })),
                     get_count: AtomicU32::new(0),
+                    get_metadata_count: AtomicU32::new(0),
                 }
             }
 
@@ -1021,11 +3501,16 @@ mod tests {
                     get_delay: delay,
                     get_result: RwLock::new(Err(error)),
                     get_count: AtomicU32::new(0),
+                    get_metadata_count: AtomicU32::new(0),
                 }
             }
 
             fn get_count(&self) -> u32 {
                 self.get_count.load(Ordering::SeqCst)
+            }
+
+            fn get_metadata_count(&self) -> u32 {
+                self.get_metadata_count.load(Ordering::SeqCst)
             }
         }
 
@@ -1037,43 +3522,53 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for DelayStore {
+            /// Nothing on disk to claim.
+            async fn hold_for_command(
+                self: std::sync::Arc<Self>,
+            ) -> std::result::Result<
+                Option<lore_storage::local::store_lock::StoreGuard>,
+                lore_storage::StoreError,
+            > {
+                Ok(None)
+            }
+
+            /// Answers from the same configured result as `get`, minus the payload, so a metadata
+            /// lookup and a full read of the same address agree on whether it is there.
+            async fn get_metadata(
+                self: Arc<Self>,
+                _partition: Partition,
+                _address: Address,
+            ) -> Result<StoreGetData, StoreError> {
+                self.get_metadata_count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.get_delay).await;
+                self.get_result
+                    .read()
+                    .await
+                    .clone()
+                    .map(|data| StoreGetData {
+                        payload: None,
+                        ..data
+                    })
+            }
+
             async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
                 true
-            }
-
-            async fn exist(
-                self: Arc<Self>,
-                _repository: Partition,
-                _address: Address,
-                _match_requested: StoreMatch,
-            ) -> Result<StoreMatch, StoreError> {
-                Ok(StoreMatch::MatchNone)
-            }
-
-            async fn exist_batch(
-                self: Arc<Self>,
-                _repository: Partition,
-                addresses: &[Address],
-                _match_requested: StoreMatch,
-            ) -> Result<Vec<StoreMatch>, StoreError> {
-                Ok(vec![StoreMatch::MatchNone; addresses.len()])
             }
 
             async fn query(
                 self: Arc<Self>,
                 _repository: Partition,
-                _address: Address,
-                _match_requested: StoreMatch,
-            ) -> Result<StoreQueryResult, StoreError> {
-                Ok(StoreQueryResult::default())
+                _addresses: &[Address],
+                _results: &mut [lore_storage::StoreMatchResult],
+            ) -> Result<(), StoreError> {
+                Ok(())
             }
 
             async fn get(
                 self: Arc<Self>,
                 _repository: Partition,
                 _address: Address,
-                _match_required: StoreMatch,
-            ) -> Result<(Fragment, Bytes), StoreError> {
+            ) -> Result<StoreGetData, StoreError> {
                 self.get_count.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(self.get_delay).await;
                 self.get_result.read().await.clone()
@@ -1122,8 +3617,6 @@ mod tests {
                 None
             }
 
-            async fn compact_stop(self: Arc<Self>) {}
-
             fn max_query_batch(&self) -> Option<usize> {
                 None
             }
@@ -1134,6 +3627,17 @@ mod tests {
 
             async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
                 Ok(())
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                _source_partition: Partition,
+                _source_address: Address,
+                _destination_partition: Partition,
+                _destination_context: Context,
+                _behavior: CopyBehavior,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::internal("Copy not supported by this store"))
             }
         }
 
@@ -1152,103 +3656,258 @@ mod tests {
             })
         }
 
-        #[tokio::test]
-        async fn success_propagated_to_listeners() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution.clone(), async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
+        /// Long enough that every task in a batch reaches the inflight map before the first
+        /// fan-out resolves, so what the assertions see is genuine contention.
+        const FAN_OUT_DELAY: Duration = Duration::from_millis(200);
 
-                    let durable = Arc::new(DelayStore::succeeding(
-                        fragment,
-                        payload.clone(),
-                        Duration::from_millis(200),
-                    ));
+        const NUM_CONCURRENT: usize = 5;
 
-                    let composite = Arc::new(
-                        CompositeStoreBuilder::default()
-                            .with_local("local".to_string(), create_empty_local().await)
-                            .expect("local should work")
-                            .with_durable("durable".to_string(), durable.clone())
-                            .expect("durable should work")
-                            .build()
-                            .expect("build should work"),
-                    );
-
-                    let num_concurrent = 5;
-                    let mut handles = Vec::with_capacity(num_concurrent);
-                    for _ in 0..num_concurrent {
-                        let store = composite.clone();
-                        handles.push(lore_spawn!(async move {
-                            store.get(repository, address, StoreMatch::MatchFull).await
-                        }));
-                    }
-
-                    for handle in handles {
-                        let (got_fragment, got_payload) =
-                            handle.await.expect("task panicked").expect("get failed");
-                        assert_eq!(got_fragment.size_payload, fragment.size_payload);
-                        assert_eq!(got_payload, payload);
-                    }
-
-                    assert_eq!(
-                        durable.get_count(),
-                        1,
-                        "inflight dedup should collapse concurrent gets into a single durable get"
-                    );
-                })
-                .await;
+        async fn composite_over(durable: Arc<DelayStore>) -> Arc<CompositeStore> {
+            Arc::new(
+                CompositeStoreBuilder::default()
+                    .with_local("local".to_string(), create_empty_local().await)
+                    .expect("local should work")
+                    .with_durable("durable".to_string(), durable)
+                    .expect("durable should work")
+                    .build()
+                    .expect("build should work"),
+            )
         }
 
-        #[tokio::test]
-        async fn failure_propagated_to_listeners() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution.clone(), async move {
-                    let repository: Partition = random::<RepositoryId>();
-                    let address = random::<Address>();
+        mod get {
+            use super::*;
 
-                    let durable = Arc::new(DelayStore::failing(
-                        StoreError::from(lore_storage::AddressNotFound::from(address)),
-                        Duration::from_millis(200),
-                    ));
+            #[tokio::test]
+            async fn success_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
 
-                    let composite = Arc::new(
-                        CompositeStoreBuilder::default()
-                            .with_local("local".to_string(), create_empty_local().await)
-                            .expect("local should work")
-                            .with_durable("durable".to_string(), durable.clone())
-                            .expect("durable should work")
-                            .build()
-                            .expect("build should work"),
-                    );
+                        let durable = Arc::new(DelayStore::succeeding(
+                            fragment,
+                            payload.clone(),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
 
-                    let num_concurrent = 5;
-                    let mut handles = Vec::with_capacity(num_concurrent);
-                    for _ in 0..num_concurrent {
-                        let store = composite.clone();
-                        handles.push(lore_spawn!(async move {
-                            store.get(repository, address, StoreMatch::MatchFull).await
-                        }));
-                    }
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(
+                                async move { store.get(repository, address).await }
+                            ));
+                        }
 
-                    for handle in handles {
-                        let result = handle.await.expect("task panicked");
-                        assert!(result.is_err(), "get should have failed");
-                        assert!(
-                            result.unwrap_err().is_address_not_found(),
-                            "should be AddressNotFound"
+                        for handle in handles {
+                            let (got_fragment, got_payload) = handle
+                                .await
+                                .expect("task panicked")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get failed");
+                            assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                            assert_eq!(got_payload, payload);
+                        }
+
+                        assert_eq!(
+                            durable.get_count(),
+                            1,
+                            "inflight dedup should collapse concurrent gets into a single durable get"
                         );
-                    }
+                    })
+                    .await;
+            }
 
-                    assert_eq!(
-                        durable.get_count(),
-                        1,
-                        "inflight dedup should collapse concurrent gets into a single durable get even on failure"
-                    );
-                })
-                .await;
+            #[tokio::test]
+            async fn failure_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_storage::AddressNotFound::from(address)),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let error = handle
+                                .await
+                                .expect("task panicked")
+                                .expect_err("get should have failed");
+                            assert!(error.is_address_not_found(), "should be AddressNotFound");
+                        }
+
+                        assert_eq!(
+                            durable.get_count(),
+                            1,
+                            "inflight dedup should collapse concurrent gets into a single durable get even on failure"
+                        );
+                    })
+                    .await;
+            }
+        }
+
+        mod get_metadata {
+            use super::*;
+
+            #[tokio::test]
+            async fn success_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, FAN_OUT_DELAY));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                            assert_eq!(data.fragment.size_payload, fragment.size_payload);
+                            assert_eq!(
+                                data.payload, None,
+                                "a metadata answer carries no payload to copy to its listeners"
+                            );
+                        }
+
+                        assert_eq!(
+                            durable.get_metadata_count(),
+                            1,
+                            "inflight dedup should collapse concurrent get_metadata calls into a single durable lookup"
+                        );
+                    })
+                    .await;
+            }
+
+            /// A durable store that cannot answer leaves the composite with nothing better than
+            /// the empty starting result, and that is what every listener is handed.
+            #[tokio::test]
+            async fn durable_error_answers_every_listener_with_no_match() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_storage::AddressNotFound::from(address)),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata reports a miss rather than failing");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchNone);
+                        }
+
+                        assert_eq!(
+                            durable.get_metadata_count(),
+                            1,
+                            "inflight dedup should collapse concurrent get_metadata calls into a single durable lookup even on failure"
+                        );
+                    })
+                    .await;
+            }
+
+            /// The inflight slot is keyed by partition and address, so unrelated lookups running
+            /// at the same time must not be served one another's answer.
+            #[tokio::test]
+            async fn distinct_addresses_each_fan_out() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, first_address, payload) = generate_random();
+                        let (_, second_address, _) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, FAN_OUT_DELAY));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(2);
+                        for address in [first_address, second_address] {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 2);
+                    })
+                    .await;
+            }
+
+            /// The slot is released once the fan-out it covers has broadcast, so a later caller
+            /// starts a fresh one instead of subscribing to a channel nothing will send on.
+            #[tokio::test]
+            async fn slot_released_once_the_fan_out_completes() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, Duration::ZERO));
+                        let composite = composite_over(durable.clone()).await;
+
+                        for _ in 0..2 {
+                            let data = composite
+                                .clone()
+                                .get_metadata(repository, address)
+                                .await
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 2);
+                    })
+                    .await;
+            }
         }
     }
 
@@ -1718,19 +4377,25 @@ mod tests {
                             .expect("build should work"),
                     );
 
-                    let match_result = composite
-                        .clone()
-                        .exist(repository, address, StoreMatch::MatchFull)
-                        .await
-                        .expect("exist should work");
-                    assert_eq!(match_result, StoreMatch::MatchFull);
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite.clone() as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should work");
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                     let (got_fragment, got_payload) = composite
                         .clone()
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should work");
-                    assert_eq!(got_fragment, fragment);
+                    // The store that served it holds the payload, and says so.
+                    let mut held = fragment;
+                    held.flags |= lore_base::types::FragmentFlags::PayloadStoredLocal.bits();
+                    assert_eq!(got_fragment, held);
                     assert_eq!(got_payload, payload);
                 })
                 .await;
@@ -1745,7 +4410,6 @@ mod tests {
                     use lore_revision::fragment::generate_random;
                     use lore_revision::lore::RepositoryId;
                     use lore_storage::ImmutableStore;
-                    use lore_storage::StoreMatch;
 
                     let (fragment, address, payload) = generate_random();
                     let repository: Partition = rand::random::<RepositoryId>();
@@ -1786,11 +4450,424 @@ mod tests {
 
                     let (got_fragment, got_payload) = composite
                         .clone()
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should succeed via durable despite empty replica");
-                    assert_eq!(got_fragment, fragment);
+                    // The store that served it holds the payload, and says so.
+                    let mut held = fragment;
+                    held.flags |= lore_base::types::FragmentFlags::PayloadStoredLocal.bits();
+                    assert_eq!(got_fragment, held);
                     assert_eq!(got_payload, payload);
+                })
+                .await;
+        }
+    }
+
+    mod durable_delay {
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_revision::fragment::generate_random;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::store::composite::CompositeStore;
+        use lore_revision::store::composite::CompositeStoreBuilder;
+        use lore_storage::ImmutableStore;
+        use lore_storage::StoreError;
+        use lore_storage::StoreGetData;
+        use lore_storage::StoreMatch;
+        use lore_storage::StoreObliterateStats;
+        use lore_storage::immutable_store::CopyBehavior;
+        use lore_storage::local::immutable_store as immutable;
+        use lore_storage::local::immutable_store::ImmutableStoreSettings;
+        use rand::random;
+
+        use crate::tests::setup_test_execution;
+
+        /// Wraps an `ImmutableStore` and tracks how many times each read method is called.
+        struct CountingStore {
+            inner: Arc<dyn ImmutableStore>,
+            get_count: AtomicU32,
+            resolve_count: AtomicU32,
+        }
+
+        impl std::fmt::Debug for CountingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "CountingStore")
+            }
+        }
+
+        impl CountingStore {
+            fn wrapping(inner: Arc<dyn ImmutableStore>) -> Self {
+                Self {
+                    inner,
+                    get_count: AtomicU32::new(0),
+                    resolve_count: AtomicU32::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ImmutableStore for CountingStore {
+            /// Joins the claim of the store this one wraps.
+            async fn hold_for_command(
+                self: std::sync::Arc<Self>,
+            ) -> std::result::Result<
+                Option<lore_storage::local::store_lock::StoreGuard>,
+                lore_storage::StoreError,
+            > {
+                lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+            }
+
+            async fn get_metadata(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<StoreGetData, StoreError> {
+                self.inner.clone().get_metadata(partition, address).await
+            }
+
+            async fn query(
+                self: Arc<Self>,
+                partition: Partition,
+                addresses: &[Address],
+                results: &mut [lore_storage::StoreMatchResult],
+            ) -> Result<(), StoreError> {
+                self.resolve_count.fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .clone()
+                    .query(partition, addresses, results)
+                    .await
+            }
+
+            async fn get(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<StoreGetData, StoreError> {
+                self.get_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.clone().get(partition, address).await
+            }
+
+            async fn put(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                fragment: Fragment,
+                payload: Option<Bytes>,
+                force: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .put(partition, address, fragment, payload, force)
+                    .await
+            }
+
+            async fn obliterate(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                stats: Arc<StoreObliterateStats>,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .obliterate(partition, address, stats)
+                    .await
+            }
+
+            async fn evict(
+                self: Arc<Self>,
+                max_capacity: usize,
+                sync_data: bool,
+                sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+            ) -> Result<usize, StoreError> {
+                self.inner
+                    .clone()
+                    .evict(max_capacity, sync_data, sink)
+                    .await
+            }
+
+            async fn compact(
+                self: Arc<Self>,
+                max_size: usize,
+                at: Option<usize>,
+                sync_data: bool,
+                sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+            ) -> Result<Option<usize>, StoreError> {
+                self.inner
+                    .clone()
+                    .compact(max_size, at, sync_data, sink)
+                    .await
+            }
+
+            async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+                self.inner.clone().compact_resume_at().await
+            }
+
+            fn max_query_batch(&self) -> Option<usize> {
+                self.inner.max_query_batch()
+            }
+
+            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+                self.inner.clone().flush(sync_data).await
+            }
+
+            async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+                self.inner.clone().verify(heal).await
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                source_partition: Partition,
+                source_address: Address,
+                destination_partition: Partition,
+                destination_context: Context,
+                behavior: CopyBehavior,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .copy(
+                        source_partition,
+                        source_address,
+                        destination_partition,
+                        destination_context,
+                        behavior,
+                    )
+                    .await
+            }
+        }
+
+        async fn make_store() -> Arc<dyn ImmutableStore> {
+            immutable::create(
+                None::<&Path>,
+                immutable::ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("should create in-memory store")
+        }
+
+        async fn build_composite_with_read_replica(
+            durable: Arc<dyn ImmutableStore>,
+            replica: Arc<dyn ImmutableStore>,
+            durable_delay: Duration,
+        ) -> Arc<CompositeStore> {
+            Arc::new(
+                CompositeStoreBuilder::default()
+                    .with_local("local".to_string(), make_store().await)
+                    .expect("local should work")
+                    .with_durable("durable".to_string(), durable)
+                    .expect("durable should work")
+                    .with_replica("read-replica".to_string(), replica, true, false)
+                    .with_durable_delay(durable_delay)
+                    .build()
+                    .expect("build should work"),
+            )
+        }
+
+        async fn build_composite_no_replica(
+            durable: Arc<dyn ImmutableStore>,
+            durable_delay: Duration,
+        ) -> Arc<CompositeStore> {
+            Arc::new(
+                CompositeStoreBuilder::default()
+                    .with_local("local".to_string(), make_store().await)
+                    .expect("local should work")
+                    .with_durable("durable".to_string(), durable)
+                    .expect("durable should work")
+                    .with_durable_delay(durable_delay)
+                    .build()
+                    .expect("build should work"),
+            )
+        }
+
+        /// When a read replica responds with a full match before the durable delay elapses,
+        /// the durable `get` should be cancelled — never invoked.
+        #[tokio::test]
+        async fn get_durable_not_called_when_replica_responds_within_delay() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (fragment, address, payload) = generate_random();
+                    let repository: Partition = random::<RepositoryId>();
+
+                    let replica = make_store().await;
+                    replica
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .expect("put to replica failed");
+
+                    let durable_inner = make_store().await;
+                    durable_inner
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .expect("put to durable failed");
+                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                    let composite = build_composite_with_read_replica(
+                        durable.clone(),
+                        replica,
+                        Duration::from_millis(500),
+                    )
+                    .await;
+
+                    let (got_fragment, got_payload) = composite
+                        .get(repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("get should succeed via replica");
+
+                    assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                    assert_eq!(got_payload, payload);
+                    assert_eq!(
+                        durable.get_count.load(Ordering::SeqCst),
+                        0,
+                        "durable get must not be called when replica responds within the delay window"
+                    );
+                })
+                .await;
+        }
+
+        /// When there are no replicas the configured delay is bypassed entirely — the
+        /// durable store is queried immediately regardless of how large the delay is.
+        #[tokio::test]
+        async fn get_durable_not_delayed_when_no_replicas() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (fragment, address, payload) = generate_random();
+                    let repository: Partition = random::<RepositoryId>();
+
+                    let durable_inner = make_store().await;
+                    durable_inner
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .expect("put to durable failed");
+                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                    // Use a large delay that would block the test if it were applied.
+                    let composite =
+                        build_composite_no_replica(durable.clone(), Duration::from_millis(500))
+                            .await;
+
+                    let (got_fragment, got_payload) = composite
+                        .get(repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("get should succeed immediately via durable");
+
+                    assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                    assert_eq!(got_payload, payload);
+                    assert_eq!(
+                        durable.get_count.load(Ordering::SeqCst),
+                        1,
+                        "durable get must be called when there are no replicas"
+                    );
+                })
+                .await;
+        }
+
+        /// When a read replica responds with `MatchFull` before the durable delay elapses,
+        /// the durable `exist` should be cancelled — never invoked.
+        #[tokio::test]
+        async fn resolve_durable_not_called_when_replica_responds_within_delay() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (fragment, address, payload) = generate_random();
+                    let repository: Partition = random::<RepositoryId>();
+
+                    let replica = make_store().await;
+                    replica
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .expect("put to replica failed");
+
+                    let durable_inner = make_store().await;
+                    durable_inner
+                        .clone()
+                        .put(repository, address, fragment, Some(payload), false)
+                        .await
+                        .expect("put to durable failed");
+                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                    let composite = build_composite_with_read_replica(
+                        durable.clone(),
+                        replica,
+                        Duration::from_millis(500),
+                    )
+                    .await;
+
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should succeed via replica");
+
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                    assert_eq!(
+                        durable.resolve_count.load(Ordering::SeqCst),
+                        0,
+                        "durable resolve must not be called when replica responds within the delay window"
+                    );
+                })
+                .await;
+        }
+
+        /// When there are no replicas the configured delay is bypassed entirely — the
+        /// durable store is queried immediately regardless of how large the delay is.
+        #[tokio::test]
+        async fn resolve_durable_not_delayed_when_no_replicas() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (fragment, address, payload) = generate_random();
+                    let repository: Partition = random::<RepositoryId>();
+
+                    let durable_inner = make_store().await;
+                    durable_inner
+                        .clone()
+                        .put(repository, address, fragment, Some(payload), false)
+                        .await
+                        .expect("put to durable failed");
+                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                    // Use a large delay that would block the test if it were applied.
+                    let composite =
+                        build_composite_no_replica(durable.clone(), Duration::from_millis(500))
+                            .await;
+
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should succeed immediately via durable");
+
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                    assert_eq!(
+                        durable.resolve_count.load(Ordering::SeqCst),
+                        1,
+                        "durable resolve must be called when there are no replicas"
+                    );
                 })
                 .await;
         }

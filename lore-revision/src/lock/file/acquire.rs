@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::types::LockData;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -23,6 +22,7 @@ use crate::lock::file::release::ReleaseOptions;
 use crate::lock::file::release::release;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -98,7 +98,7 @@ impl EventError for AcquireError {
 
 /// Data for an event that marks the start of a lock acquire report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
@@ -109,7 +109,7 @@ pub struct LoreLockFileAcquireBeginEventData {
 
 /// Data for an event reporting a path whose lock is being acquired.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireEventData {
     /// The path whose lock is being acquired.
@@ -134,7 +134,7 @@ pub async fn acquire(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<AcquireError>("Invalid branch")?;
         resolved.id
     };
 
@@ -209,7 +209,6 @@ pub async fn acquire(
         .await
         .forward::<AcquireError>("Unable to acquire lock while offline")?;
 
-    let resources_count = resources.len();
     let resources_values = resources.values().cloned().collect::<Vec<_>>();
     let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
@@ -246,42 +245,30 @@ pub async fn acquire(
     }
     task_error?;
 
-    let mut locks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            locks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut locks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources.len());
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-acquire {num_batch_failed} batch(es) out of {num_batches}");
-    }
 
-    if num_batch_success == 0 {
-        return Err(AcquireError::internal("Failed to acquire the lock"));
-    }
+        if num_batch_success > 0 {
+            lore_debug!("Attempting releasing partial acquired locks.");
 
-    if num_batch_success > 0 && num_batch_success < num_batches {
-        lore_debug!("Attempting releasing partial acquired locks.");
+            let options = ReleaseOptions {
+                paths: options.paths,
+                branch: options.branch,
+                owner: String::default(),
+                owner_id: String::default(),
+            };
 
-        let options = ReleaseOptions {
-            paths: options.paths,
-            branch: options.branch,
-            owner: String::default(),
-            owner_id: String::default(),
-        };
+            release(repository.clone(), options)
+                .await
+                .forward::<AcquireError>("Failed to acquire the lock")?;
+        }
 
-        release(repository.clone(), options)
-            .await
-            .forward::<AcquireError>("Failed to acquire the lock")?;
-
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     locks.sort_by(|lock_a, lock_b| {

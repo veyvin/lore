@@ -3,6 +3,8 @@
 // Re-export all storage-relevant error types from lore-error
 pub use lore_base::error::AddressNotFound;
 pub use lore_base::error::Disconnected;
+pub use lore_base::error::InefficientCompression;
+pub use lore_base::error::InvalidArguments;
 pub use lore_base::error::Maintenance;
 pub use lore_base::error::NoRemote;
 pub use lore_base::error::NotAuthenticated;

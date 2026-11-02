@@ -1,5 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// Boxed future for external API boundaries.
+///
+/// Used to reduce monomorphization pressure at crate boundaries by erasing
+/// the concrete future type behind a trait object.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub mod anchor;
 pub mod auth;
 pub mod branch;
@@ -9,7 +19,6 @@ pub mod commit;
 pub mod dependency;
 pub mod diff;
 pub mod environment;
-pub mod error;
 pub mod errors;
 pub mod event;
 pub mod file;
@@ -47,6 +56,7 @@ pub mod relay;
 pub mod repository;
 pub mod revision;
 pub mod runtime;
+pub mod service_state;
 pub mod stage;
 pub mod state;
 pub mod store;
@@ -54,10 +64,21 @@ pub mod util;
 
 #[cfg(all(target_family = "windows", feature = "vfs"))]
 pub mod projfs;
-//#[cfg(all(target_family = "windows", feature = "vfs"))]
-//pub mod swfs;
 
 pub use lore_base::lore_drain_tasks;
 pub use lore_base::lore_limit_drain_tasks;
 pub use lore_base::lore_spawn_blocking;
 pub use lore_base::lore_spawn_blocking_nocontext;
+
+/// Ceiling on concurrently-spawned tasks in a filesystem or state tree walk:
+/// the diff, stage, realize and verify-filesystem walks.
+///
+/// These tasks wait on the `lore-io` syscall pool rather than holding a core, so
+/// the bound keeps that pool fed while capping live per-task state. A walk that
+/// reaches the ceiling carries the work rather than waiting for a permit: the
+/// revision diff queues it for the task that found it, the filesystem diff and
+/// the local-size walk take it inline, and the walks bounded by the length of
+/// their own `JoinSet` wait on a task of theirs, which needs no permit to
+/// finish. So any value >= 1 is correct, and waiting for a permit instead would
+/// deadlock, since a task holds its own until the subtrees it spawned finish.
+pub const MAX_CONCURRENT_TREE_TASKS: usize = 1000;

@@ -7,9 +7,9 @@ pub mod metadata;
 pub mod revision_tree;
 
 use lore_macro::VariantTypeSize;
-use serde::Deserialize;
 use serde::Serialize;
 
+use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
 use crate::auth::userinfo::LoreAuthIdentityEventData;
 use crate::auth::userinfo::LoreAuthUserInfoEventData;
@@ -60,11 +60,13 @@ use crate::branch::push::LoreBranchPushRevisionPushEndEventData;
 use crate::branch::push::LoreBranchPushRevisionPushUpdateEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateBeginEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateEndEventData;
+use crate::branch::push::LoreBranchPushStatsEventData;
 use crate::branch::reset::LoreBranchResetEventData;
 use crate::commit::LoreRevisionCommitBeginEventData;
 use crate::commit::LoreRevisionCommitEndEventData;
 use crate::commit::LoreRevisionCommitProgressEventData;
 use crate::commit::LoreRevisionCommitRevisionEventData;
+use crate::commit::LoreRevisionCommitStatsEventData;
 use crate::dependency::LoreDependencyResolveBeginEventData;
 use crate::dependency::LoreDependencyResolveEndEventData;
 use crate::dependency::LoreDependencyResolveItemEventData;
@@ -80,6 +82,7 @@ use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
+use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
 use crate::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
@@ -87,6 +90,7 @@ use crate::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeListChildrenBeginEventData;
 use crate::event::revision_tree::LoreRevisionTreeLoadedEventData;
+use crate::event::revision_tree::LoreRevisionTreeMetadataClearCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataGetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataSetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeModifyCompleteEventData;
@@ -94,6 +98,7 @@ use crate::event::revision_tree::LoreRevisionTreeMoveCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodePathEventData;
 use crate::event::revision_tree::LoreRevisionTreeResolvePathCompleteEventData;
+use crate::file::audit::LoreFileAuditEventData;
 use crate::file::diff::LoreFileDiffEventData;
 use crate::file::dump::LoreFileDumpEventData;
 use crate::file::hash::LoreFileHashEventData;
@@ -116,6 +121,7 @@ use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
 use crate::interface::LoreArray;
+use crate::interface::LoreBinary;
 use crate::interface::LoreError;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
@@ -125,8 +131,8 @@ use crate::layer::LoreLayerAddEventData;
 use crate::layer::LoreLayerEntryEventData;
 use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
+use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
-use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
@@ -136,6 +142,9 @@ use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
@@ -211,6 +220,7 @@ use crate::revision::sync::LoreRevisionSyncRevisionEventData;
 use crate::revision::sync::LoreRevisionSyncTargetEventData;
 use crate::shared_store::LoreSharedStoreCreateEventData;
 use crate::shared_store::LoreSharedStoreInfoEventData;
+use crate::shared_store::LoreSharedStoreListEventData;
 use crate::stage::LoreFileStageBeginEventData;
 use crate::stage::LoreFileStageEndEventData;
 use crate::stage::LoreFileStageFileEventData;
@@ -220,6 +230,7 @@ use crate::state::LoreRepositoryStateDumpEventData;
 use crate::state::LoreRepositoryStateDumpNodeEventData;
 use crate::store::event::LoreStorageCopyItemCompleteEventData;
 use crate::store::event::LoreStorageGetDataEventData;
+use crate::store::event::LoreStorageGetFragmentEventData;
 use crate::store::event::LoreStorageGetHeaderEventData;
 use crate::store::event::LoreStorageGetItemCompleteEventData;
 use crate::store::event::LoreStorageGetMetadataItemCompleteEventData;
@@ -261,11 +272,74 @@ pub trait EventError: std::fmt::Display {
 /// Data for a generic progress event.
 // TODO(vri): Implement with a union to enable command-specific progress events
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreProgressEventData {
     /// Placeholder field; carries no meaningful value.
     pub _unused: u32,
+}
+
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Staged change to a link itself, as opposed to content inside it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreLinkStagedState {
+    /// The link carries no staged change.
+    None = 0,
+    /// The link was added and is not committed yet.
+    Added = 1,
+    /// The link was removed and the removal is not committed yet.
+    Removed = 2,
+    /// The link's pin was changed and is not committed yet.
+    Modified = 3,
+}
+
+/// Data for an event describing a single link in a repository. Carries the
+/// branch identifier rather than its name; a consumer that wants the name
+/// resolves it, so listing links costs no branch metadata reads.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkEntryEventData {
+    /// Identifier of the repository the link points to.
+    pub link: RepositoryId,
+    /// Identifier of the link node in the parent repository.
+    pub link_node: u32,
+    /// Path of the link within the parent repository.
+    pub link_path: LoreString,
+    /// Identifier of the source node in the linked repository.
+    pub source_node: u32,
+    /// Path of the source within the linked repository.
+    pub source_path: LoreString,
+    /// Identifier of the branch the link is pinned to.
+    pub branch: BranchId,
+    /// Set when the link follows its parent's branch instead of being pinned to
+    /// an explicit one, in which case `branch` is the branch it resolved to.
+    #[serde(with = "crate::util::serde::u8_as_bool")]
+    pub tracking: u8,
+    /// Hash of the revision the link is pinned to.
+    pub revision: Hash,
+    /// Link flags.
+    pub flags: u32,
+}
+
+/// Data for an event describing a single link in detail: everything `LinkEntry`
+/// reports, plus the state only `link info` gathers.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkInfoEventData {
+    /// The link as `LinkEntry` reports it.
+    pub entry: LoreLinkEntryEventData,
+    /// Hash of the remote latest revision of the pinned branch, zero when the
+    /// remote was not consulted.
+    pub remote_revision: Hash,
+    /// Staged change to the link itself.
+    pub staged_state: LoreLinkStagedState,
+    /// Number of staged files inside the linked repository.
+    pub staged_file_count: u64,
 }
 
 /// Borrowed byte slice handed to callbacks.
@@ -323,44 +397,113 @@ impl serde::Serialize for LoreBytes {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for LoreBytes {
-    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(
-            "LoreBytes cannot be deserialized — it is a borrowed view",
-        ))
+/// Borrowed writable byte slice the caller hands to the library. The counterpart of
+/// `lore_bytes_t`: the caller owns the memory and the library fills it.
+///
+/// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
+/// value says, as does a length no allocation can have.
+///
+/// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+/// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+/// items of one call must not overlap: the items run alongside each other, so two covering the same
+/// byte would write it at once.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LoreBytesMut {
+    /// Pointer to the start of the writable slice.
+    pub ptr: *mut core::ffi::c_void,
+    /// Number of bytes available behind `ptr`.
+    pub len: usize,
+}
+
+// SAFETY: as `LoreBytes`, with the caller owning the memory; the call it is handed to bounds the
+// lifetime.
+unsafe impl Send for LoreBytesMut {}
+unsafe impl Sync for LoreBytesMut {}
+
+impl Default for LoreBytesMut {
+    fn default() -> Self {
+        LoreBytesMut {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        }
     }
 }
 
-/// Small discriminator enum for per-item terminal events in the
-/// content-addressed storage API.
+impl LoreBytesMut {
+    /// Whether a buffer is supplied.
+    ///
+    /// A length above `isize::MAX` describes no allocation Rust can address, and reading it as one
+    /// is undefined rather than merely wrong, so such a value is taken as no buffer at all and the
+    /// item is answered the way it is answered without one.
+    pub fn is_supplied(&self) -> bool {
+        !self.ptr.is_null() && self.len > 0 && isize::try_from(self.len).is_ok()
+    }
+}
+
+impl PartialEq for LoreBytesMut {
+    fn eq(&self, other: &Self) -> bool {
+        // Compared as a destination rather than as contents: nothing has written the bytes yet.
+        self.ptr == other.ptr && self.len == other.len
+    }
+}
+
+impl core::fmt::Debug for LoreBytesMut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoreBytesMut")
+            .field("supplied", &self.is_supplied())
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+/// Small discriminator enum for the per-item terminal events of the revision-tree API.
 ///
-/// Narrower than the general library error code — events emitted per
-/// put/get/copy/etc. item embed this code so a caller can branch on the
-/// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-/// detail. Variants overlap with the general library error code where they
-/// share a meaning.
+/// Narrower than the general library error code: an event embeds this so a caller can branch on
+/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
+/// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
+///
+/// The values are the error codes themselves, taken from the registry in
+/// `lore_base::error`, so a code read from a per-item event means the same
+/// thing as the code on `Complete.status`. This enum names the subset a
+/// per-item event can carry; it is not a second numbering.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 pub enum LoreErrorCode {
     /// No error; the operation succeeded.
     #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
+    InvalidArguments = 3,
     /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
+    AddressNotFound = 80,
     /// An internal error occurred.
-    Internal = 3,
+    Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 4,
+    SlowDown = 31,
 }
+
+// cbindgen cannot evaluate a const in a discriminant position — it drops the
+// enum and emits an incomplete type — so the codes above are written out.
+// These tie them back to the registry at compile time: a code that moves in
+// `lore-base` fails the build here rather than silently leaving this enum
+// describing the old numbering.
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
+const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorEventData {
     /// The error code, matching one of the error codes.
@@ -380,22 +523,19 @@ impl LoreErrorEventData {
 
 /// Data for a completion event, marking the end of an operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompleteEventData {
     /// The completion status code of the operation.
     pub status: i32,
     /// The error detail for the operation. The empty default detail on
-    /// success; the populated detail on failure. `#[serde(default)]` lets an
-    /// older payload that lacks this field deserialize: the detail then reads
-    /// back as the empty default with an empty trace list.
-    #[serde(default)]
+    /// success; the populated detail on failure.
     pub error: LoreErrorDetail,
 }
 
 /// Data for a metadata event, carrying a single key and value.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataEventData {
     /// The metadata key.
@@ -414,9 +554,9 @@ impl LoreMetadataEventData {
             MetadataType::Hash => LoreMetadata::Hash(Metadata::to_hash(value)?),
             MetadataType::Numeric => LoreMetadata::Numeric(Metadata::to_u64(value)?),
             MetadataType::String => {
-                LoreMetadata::String(LoreString::from(Metadata::to_string(value).ok()))
+                LoreMetadata::String(LoreString::from(Metadata::to_string(value)?))
             }
-            MetadataType::Binary => return Err(MetadataError::internal("metadata type mismatch")),
+            MetadataType::Binary => LoreMetadata::Binary(LoreBinary::from_bytes(value)),
         };
 
         Ok(LoreMetadataEventData { key, value })
@@ -425,7 +565,7 @@ impl LoreMetadataEventData {
 
 /// Data for a log event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLogEventData {
     /// The severity level of the log message.
@@ -442,7 +582,7 @@ pub struct LoreLogEventData {
 
 /// Data for an end event, marking the final event of a callback stream.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEndEventData {
     /// Placeholder field; carries no meaningful value.
@@ -451,7 +591,7 @@ pub struct LoreEndEventData {
 
 /// Data for a maintenance event, carrying an informational message.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMaintenanceEventData {
     /// The maintenance message text.
@@ -471,7 +611,7 @@ pub struct LoreMaintenanceEventData {
 /// event. A consumer that keeps any of this data must copy it out before the
 /// callback returns.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreTraceLocation {
     /// The source file path.
@@ -530,19 +670,16 @@ impl std::fmt::Display for LoreTraceLocation {
 ///
 /// [`MAX_TRACE_DEPTH`]: lore_error_set::MAX_TRACE_DEPTH
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorDetail {
     /// The error's error code. `0` on success; `-1` for an internal error.
-    #[serde(default)]
     pub error_code: i32,
     /// The error message, taken from the error's `Display` output. Empty on
     /// success.
-    #[serde(default)]
     pub message: LoreString,
     /// The captured trace, one location per trace entry. Empty when
     /// `track-locations` is off or the error carries no trace.
-    #[serde(default)]
     pub trace_locations: LoreArray<LoreTraceLocation>,
 }
 
@@ -578,6 +715,7 @@ impl LoreErrorDetail {
     }
 
     /// Builds an error detail from an error and an explicitly supplied trace.
+    #[lore_macro::test_pub]
     fn from_error_with_trace<E>(error: &E, trace: &lore_error_set::Trace) -> Self
     where
         E: lore_error_set::FfiError + std::fmt::Display,
@@ -610,7 +748,7 @@ impl LoreErrorDetail {
 
 /// Data for the start of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionBeginEventData {
     /// Fragment capacity the pass is reducing the store toward.
@@ -619,7 +757,7 @@ pub struct LoreEvictionBeginEventData {
 
 /// Data for one bucket evicted during a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionProgressEventData {
     /// Fragments evicted from this bucket.
@@ -628,7 +766,7 @@ pub struct LoreEvictionProgressEventData {
 
 /// Data for the end of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionEndEventData {
     /// Total fragments evicted across the pass.
@@ -637,7 +775,7 @@ pub struct LoreEvictionEndEventData {
 
 /// Data for the start of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionBeginEventData {
     /// Store size in bytes the pass is reducing the store toward.
@@ -646,7 +784,7 @@ pub struct LoreCompactionBeginEventData {
 
 /// Data for one group compacted during a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionProgressEventData {
     /// Bytes reclaimed from this group.
@@ -655,11 +793,40 @@ pub struct LoreCompactionProgressEventData {
 
 /// Data for the end of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionEndEventData {
     /// Total bytes reclaimed across the pass.
     pub total_compacted_bytes: u64,
+}
+
+/// Data for the service status event, reporting whether the service is running
+/// and its current metadata.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreServiceStatusEventData {
+    /// Whether the service is running: 1 for running, 0 for not running.
+    pub running: u8,
+    /// Path to the service binary.
+    pub binary_path: LoreString,
+    /// Milliseconds since the service started.
+    pub uptime_ms: u64,
+    /// Number of active client connections.
+    pub connection_count: u32,
+    /// Number of SWFS mounts currently active.
+    pub swfs_mount_count: u32,
+}
+
+/// Data for a service log message captured outside command execution.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreServiceMessageEventData {
+    /// The severity level of the log message.
+    pub level: lore_base::log::LoreLogLevel,
+    /// The log message text.
+    pub message: LoreString,
 }
 
 /// cbindgen:prefix-with-name
@@ -667,7 +834,7 @@ pub struct LoreCompactionEndEventData {
 /// An event delivered to a callback. Each variant names a kind of event and
 /// carries the data for that event.
 #[repr(C, u32)]
-#[derive(Clone, PartialEq, Serialize, Deserialize, VariantTypeSize)]
+#[derive(Clone, PartialEq, Serialize, VariantTypeSize, bitcode::Encode, bitcode::Decode)]
 #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
 pub enum LoreEvent {
     // Standard events
@@ -909,10 +1076,14 @@ pub enum LoreEvent {
     LayerRemove(LoreLayerRemoveEventData),
     /// One staged entry in a layer listing.
     LayerStagedEntry(LoreLayerStagedEntryEventData),
+    /// A link's branch in the linked repository was created or reused.
+    LinkBranchCreate(LoreLinkBranchCreateEventData),
     /// A link was changed.
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
+    /// Detailed information about a single link.
+    LinkInfo(LoreLinkInfoEventData),
     /// The start of a file lock acquire report.
     LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
     /// A file concerning the lock acquire report.
@@ -941,7 +1112,8 @@ pub enum LoreEvent {
     RepositoryCloneBegin(LoreRepositoryCloneBeginEventData),
     /// Progress during a repository clone.
     RepositoryCloneProgress(LoreRepositoryCloneProgressEventData),
-    /// The end of a repository clone.
+    /// The end of a repository clone that succeeded. A clone that fails sends none, and reports its
+    /// outcome on the complete event as every clone does.
     RepositoryCloneEnd(LoreRepositoryCloneEndEventData),
     /// The start of resolving dependencies.
     DependencyResolveBegin(LoreDependencyResolveBeginEventData),
@@ -1053,6 +1225,8 @@ pub enum LoreEvent {
     SharedStoreCreate(LoreSharedStoreCreateEventData),
     /// Information about a shared store.
     SharedStoreInfo(LoreSharedStoreInfoEventData),
+    /// List of all shared stores.
+    SharedStoreList(LoreSharedStoreListEventData),
     /// One staged entry in a link listing.
     LinkStagedEntry(LoreLinkStagedEntryEventData),
     // Content-addressed storage API
@@ -1130,6 +1304,29 @@ pub enum LoreEvent {
     CompactionProgress(LoreCompactionProgressEventData),
     /// A store compaction pass ended.
     CompactionEnd(LoreCompactionEndEventData),
+    /// A batch write call on a revision tree completed as a whole.
+    RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
+    /// A metadata-clear entry completed.
+    RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
+    /// What a commit has cost so far, or in total once it has drained its writes.
+    RevisionCommitStats(LoreRevisionCommitStatsEventData),
+    /// What a push has cost so far, or in total once it has finished.
+    BranchPushStats(LoreBranchPushStatsEventData),
+    /// The status of the background service.
+    ServiceStatus(LoreServiceStatusEventData),
+    /// A log message captured by the service outside command execution.
+    ServiceMessage(LoreServiceMessageEventData),
+    /// An interactive login is still waiting for the user's approval.
+    AuthPending(LoreAuthPendingEventData),
+    /// One leaf fragment and its payload for a get-resolved item.
+    StorageGetFragment(LoreStorageGetFragmentEventData),
+    /// One range of a file's lines, attributed to the revision that last changed them.
+    FileAudit(LoreFileAuditEventData),
+}
+
+/// Encodes as the event it refers to, so that a sender can encode an event it only borrows.
+impl bitcode::Encode for &LoreEvent {
+    type Encoder = <Box<LoreEvent> as bitcode::Encode>::Encoder;
 }
 
 impl LoreEvent {
@@ -1149,302 +1346,5 @@ impl LoreEvent {
                 ptr.read_unaligned()
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod trace_location_tests {
-    use std::sync::Arc;
-
-    use lore_error_set::Location;
-
-    use super::LoreTraceLocation;
-
-    #[test]
-    fn builds_from_location_with_context() {
-        let location = Location::with_context("src/main.rs", 42, 7, Arc::from("loading config"));
-
-        let trace = LoreTraceLocation::from_location(&location);
-
-        assert_eq!(trace.file.as_str(), "src/main.rs");
-        assert_eq!(trace.line, 42);
-        assert_eq!(trace.column, 7);
-        assert_eq!(trace.context.as_str(), "loading config");
-    }
-
-    #[test]
-    fn builds_from_location_without_context_yields_empty_context() {
-        let location = Location::new("src/lib.rs", 1, 1);
-
-        let trace = LoreTraceLocation::from_location(&location);
-
-        assert_eq!(trace.file.as_str(), "src/lib.rs");
-        assert_eq!(trace.line, 1);
-        assert_eq!(trace.column, 1);
-        assert!(trace.context.is_empty());
-        assert_eq!(trace.context.as_str(), "");
-    }
-
-    #[test]
-    fn clone_is_independent_deep_copy_and_both_drop_cleanly() {
-        let location = Location::with_context("src/clone.rs", 3, 9, Arc::from("deep copy"));
-        let trace = LoreTraceLocation::from_location(&location);
-
-        let clone = trace.clone();
-
-        // The clone holds its own allocations, not shared pointers.
-        assert_ne!(trace.file.string, clone.file.string);
-        assert_ne!(trace.context.string, clone.context.string);
-
-        // The clone is value-equal to the original. `LoreTraceLocation` does
-        // not derive `Debug`, so compare through `PartialEq` directly.
-        assert!(trace == clone);
-        assert_eq!(clone.file.as_str(), "src/clone.rs");
-        assert_eq!(clone.context.as_str(), "deep copy");
-
-        // Dropping the original must not affect the clone's strings.
-        drop(trace);
-        assert_eq!(clone.file.as_str(), "src/clone.rs");
-        assert_eq!(clone.context.as_str(), "deep copy");
-
-        // Dropping the clone frees its own strings; under leak detection this
-        // confirms no double free and no leak.
-        drop(clone);
-    }
-
-    #[test]
-    fn displays_file_line_column_without_context() {
-        let trace = LoreTraceLocation::from_location(&Location::new("src/lib.rs", 12, 4));
-        assert_eq!(trace.to_string(), "src/lib.rs:12:4");
-    }
-
-    #[test]
-    fn displays_context_in_place_of_column_when_present() {
-        let location = Location::with_context("src/main.rs", 7, 2, Arc::from("loading config"));
-        let trace = LoreTraceLocation::from_location(&location);
-        assert_eq!(trace.to_string(), "src/main.rs:7 - loading config");
-    }
-}
-
-#[cfg(test)]
-mod error_detail_tests {
-    use lore_base::error::NotFound;
-    use lore_error_set::FfiError;
-    use lore_error_set::Location;
-    use lore_error_set::Trace;
-    use lore_error_set::prelude::*;
-
-    use super::LoreErrorDetail;
-
-    // A concrete `#[error_set]` error used to exercise the constructor. Its
-    // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
-    // code 13, so the detail's `error_code` has a known, non-internal value to
-    // assert against.
-    #[error_set]
-    enum SampleError {
-        NotFound,
-    }
-
-    #[test]
-    fn from_error_holds_code_message_and_one_location_per_trace_entry() {
-        // Build a concrete error and give it a trace with two entries.
-        let mut error: SampleError = NotFound.into();
-        error.push_trace(Location::new("src/first.rs", 10, 2));
-        error.push_trace(Location::new("src/second.rs", 20, 4));
-
-        let detail = LoreErrorDetail::from_error(&error);
-
-        // The code is the error's error code.
-        assert_eq!(detail.error_code, error.ffi_code());
-        // The message is the error's `Display` output.
-        assert_eq!(detail.message.as_str(), error.to_string());
-
-        // One trace location per trace entry. The `From` conversion adds its
-        // own caller location ahead of the two we pushed, so the count and
-        // the contents must match the trace exactly.
-        let locations = error.trace().locations();
-        assert_eq!(detail.trace_locations.len(), locations.len());
-        for (built, source) in detail.trace_locations.as_slice().iter().zip(locations) {
-            assert_eq!(built.file.as_str(), source.file);
-            assert_eq!(built.line, source.line);
-            assert_eq!(built.column, source.column);
-        }
-    }
-
-    #[test]
-    fn default_is_the_empty_success_detail() {
-        let detail = LoreErrorDetail::default();
-
-        assert_eq!(detail.error_code, 0);
-        assert!(detail.message.is_empty());
-        assert!(detail.trace_locations.is_empty());
-    }
-
-    #[test]
-    fn error_set_enum_exposes_trace_through_has_trace_bound() {
-        use lore_error_set::HasTrace;
-
-        // A generic function can only read the trace through the bound, not the
-        // inherent method, so this exercises the trait `#[error_set]` generates.
-        fn locations_through_bound<E: HasTrace>(error: &E) -> usize {
-            error.trace().locations().len()
-        }
-
-        let mut error: SampleError = NotFound.into();
-        error.push_trace(Location::new("src/bound.rs", 5, 1));
-
-        // The trait access matches the inherent access on the same error.
-        assert_eq!(
-            locations_through_bound(&error),
-            error.trace().locations().len()
-        );
-    }
-
-    #[test]
-    fn empty_trace_yields_empty_location_array() {
-        // An empty trace is the observable behavior when `track-locations` is
-        // off: `Trace::locations()` reports no entries, so the array is empty
-        // and the path stays safe. With the feature on, an error built with an
-        // empty trace exercises the same empty-array path.
-        let error: SampleError = NotFound.into();
-        let empty_trace = Trace::new();
-
-        let detail = LoreErrorDetail::from_error_with_trace(&error, &empty_trace);
-
-        assert!(detail.trace_locations.is_empty());
-        assert_eq!(detail.error_code, error.ffi_code());
-    }
-
-    #[test]
-    fn message_with_trace_appends_one_indented_line_per_location() {
-        use super::LoreTraceLocation;
-        use crate::interface::LoreArray;
-        use crate::interface::LoreString;
-
-        let detail = LoreErrorDetail {
-            error_code: 13,
-            message: LoreString::from("not found"),
-            trace_locations: LoreArray::from_vec(vec![
-                LoreTraceLocation {
-                    file: LoreString::from("src/a.rs"),
-                    line: 10,
-                    column: 2,
-                    context: LoreString::default(),
-                },
-                LoreTraceLocation {
-                    file: LoreString::from("src/b.rs"),
-                    line: 20,
-                    column: 4,
-                    context: LoreString::from("loading"),
-                },
-            ]),
-        };
-
-        assert_eq!(
-            detail.message_with_trace(),
-            "not found\n  at src/a.rs:10:2\n  at src/b.rs:20 - loading"
-        );
-    }
-
-    #[test]
-    fn message_with_trace_is_just_the_message_when_no_trace() {
-        use crate::interface::LoreString;
-
-        let detail = LoreErrorDetail {
-            error_code: 13,
-            message: LoreString::from("boom"),
-            trace_locations: Default::default(),
-        };
-
-        assert_eq!(detail.message_with_trace(), "boom");
-    }
-}
-
-#[cfg(test)]
-mod complete_event_tests {
-    use super::LoreCompleteEventData;
-    use super::LoreErrorDetail;
-    use super::LoreTraceLocation;
-    use crate::interface::LoreArray;
-    use crate::interface::LoreString;
-
-    // Builds a populated error detail with one trace location so the
-    // serialized form carries non-default values to assert against.
-    fn populated_detail() -> LoreErrorDetail {
-        let location = LoreTraceLocation {
-            file: LoreString::from("src/op.rs"),
-            line: 11,
-            column: 5,
-            context: LoreString::from("running op"),
-        };
-
-        LoreErrorDetail {
-            error_code: 13,
-            message: LoreString::from("not found"),
-            trace_locations: LoreArray::from_vec(vec![location]),
-        }
-    }
-
-    #[test]
-    fn serializes_error_detail_fields_in_camel_case() {
-        let event = LoreCompleteEventData {
-            status: 13,
-            error: populated_detail(),
-        };
-
-        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
-
-        // The `status` field keeps its key and value.
-        assert_eq!(json["status"], 13);
-
-        // The appended detail nests under `error` and uses camelCase keys for
-        // its own fields.
-        let error = &json["error"];
-        assert_eq!(error["errorCode"], 13);
-        assert_eq!(error["message"], "not found");
-
-        let traces = error["traceLocations"].as_array().unwrap();
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0]["file"], "src/op.rs");
-        assert_eq!(traces[0]["line"], 11);
-        assert_eq!(traces[0]["column"], 5);
-        assert_eq!(traces[0]["context"], "running op");
-    }
-
-    #[test]
-    fn deserializes_old_payload_without_error_detail() {
-        // A serialized payload that carries only the `status` field.
-        let json = r#"{ "status": 7 }"#;
-
-        let event: LoreCompleteEventData = serde_json::from_str(json).unwrap();
-
-        // The status is read back unchanged.
-        assert_eq!(event.status, 7);
-
-        // The missing detail defaults to the empty success detail: code 0,
-        // empty message, and an empty trace list.
-        assert_eq!(event.error.error_code, 0);
-        assert!(event.error.message.is_empty());
-        assert!(event.error.trace_locations.is_empty());
-    }
-
-    #[test]
-    fn legacy_status_field_keeps_its_name_position_and_type() {
-        // The `status` field serializes under its existing key.
-        let event = LoreCompleteEventData {
-            status: 42,
-            error: LoreErrorDetail::default(),
-        };
-        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["status"], 42);
-
-        // `status` keeps its `i32` type: an `i32` binds directly into the
-        // first field, so a change of type or position would fail to compile.
-        let status: i32 = -1;
-        let by_position = LoreCompleteEventData {
-            status,
-            error: LoreErrorDetail::default(),
-        };
-        assert_eq!(by_position.status, status);
     }
 }

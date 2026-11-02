@@ -31,6 +31,7 @@ use crate::util::log_command_done;
 use crate::util::log_command_info;
 
 /// Errors emitted by the dispatch helper itself (not by the verb impl).
+#[lore_macro::test_pub]
 #[error_set]
 enum DispatchError {
     InvalidArguments,
@@ -54,10 +55,11 @@ impl EventError for DispatchError {
 /// The helper:
 /// 1. Sets up an `ExecutionContext` and enters its `LORE_CONTEXT` scope.
 /// 2. Acquires a [`RevisionTreeGuard`] for the handle. If the handle is
-///    unknown or already closed, invokes `on_handle_miss` (letting the verb
-///    emit its own `*Complete` terminal carrying the caller id), then
-///    completes with the handle-miss error detail and returns its error code
-///    without invoking the verb impl.
+///    unknown or already closed, invokes `on_handle_miss` with the arguments
+///    (letting the verb emit its own `*Complete` terminal carrying the caller
+///    id, or one per entry for a batch verb), then completes with the
+///    handle-miss error detail and returns its error code without invoking the
+///    verb impl.
 /// 3. Passes a cloned `Arc<RevisionTreeInternal>` to the verb impl
 ///    (ownership transferred; the impl can fan it out to spawned tasks).
 /// 4. Translates the impl's `Result` into a `Complete{status}` event.
@@ -70,6 +72,15 @@ impl EventError for DispatchError {
 /// before the returned future resolves — no background work outlives a
 /// data verb. Use `JoinSet` / `join_all` to await spawned futures before
 /// returning.
+///
+/// The verb reaches the handle's tree through
+/// [`access_shared`](crate::revision_tree::handle::RevisionTreeInternal::access_shared) or
+/// [`access_exclusive`](crate::revision_tree::handle::RevisionTreeInternal::access_exclusive),
+/// which is where a call states whether it can share the handle. This helper does not
+/// take that lock: a verb holds it for as long as it uses the state, and taking it here
+/// as well would deadlock, since `tokio::sync::RwLock` is write-preferring and a second
+/// read waits behind a queued writer.
+#[lore_macro::test_pub]
 pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
@@ -82,7 +93,7 @@ pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
 where
     ErrT: EventError + FfiError + HasTrace,
     Arg: std::fmt::Debug,
-    M: FnOnce(),
+    M: FnOnce(&Arg),
     F: FnOnce(Arc<RevisionTreeInternal>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
@@ -91,7 +102,7 @@ where
     LORE_CONTEXT
         .scope(execution, async move {
             let Some(guard) = RevisionTreeGuard::enter(handle) else {
-                on_handle_miss();
+                on_handle_miss(&args);
                 let err = DispatchError::from(InvalidArguments {
                     reason: "revision tree handle is unknown or has been closed".into(),
                 });
@@ -109,174 +120,8 @@ where
 
             log_command_done(&caller, time_start);
             let status = execution_context().dispatcher.complete(detail).await;
-            // Explicit drop after Complete: a closer waiting on the in-flight counter must
-            // not be woken before Complete has fired.
             drop(guard);
             status
         })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-
-    use lore_revision::interface::LoreGlobalArgs;
-
-    use super::*;
-    use crate::call::test_support::CapturedEvent;
-    use crate::call::test_support::completes;
-    use crate::call::test_support::has_error_event;
-    use crate::call::test_support::make_callback;
-    use crate::revision_tree::handle;
-    use crate::revision_tree::handle::test_support;
-
-    #[tokio::test]
-    async fn handle_miss_completes_with_error_code_and_no_error_event() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let missed = Arc::new(AtomicBool::new(false));
-        let missed_setter = missed.clone();
-        let status = revision_tree_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            LoreRevisionTree::INVALID,
-            (),
-            "handle_miss_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
-            |_internal, _args: ()| async move { Ok::<_, DispatchError>(()) },
-        )
-        .await;
-        assert!(
-            missed.load(Ordering::SeqCst),
-            "on_handle_miss must fire when the handle is unknown"
-        );
-        let events = sink.lock().unwrap().clone();
-        assert!(
-            !has_error_event(&events),
-            "no Error event must be emitted on terminal failure"
-        );
-
-        let completes = completes(&events);
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-
-        // The status holds the handle-miss error's real error code and the detail
-        // carries the same code and message.
-        let expected = DispatchError::from(InvalidArguments {
-            reason: "revision tree handle is unknown or has been closed".into(),
-        });
-        let expected_code = expected.ffi_code();
-        // The synchronous return equals the error code, matching `Complete.status`.
-        assert_eq!(status, expected_code);
-        let data = &completes[0];
-        assert_eq!(data.status, expected_code);
-        assert_eq!(data.error.error_code, expected_code);
-        assert_eq!(data.error.message.as_str(), expected.to_string());
-    }
-
-    #[tokio::test]
-    async fn happy_path_completes_with_status_zero_and_decrements_counter() {
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal.clone());
-        assert_eq!(internal.in_flight.load(Ordering::Acquire), 0);
-
-        let invoked = Arc::new(AtomicU64::new(0));
-        let invoked_clone = invoked.clone();
-
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let missed = Arc::new(AtomicBool::new(false));
-        let missed_setter = missed.clone();
-        let status = revision_tree_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            handle_value,
-            (),
-            "happy_path_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
-            move |internal_arc, _args: ()| async move {
-                invoked_clone.fetch_add(1, Ordering::AcqRel);
-                assert!(internal_arc.in_flight.load(Ordering::Acquire) >= 1);
-                Ok::<_, DispatchError>(())
-            },
-        )
-        .await;
-
-        assert_eq!(status, 0);
-        assert!(
-            !missed.load(Ordering::SeqCst),
-            "on_handle_miss must not fire on the happy path"
-        );
-        assert_eq!(invoked.load(Ordering::Acquire), 1);
-        assert_eq!(
-            internal.in_flight.load(Ordering::Acquire),
-            0,
-            "counter must return to zero after the verb"
-        );
-        let events = sink.lock().unwrap().clone();
-        let completes = completes(&events);
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-        let data = &completes[0];
-        assert_eq!(data.status, 0);
-        assert_eq!(data.error.error_code, 0);
-        assert!(data.error.message.is_empty());
-        assert!(data.error.trace_locations.is_empty());
-        handle::unregister(handle_value);
-    }
-
-    #[tokio::test]
-    async fn verb_error_completes_with_error_code_and_no_error_event() {
-        let internal = test_support::new_for_testing().await;
-        let handle_value = handle::register(internal.clone());
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let missed = Arc::new(AtomicBool::new(false));
-        let missed_setter = missed.clone();
-        let status = revision_tree_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            handle_value,
-            (),
-            "verb_error_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
-            move |_internal, _args: ()| async move {
-                Err::<(), _>(DispatchError::from(InvalidArguments {
-                    reason: "simulated verb error".into(),
-                }))
-            },
-        )
-        .await;
-        assert!(
-            !missed.load(Ordering::SeqCst),
-            "on_handle_miss must not fire when the handle resolves"
-        );
-        assert_eq!(
-            internal.in_flight.load(Ordering::Acquire),
-            0,
-            "counter must return to zero even on error"
-        );
-
-        let events = sink.lock().unwrap().clone();
-        assert!(
-            !has_error_event(&events),
-            "no Error event must be emitted on terminal failure"
-        );
-
-        let completes = completes(&events);
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-
-        // The status holds the verb error's real error code and the detail carries
-        // the same code and message.
-        let expected = DispatchError::from(InvalidArguments {
-            reason: "simulated verb error".into(),
-        });
-        let expected_code = expected.ffi_code();
-        // The synchronous return equals the error code, matching `Complete.status`.
-        assert_eq!(status, expected_code);
-        let data = &completes[0];
-        assert_eq!(data.status, expected_code);
-        assert_eq!(data.error.error_code, expected_code);
-        assert_eq!(data.error.message.as_str(), expected.to_string());
-        handle::unregister(handle_value);
-    }
 }

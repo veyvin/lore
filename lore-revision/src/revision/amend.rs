@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 
+use crate::branch;
 use crate::commit::LoreRevisionCommitRevisionEventData;
 use crate::commit::store_branch_latest_and_make_current;
 use crate::errors::*;
@@ -82,15 +83,7 @@ pub struct AmendRevisionOptions {
     pub message: Option<String>,
 }
 
-pub async fn amend_revision(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    options: AmendRevisionOptions,
-) -> Result<Hash, AmendRevisionError> {
-    amend_revision_impl(repository, token, options).await
-}
-
-async fn amend_revision_impl(
+pub(crate) async fn amend_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: AmendRevisionOptions,
@@ -153,9 +146,17 @@ async fn amend_revision_impl(
         .await
         .forward::<AmendRevisionError>("Failed to serialize revision state")?;
 
-    store_branch_latest_and_make_current(repository.clone(), signature, current_branch)
+    let branch_previous = branch::load_latest(repository.clone(), current_branch)
         .await
-        .forward::<AmendRevisionError>("Failed to store branch latest")?;
+        .unwrap_or_default();
+    store_branch_latest_and_make_current(
+        repository.clone(),
+        branch_previous,
+        signature,
+        current_branch,
+    )
+    .await
+    .forward::<AmendRevisionError>("Failed to store branch latest")?;
 
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: repository.id,
@@ -167,7 +168,16 @@ async fn amend_revision_impl(
     })
     .send();
 
-    let _ = event::metadata::send(&amended_metadata);
+    event::metadata::send(&amended_metadata);
 
     Ok(signature)
+}
+
+/// Boxed version of [`amend_revision`] for cross-crate use.
+pub fn amend_revision_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: AmendRevisionOptions,
+) -> crate::BoxFuture<'_, Result<Hash, AmendRevisionError>> {
+    Box::pin(amend_revision(repository, token, options))
 }

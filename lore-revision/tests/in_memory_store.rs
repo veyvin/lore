@@ -5,6 +5,7 @@ mod tests {
     use std::path::PathBuf;
 
     use bytes::Bytes;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::*;
     use lore_revision::repository::cache_in_memory_stores;
     use lore_revision::repository::create_client_memory_stores;
@@ -61,8 +62,9 @@ mod tests {
                 .expect("Failed to put into immutable store");
 
                 let (got_fragment, got_payload) =
-                    ImmutableStore::get(imm.clone(), repository, address, StoreMatch::MatchFull)
+                    ImmutableStore::get(imm.clone(), repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("Failed to get from immutable store");
                 assert_eq!(
                     got_fragment.size_payload, fragment.size_payload,
@@ -81,6 +83,68 @@ mod tests {
     async fn repository_release_does_not_panic_on_uncached_path() {
         let path = PathBuf::from("/tmp/lore-test-release-uncached");
         repository_release(&path);
+    }
+
+    /// **Releasing a repository leaves its live disk-backed stores to be reused.** The
+    /// disk-backed caches hold weak references that expire once nothing uses a store.
+    /// Removing them early would make the next open build a second store over the same
+    /// files — which the store epoch keeps coherent for reads, but not for writes one of
+    /// the two has not flushed.
+    #[tokio::test]
+    async fn release_keeps_live_disk_backed_stores_for_the_next_open() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let dir = lore_base::test_util::TempDir::new("lore-release-disk-");
+                let repository = dir.path().to_path_buf();
+                let dot_path = repository.join(".lore");
+                std::fs::create_dir_all(&dot_path).expect("a .lore directory");
+                let options =
+                    lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none();
+
+                let immutable = lore_revision::repository::create_immutable_store_at_path(
+                    dot_path.clone(),
+                    options,
+                    false,
+                )
+                .await
+                .expect("creates the immutable store")
+                .0;
+                let mutable = lore_revision::repository::create_mutable_store_at_path(
+                    dot_path.clone(),
+                    immutable.clone(),
+                )
+                .await
+                .expect("creates the mutable store")
+                .0;
+
+                repository_release(&repository);
+
+                let immutable_again = lore_revision::repository::create_immutable_store_at_path(
+                    dot_path.clone(),
+                    options,
+                    false,
+                )
+                .await
+                .expect("opens the immutable store")
+                .0;
+                let mutable_again = lore_revision::repository::create_mutable_store_at_path(
+                    dot_path,
+                    immutable_again.clone(),
+                )
+                .await
+                .expect("opens the mutable store")
+                .0;
+                assert!(
+                    std::sync::Arc::ptr_eq(&immutable, &immutable_again),
+                    "a live immutable store is reused, not built again over its files"
+                );
+                assert!(
+                    std::sync::Arc::ptr_eq(&mutable, &mutable_again),
+                    "and so is a live mutable store"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -162,8 +226,7 @@ mod tests {
                 );
 
                 // Immutable store should not contain the previously stored fragment
-                let get_result =
-                    ImmutableStore::get(new_imm, repository, address, StoreMatch::MatchFull).await;
+                let get_result = ImmutableStore::get(new_imm, repository, address).await;
                 assert!(
                     get_result.is_err(),
                     "New immutable store should not contain data from released store"

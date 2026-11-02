@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
@@ -11,20 +9,28 @@ use zerocopy::IntoBytes;
 
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
+use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
-use crate::immutable;
-use crate::lore::Context;
+use crate::lore::Address;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
+use crate::metadata::store_binary_payload;
 use crate::node;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
@@ -46,6 +52,14 @@ pub enum SetError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
+    FileNotFound,
 }
 
 impl event::EventError for SetError {
@@ -62,7 +76,7 @@ impl event::EventError for SetError {
     }
 }
 
-pub async fn set_revision(
+pub(crate) async fn set_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     keys: &[&[u8]],
@@ -83,7 +97,7 @@ pub async fn set_revision(
 
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("Failed to deserialize current revision anchor")?;
+        .forward::<SetError>("Failed to deserialize current revision anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -92,7 +106,7 @@ pub async fn set_revision(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("Failed to deserialize state")?;
+        .forward_any::<SetError>("Failed to deserialize state")?;
 
     let metadata_hash = if current_revision == staged_revision {
         Hash::default()
@@ -104,7 +118,7 @@ pub async fn set_revision(
     } else {
         Metadata::deserialize(repository.clone(), metadata_hash)
             .await
-            .internal("Failed to deserialize metadata")?
+            .forward::<SetError>("Failed to deserialize metadata")?
     };
 
     for i in 0..keys.len() {
@@ -112,81 +126,52 @@ pub async fn set_revision(
         let value = values[i];
         let format = formats[i];
 
-        let is_binary = format == MetadataType::Binary;
-        if is_binary {
-            // Read metadata from disk
-            let payload = {
-                let input_path = {
-                    let user_path = String::from_utf8_lossy(value).to_string();
-                    let given_path = PathBuf::from(&user_path);
-                    if given_path.is_absolute() {
-                        given_path
-                    } else {
-                        let repository_path = repository.require_path()?;
-                        let relative_path =
-                            RelativePath::new_from_user_path(repository_path, &user_path)
-                                .internal("Invalid path")?;
-                        relative_path.to_absolute_path(repository_path)
-                    }
-                };
-
-                tokio::fs::read(input_path).await.internal("Invalid path")?
-            };
-
-            // When storing binary data, put it in the immutable store
-            // Use a zero context to avoid creating extra entries if multiple
-            // revisions use the same metadata blob
-            let (address, _) = {
-                immutable::write(
-                    repository.clone(),
-                    Context::default(),
-                    Bytes::from_owner(payload),
-                    immutable::write_options_from_repository(repository.clone()),
-                )
-                .await
-                .internal("Failed to write payload")?
-            };
-
-            // When storing binary data, put its address in the metadata
+        if format == MetadataType::Binary {
+            let address = store_binary_payload::<SetError>(&repository, value).await?;
             metadata
                 .set(key, address.as_bytes(), MetadataType::Address)
-                .internal("Failed to set metadata")?;
+                .forward::<SetError>("Failed to set metadata")?;
         } else {
             metadata
                 .set(key, value, format)
-                .internal("Failed to set metadata")?;
+                .forward::<SetError>("Failed to set metadata")?;
         }
     }
 
-    state.set_metadata_hash(
-        metadata
-            .serialize(repository.clone())
-            .await
-            .internal("Failed to write metadata")?,
-    );
+    let metadata_hash = metadata
+        .serialize(repository.clone())
+        .await
+        .forward::<SetError>("Failed to write metadata")?;
+
+    // Re-parenting a state of the current revision drops that revision's metadata, so the
+    // metadata built above is set after it.
+    state.reparent_onto(current_revision);
+    state.set_metadata_hash(metadata_hash);
 
     // Serialize the new current state
-    if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
+    let signature = state
+        .serialize(repository.clone(), token)
+        .await
+        .forward_any::<SetError>("Failed to serialize revision state")?;
 
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+    crate::instance::store_staged_anchor(&repository, signature)
+        .await
+        .forward::<SetError>("Failed to serialize staged revision anchor")?;
 
-        let signature = state
-            .serialize(repository.clone(), token)
-            .await
-            .internal("Failed to serialize revision state")?;
-
-        crate::instance::store_staged_anchor(&repository, signature)
-            .await
-            .internal("Failed to serialize staged revision anchor")?;
-    }
-
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
+}
+
+/// Boxed version of [`set_revision`] for cross-crate use.
+pub fn set_revision_boxed<'a>(
+    repository: Arc<RepositoryContext>,
+    token: &'a RepositoryWriteToken,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), SetError>> {
+    Box::pin(set_revision(repository, token, keys, values, formats))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,12 +185,12 @@ async fn set_file_task(
     events: bool,
 ) -> Result<(), SetError> {
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
-        .internal("Invalid path")?;
+        .forward::<SetError>("Invalid path")?;
 
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
-        .internal("Invalid node")?;
+        .forward_any::<SetError>("Invalid node")?;
     if !node_link.is_valid() {
         return Err(SetError::internal("Invalid node"));
     }
@@ -217,7 +202,7 @@ async fn set_file_task(
     let metadata_block = state
         .block_file_metadata(repository.clone(), metadata_block_index)
         .await
-        .internal("Failed to deserialize metadata block")?;
+        .forward_any::<SetError>("Failed to deserialize metadata block")?;
 
     let mut metadata;
     loop {
@@ -233,64 +218,19 @@ async fn set_file_task(
         } else {
             Metadata::deserialize(repository.clone(), metadata_hash)
                 .await
-                .internal("Failed to deserialize metadata")?
+                .forward::<SetError>("Failed to deserialize metadata")?
         };
 
         for index in 0..keys.len() {
-            let key = &keys[index];
-            let value = &values[index];
-            let format = formats[index];
-
-            let is_binary = format == MetadataType::Binary;
-            if is_binary {
-                // Read metadata from disk
-                let payload = {
-                    let input_path = {
-                        let user_path = String::from_utf8_lossy(value).to_string();
-                        let given_path = PathBuf::from(&user_path);
-                        if given_path.is_absolute() {
-                            given_path
-                        } else {
-                            let repository_path = repository.require_path()?;
-                            let relative_path =
-                                RelativePath::new_from_user_path(repository_path, &user_path)
-                                    .internal("Invalid path")?;
-                            relative_path.to_absolute_path(repository_path)
-                        }
-                    };
-
-                    tokio::fs::read(input_path).await.internal("Invalid path")?
-                };
-
-                // When storing binary data, put it in the immutable store
-                // Use a zero context to avoid creating extra entries if multiple
-                // files use the same metadata blob
-                let (address, _) = {
-                    immutable::write(
-                        repository.clone(),
-                        Context::default(),
-                        Bytes::from_owner(payload),
-                        immutable::write_options_from_repository(repository.clone()),
-                    )
-                    .await
-                    .internal("Failed to write payload")?
-                };
-
-                // When storing binary data, put its address in the metadata
-                metadata
-                    .set(key, address.as_bytes(), MetadataType::Address)
-                    .internal("Failed to set metadata")?;
-            } else {
-                metadata
-                    .set(key, value, format)
-                    .internal("Failed to set metadata")?;
-            }
+            metadata
+                .set(&keys[index], &values[index], formats[index])
+                .forward::<SetError>("Failed to set metadata")?;
         }
 
         let metadata_hash_updated = metadata
             .serialize(repository.clone())
             .await
-            .internal("Failed to write metadata")?;
+            .forward::<SetError>("Failed to write metadata")?;
 
         let dirtied = {
             let mut block_writer = metadata_block.write();
@@ -320,10 +260,37 @@ async fn set_file_task(
     }
 
     if events {
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     Ok(())
+}
+
+/// The address each binary value's payload was stored at, `None` where the value stands for
+/// itself, and empty where none of them is binary.
+///
+/// A binary value names a file, and the same file whatever path it is set on, so its payload is
+/// stored once here rather than once per path. Storing it here also keeps the read out of the
+/// per-path tasks: a filesystem holds one operation at a time, and those tasks run concurrently.
+async fn binary_payload_addresses(
+    repository: &Arc<RepositoryContext>,
+    values: &[&[u8]],
+    formats: &[MetadataType],
+) -> Result<Vec<Option<Address>>, SetError> {
+    if !formats.contains(&MetadataType::Binary) {
+        return Ok(Vec::new());
+    }
+
+    let mut addresses = Vec::with_capacity(formats.len());
+    for (index, format) in formats.iter().enumerate() {
+        addresses.push(match format {
+            MetadataType::Binary => {
+                Some(store_binary_payload::<SetError>(repository, values[index]).await?)
+            }
+            _ => None,
+        });
+    }
+    Ok(addresses)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,7 +329,7 @@ pub async fn set_file(
 
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("Failed to deserialize current revision anchor")?;
+        .forward::<SetError>("Failed to deserialize current revision anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -371,7 +338,9 @@ pub async fn set_file(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("Failed to deserialize state")?;
+        .forward_any::<SetError>("Failed to deserialize state")?;
+
+    let addresses = binary_payload_addresses(&repository, values, formats).await?;
 
     let events = paths.len() == 1; // Only if a single path is given.
 
@@ -386,13 +355,19 @@ pub async fn set_file(
         let repository = repository.clone();
         let state = state.clone();
         let path = (*path).to_string();
-        let formats = formats[offset..offset + count].to_vec();
+        let mut formats = formats[offset..offset + count].to_vec();
 
         let mut keys_vec = vec![];
         let mut values_vec = vec![];
         for i in 0..count {
             keys_vec.push(keys[offset + i].to_vec());
-            values_vec.push(values[offset + i].to_vec());
+            match addresses.get(offset + i).and_then(Option::as_ref) {
+                Some(address) => {
+                    values_vec.push(address.as_bytes().to_vec());
+                    formats[i] = MetadataType::Address;
+                }
+                None => values_vec.push(values[offset + i].to_vec()),
+            }
         }
 
         lore_spawn!(tasks, {
@@ -433,22 +408,16 @@ pub async fn set_file(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)
             .await
-            .internal("Failed to serialize revision state")?;
+            .forward_any::<SetError>("Failed to serialize revision state")?;
 
         crate::instance::store_staged_anchor(&repository, signature)
             .await
-            .internal("Failed to serialize staged revision anchor")?;
+            .forward::<SetError>("Failed to serialize staged revision anchor")?;
     }
 
     Ok(())

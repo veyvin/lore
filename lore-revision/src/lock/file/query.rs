@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::auth;
@@ -37,6 +36,7 @@ pub enum QueryError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     InvalidPath,
@@ -55,7 +55,7 @@ impl EventError for QueryError {
 
 /// Data for an event that marks the start of a lock query result.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileQueryBeginEventData {
     /// Number of query entries that follow.
@@ -64,7 +64,7 @@ pub struct LoreLockFileQueryBeginEventData {
 
 /// Data for an event reporting a single lock matched by a query.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileQueryEventData {
     /// Identifier of the branch the lock belongs to.
@@ -91,7 +91,7 @@ pub async fn query(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward_any::<QueryError>("Invalid branch")?;
         Some(resolved.id)
     };
 
@@ -100,7 +100,7 @@ pub async fn query(
     } else {
         let owner_id = auth::userinfo::user_id(repository.clone(), &options.owner)
             .await
-            .internal("Failed to resolve user id from user name")?;
+            .forward::<QueryError>("Failed to resolve user id from user name")?;
 
         Some(owner_id)
     };

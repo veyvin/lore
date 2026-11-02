@@ -4,16 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_base::lore_spawn_core;
+use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_revision::runtime::execution_context;
+use lore_transport::quic::net_runtime::NetRuntime;
 use opentelemetry::KeyValue;
 use quinn::AckFrequencyConfig;
 use quinn::EndpointConfig;
 use quinn::ServerConfig;
-use quinn::TokioRuntime;
 use quinn::VarInt;
-use quinn::congestion;
 use quinn::crypto::rustls::HandshakeData;
 use quinn::crypto::rustls::QuicServerConfig;
 use socket2::Domain;
@@ -30,6 +30,7 @@ use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerFactory;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::quinn::config::QuinnConfig;
 use crate::quic::quinn::config::crypto_config;
 use crate::quic::quinn::metrics::track_connection_stats;
@@ -44,7 +45,7 @@ pub struct QuinnServer {
 }
 
 impl QuinnServer {
-    pub fn start(settings: QuinnConfig) -> anyhow::Result<Self> {
+    pub fn start(mut settings: QuinnConfig) -> anyhow::Result<Self> {
         let span = info_span!(
             "quinn_server",
             quinn_server_name = settings.server_metrics_name
@@ -99,8 +100,12 @@ impl QuinnServer {
                 .send_window(send_window as u64)
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
-            transport_config
-                .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+            transport_config.congestion_controller_factory(
+                settings.congestion_algorithm.controller_factory(
+                    settings.initial_cwnd.map(InitialCwndBytes::get),
+                    send_window as u64,
+                ),
+            );
             transport_config
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
@@ -115,27 +120,42 @@ impl QuinnServer {
                 .ack_frequency_config(Some(ack_freq_config));
         }
 
-        let socket = socket2::Socket::new(
-            Domain::for_address(settings.address),
-            Type::DGRAM,
-            Some(Protocol::UDP),
-        )?;
+        // A caller that needs this port on TCP as well binds both itself and hands the UDP half
+        // over, because there is no way to reserve a number across two binds. Its socket carries
+        // its own options, so the reuse flags below are deliberately not applied to it.
+        let socket: std::net::UdpSocket = if let Some(socket) = settings.socket.take() {
+            socket
+        } else {
+            let socket = socket2::Socket::new(
+                Domain::for_address(settings.address),
+                Type::DGRAM,
+                Some(Protocol::UDP),
+            )?;
 
-        // Reuse must be configured before bind.
-        socket.reuse_address()?;
+            // Reuse must be configured before bind.
+            socket.reuse_address()?;
 
-        // set_reuse_port is not implemented on Windows
-        #[cfg(target_family = "unix")]
-        socket.set_reuse_port(true)?;
+            // set_reuse_port is not implemented on Windows
+            #[cfg(target_family = "unix")]
+            socket.set_reuse_port(true)?;
 
-        socket.bind(&socket2::SockAddr::from(settings.address))?;
+            socket.bind(&socket2::SockAddr::from(settings.address))?;
+            socket.into()
+        };
 
-        let endpoint = quinn::Endpoint::new(
-            endpoint_config,
-            Some(server_config),
-            socket.into(),
-            Arc::new(TokioRuntime),
-        )?;
+        // `NetRuntime` places every task quinn spawns on net, including the connection driver
+        // created when an `Incoming` is awaited. The guard covers what it cannot: the socket is
+        // handed to `tokio::net::UdpSocket::from_std`, which registers with whichever reactor is
+        // current here. Removing it would register net's socket on core's reactor.
+        let endpoint = {
+            let _guard = lore_base::runtime::net_runtime().enter();
+            quinn::Endpoint::new(
+                endpoint_config,
+                Some(server_config),
+                socket,
+                Arc::new(NetRuntime),
+            )?
+        };
 
         run_loop(endpoint.clone(), settings)?;
 
@@ -170,7 +190,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         // the `TaskMonitor` so we need to use a scoped import.
         use tracing::instrument::Instrument;
         let monitor = monitor.clone();
-        runtime().spawn(
+        lore_spawn_core!(
             LORE_CONTEXT.scope(
                 execution_context(),
                 async move {
@@ -180,7 +200,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                     }
                 }
                 .in_current_span(),
-            ),
+            )
         );
     }
 
@@ -193,7 +213,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         let monitor = monitor.clone();
         let stream_handler_factory = stream_handler_factory.clone();
 
-        runtime().spawn(
+        lore_spawn_net!(
             LORE_CONTEXT.scope(
                 execution_context(),
                 async move {
@@ -204,7 +224,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                         let monitor = monitor.clone();
                         let stream_handler_factory = stream_handler_factory.clone();
 
-                        runtime().spawn(
+                        lore_spawn_net!(
                             LORE_CONTEXT.scope(
                                 execution_context(),
                                 async move {
@@ -220,12 +240,12 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                                     }
                                 }
                                 .in_current_span(),
-                            ),
+                            )
                         );
                     }
                 }
                 .in_current_span(),
-            ),
+            )
         );
     }
 
@@ -281,12 +301,16 @@ async fn handle_conn(
         ));
     };
 
-    let _stats_guard =
-        track_connection_stats(service_name, &connection, connection_metrics_interval);
-
     let context = Arc::new(AttributeMap::default());
     context.insert(conn_span.clone());
     context.insert(ConnectionId(connection_id));
+
+    let _stats_guard = track_connection_stats(
+        service_name,
+        &connection,
+        context.clone(),
+        connection_metrics_interval,
+    );
 
     // Create the stream handler once per connection so per-connection state
     // (e.g. SessionMap in StorageServiceV4) is shared across all streams.
@@ -344,6 +368,8 @@ async fn handle_conn(
             .instrument(info_span!("handle_stream"))
         };
 
-        runtime().spawn(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
+        // Transport read only: `handle_stream` lifts the request off the wire and
+        // hands processing to core from inside the stream handler.
+        lore_spawn_net!(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
     }
 }

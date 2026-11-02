@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use core::mem::MaybeUninit;
+
 use crate::FragmentFlags;
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::compress::FragmentError;
@@ -71,6 +73,8 @@ pub fn hash_function_strs_slice(salt: &[u8], function: &str, args: &[&str]) -> H
 
 /// Hash a raw data slice using blake3.
 pub fn hash_slice(data: &[u8]) -> Hash {
+    #[cfg(feature = "test-util")]
+    crate::test_util::count_hash();
     blake3::hash(data).as_bytes().into()
 }
 
@@ -103,147 +107,33 @@ pub fn hash_fragment(fragment: Fragment, data: &[u8]) -> Result<Hash, FragmentEr
 /// 64-bit string hash type, used for node name lookups.
 pub type StringHash = u64;
 
+/// Longest name [`hash_string`] folds without allocating, one cache line wide.
+#[lore_macro::test_pub]
+const HASH_STRING_STACK_BYTES: usize = 64;
+
 /// Compute the 64-bit xxh3 hash of the lowercase form of a string.
+///
+/// Names up to [`HASH_STRING_STACK_BYTES`] fold in one branchless pass over a
+/// stack buffer; the high bits it accumulates say whether the name is ASCII and
+/// the fold usable. Testing per byte instead would stop the pass vectorizing.
 pub fn hash_string(string: &str) -> StringHash {
-    let lowercase_string = string.to_lowercase();
-    xxhash_rust::xxh3::xxh3_64(lowercase_string.as_bytes())
+    let bytes = string.as_bytes();
+    if bytes.len() <= HASH_STRING_STACK_BYTES {
+        let mut buffer = [const { MaybeUninit::<u8>::uninit() }; HASH_STRING_STACK_BYTES];
+        let mut high_bits = 0u8;
+        for (target, &source) in buffer.iter_mut().zip(bytes) {
+            high_bits |= source;
+            target.write(source.to_ascii_lowercase());
+        }
+        if high_bits & 0x80 == 0 {
+            // SAFETY: the loop above wrote every byte of `buffer[..bytes.len()]`.
+            return xxhash_rust::xxh3::xxh3_64(unsafe { buffer[..bytes.len()].assume_init_ref() });
+        }
+    }
+    xxhash_rust::xxh3::xxh3_64(string.to_lowercase().as_bytes())
 }
 
 /// Zero-alloc xxh3 of raw string-like bytes (same digest family as [`hash_string`] without the lowercasing, distinct from the blake3 [`hash_slice`]).
 pub fn hash_string_bytes(bytes: &[u8]) -> StringHash {
     xxhash_rust::xxh3::xxh3_64(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hash_fragment_uncompressed_ok() {
-        let data = b"hello world";
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: data.len() as u32,
-            size_content: data.len() as u64,
-        };
-        let result = hash_fragment(fragment, data);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), hash_slice(data));
-    }
-
-    #[test]
-    fn hash_fragment_uncompressed_deterministic() {
-        let data = b"deterministic content";
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: data.len() as u32,
-            size_content: data.len() as u64,
-        };
-        let hash1 = hash_fragment(fragment, data).unwrap();
-        let hash2 = hash_fragment(fragment, data).unwrap();
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn hash_fragment_different_data_different_hash() {
-        let data_a = b"content a";
-        let data_b = b"content b";
-        let frag_a = Fragment {
-            flags: 0,
-            size_payload: data_a.len() as u32,
-            size_content: data_a.len() as u64,
-        };
-        let frag_b = Fragment {
-            flags: 0,
-            size_payload: data_b.len() as u32,
-            size_content: data_b.len() as u64,
-        };
-        assert_ne!(
-            hash_fragment(frag_a, data_a).unwrap(),
-            hash_fragment(frag_b, data_b).unwrap()
-        );
-    }
-
-    #[test]
-    fn hash_fragment_payload_size_mismatch() {
-        let data = b"hello";
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: data.len() as u32 + 1,
-            size_content: data.len() as u64,
-        };
-        assert!(hash_fragment(fragment, data).is_err());
-    }
-
-    #[test]
-    fn hash_fragment_empty_payload() {
-        let data: &[u8] = b"";
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: 0,
-            size_content: 0,
-        };
-        let result = hash_fragment(fragment, data);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), hash_slice(data));
-    }
-
-    #[test]
-    fn hash_fragment_compressed_payload_size_mismatch() {
-        let data = b"short";
-        let fragment = Fragment {
-            flags: crate::FragmentFlags::PayloadCompressedLZ4.into(),
-            size_payload: data.len() as u32 + 5,
-            size_content: 100,
-        };
-        assert!(hash_fragment(fragment, data).is_err());
-    }
-
-    #[test]
-    fn hash_fragment_compressed_invalid_data() {
-        let data = b"this is not valid lz4 compressed data!!";
-        let fragment = Fragment {
-            flags: crate::FragmentFlags::PayloadCompressedLZ4.into(),
-            size_payload: data.len() as u32,
-            size_content: 100,
-        };
-        assert!(hash_fragment(fragment, data).is_err());
-    }
-
-    #[test]
-    fn hash_function_different_salts_produce_different_keys() {
-        let hash_urc = hash_function(b"urc", "test_function");
-        let hash_lore = hash_function(b"lore", "test_function");
-        assert_ne!(hash_urc, hash_lore);
-    }
-
-    #[test]
-    fn hash_function_same_salt_is_deterministic() {
-        let hash1 = hash_function(b"urc", "test_function");
-        let hash2 = hash_function(b"urc", "test_function");
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn hash_function_arg_with_salt() {
-        let hash_urc = hash_function_arg(b"urc", "func", "arg");
-        let hash_lore = hash_function_arg(b"lore", "func", "arg");
-        assert_ne!(hash_urc, hash_lore);
-    }
-
-    #[test]
-    fn hash_function_compressed_roundtrip() {
-        let original = vec![0u8; 4096];
-        let original = original.as_slice();
-        let uncompressed_fragment = Fragment {
-            flags: 0,
-            size_payload: original.len() as u32,
-            size_content: original.len() as u64,
-        };
-        let (compressed_fragment, compressed_data) =
-            crate::compress::compress(uncompressed_fragment, original, crate::CompressionMode::Lz4)
-                .unwrap();
-        let hash = hash_fragment(compressed_fragment, compressed_data.as_ref()).unwrap();
-        assert_eq!(hash, hash_slice(original));
-    }
 }

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,9 +11,8 @@ use lore_proto::lore::revision::v1::RevisionListRequest;
 use lore_proto::lore::revision::v1::RevisionListResponse;
 use lore_proto::lore::revision::v1::revision_list_request::Start;
 use lore_revision::branch;
-use lore_revision::find::FindMatchResult;
-use lore_revision::find::find_revision;
 use lore_revision::lore::BranchId;
+use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -22,10 +20,12 @@ use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state;
 use lore_revision::util;
+use lore_storage::StoreError;
 use lore_telemetry::LabelArray;
 use lore_telemetry::observe::Observe;
 use lore_telemetry::observe::ObserveResult;
 use lore_telemetry::observe::observe_result;
+use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::REVISION_LIST_STRATEGY_HEADER;
@@ -45,14 +45,22 @@ use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::get_write_token;
+use crate::grpc::none_or_status;
+use crate::grpc::revision::v1::branch_lineage::BranchLineage;
+use crate::grpc::revision::v1::branch_lineage::HistoryOwner;
 use crate::grpc::revision::v1::service::RevisionListInstruments;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
+#[lore_macro::test_pub]
 const MAX_REVISION_LIST_RESPONSE_ITEMS: usize = 100;
 const METRICS_START_KEY: &str = "start_type";
 const METRICS_LIST_STRATEGY_KEY: &str = "list_strategy";
+/// Revisions walked between progress reports from the forward-cursor gap
+/// descent. The descent reports its totals when it finishes, and the
+/// handler timeout can end it before it ever gets there, so a descent long
+/// enough to be worth diagnosing reports as it goes.
+const GAP_DESCENT_PROGRESS_HOPS: u64 = 10_000;
 
 enum RevisionListStrategy {
     Direct,
@@ -141,14 +149,15 @@ fn start_to_metric_value(value: &Start) -> &'static str {
 
 /// `lore.revision.v1.RevisionService.RevisionList` handler.
 ///
-/// Returns a page of revisions newer-to-older starting from the
-/// `start` anchor, plus optional cursors for the adjacent pages.
+/// Returns a page of revisions newer-to-older that holds the `start`
+/// anchor, plus optional cursors for the adjacent pages. A walked page
+/// starts at the anchor; a page served from a cached segment starts at
+/// the segment's top, so it also holds revisions newer than the anchor.
 /// `signature_backward` is items[N-1]'s parent — absent when items[N-1]
 /// is the root revision. `signature_forward` is the revision whose
-/// `parent_self` is items[0]'s signature, derived from the
-/// `BranchLatestPointer` step keys; absent when no step key covers
-/// the requested forward position (e.g. items[0] is the branch latest,
-/// or its child sits inside a step block whose key wasn't recorded).
+/// `parent_self` is items[0]'s signature — absent only when items[0]
+/// is the branch's latest revision, i.e. there is genuinely no newer
+/// revision.
 #[tracing::instrument(name = "RevisionList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionListRequest>,
@@ -178,19 +187,34 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // A signature names a revision and not a branch to view it from, so
+            // only an identifier start has a lineage.
+            let lineage = match &start {
+                Start::Identifier(identifier) => {
+                    Some(BranchLineage::new(BranchId::from(&identifier.branch_id)))
+                }
+                Start::Signature(_) => None,
+            };
+
             let resolved = {
                 let labels = smallvec![KeyValue::new(
                     METRICS_START_KEY,
                     start_to_metric_value(&start),
                 )];
-                resolve_start(start, &repository, history_step_size, acceleration)
-                    .observe(
-                        instruments.resolve_start_duration.clone(),
-                        labels,
-                        observe_resolve_start(),
-                    )
-                    .await
-                    .output?
+                resolve_start(
+                    start,
+                    lineage.as_ref(),
+                    &repository,
+                    history_step_size,
+                    acceleration,
+                )
+                .observe(
+                    instruments.resolve_start_duration.clone(),
+                    labels,
+                    observe_resolve_start(),
+                )
+                .await
+                .output?
             };
 
             let (walked, strategy) = match resolved {
@@ -211,7 +235,7 @@ pub async fn handler(
                     )
                 }
                 ResolveStart::Walk { start, strategy } => {
-                    debug!({REVISION} = %start, %strategy, "Listing revisions");
+                    debug!({REVISION} = %start, %strategy, "Walking revisions");
                     let walked = walk_revisions(
                         start,
                         &strategy,
@@ -230,7 +254,16 @@ pub async fn handler(
                 }
             };
 
-            let signature_forward = forward_cursor(&repository, &walked, history_step_size).await;
+            debug!(walked_items = walked.items.len(), %strategy, "Finished walk");
+
+            let signature_forward = forward_cursor(
+                &repository,
+                &walked,
+                lineage.as_ref(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
             let signature_backward = walked.next_older;
 
             debug!(
@@ -260,16 +293,18 @@ pub async fn handler(
 /// the step-key dance would always miss for the zero block.
 async fn resolve_start(
     start: Start,
+    lineage: Option<&BranchLineage>,
     repository: &Arc<RepositoryContext>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<ResolveStart, Status> {
     match start {
         Start::Signature(signature) => {
-            let hash = Hash::from(signature);
+            let hash = crate::grpc::revision_signature(signature)?;
+            debug!({REVISION} = %hash, "resolve_start - Signature");
             if acceleration.list_cache
                 && let Some(cached) =
-                    try_serve_signature_from_cache(repository, hash, history_step_size).await
+                    try_serve_signature_from_cache(repository, hash, history_step_size).await?
             {
                 return Ok(cached);
             }
@@ -280,9 +315,11 @@ async fn resolve_start(
         }
         Start::Identifier(identifier) => {
             let branch = BranchId::from(&identifier.branch_id);
+            debug!({BRANCH_ID} = %branch, revision_number = identifier.number, "resolve_start - Identifier");
             if identifier.number == 0 {
                 let hash = branch::load_latest(repository.clone(), branch)
                     .await
+                    .filter_slow_down()?
                     .warn_map_err(|err| {
                         Status::not_found(format!("Branch {branch} not found: {err}"))
                     })?;
@@ -292,98 +329,127 @@ async fn resolve_start(
                 });
             }
 
-            if acceleration.list_cache {
-                if let Some(cached) = cache::revision::load_cached_list(
-                    repository,
-                    branch,
-                    identifier.number,
-                    history_step_size,
-                )
-                .await
-                    && cached
-                        .items()
-                        .iter()
-                        .any(|item| item.number == identifier.number)
-                {
-                    debug!(
-                        number = identifier.number,
-                        "Served revision list from cache"
-                    );
-                    return Ok(ResolveStart::Items {
-                        items: cached_to_proto(cached.items()),
-                        branch,
-                        next_older: cached_next_older(cached.items()),
-                        strategy: RevisionListStrategy::ListCache,
-                    });
-                }
-
-                if let Some(cached) = cache::revision::try_backfill_segment(
-                    repository,
-                    branch,
-                    identifier.number,
-                    history_step_size,
-                )
-                .await
-                    && cached
-                        .items()
-                        .iter()
-                        .any(|item| item.number == identifier.number)
-                {
-                    debug!(number = identifier.number, "Backfilled revision list cache");
-                    return Ok(ResolveStart::Items {
-                        items: cached_to_proto(cached.items()),
-                        branch,
-                        next_older: cached_next_older(cached.items()),
-                        strategy: RevisionListStrategy::ListCacheBackfill,
-                    });
-                }
+            let requested = HistoryOwner::requested(branch);
+            if let Some(accelerated) = accelerated_start(
+                repository,
+                &requested,
+                identifier.number,
+                history_step_size,
+                acceleration,
+            )
+            .await?
+            {
+                return Ok(accelerated);
             }
 
-            let step_key_hit = if acceleration.step_keys {
-                let (key, key_type) = branch::revision_step_key(
-                    repository::SALT_LORE,
-                    repository.id,
-                    branch,
+            // The requested branch's own data had nothing, so the number may
+            // be at or below a branch point and described by an ancestor.
+            if let Some(lineage) = lineage
+                && let Some(owner) = lineage.owner_of(repository, identifier.number).await?
+                && owner.branch != branch
+                && let Some(accelerated) = accelerated_start(
+                    repository,
+                    &owner,
                     identifier.number,
                     history_step_size,
-                );
-                repository
-                    .read_mutable_store()
-                    .load(repository.id, key, key_type)
-                    .await
-                    .ok()
-                    .map(|revision| (key, revision))
-            } else {
-                None
-            };
-
-            if let Some((key, block_revision)) = step_key_hit {
-                debug!(number = identifier.number, key = %key, "Found history step key");
-                let hash =
-                    find_exact_revision(repository, branch, block_revision, identifier.number)
-                        .await
-                        .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
-                Ok(ResolveStart::Walk {
-                    start: hash,
-                    strategy: RevisionListStrategy::HistoryStep,
-                })
-            } else {
-                let signature = format!("{branch}@{}", identifier.number);
-                let hash = revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
+                    acceleration,
                 )
-                .await
-                .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
-                Ok(ResolveStart::Walk {
-                    start: hash,
-                    strategy: RevisionListStrategy::FullIteration,
-                })
+                .await?
+            {
+                return Ok(accelerated);
             }
+
+            let signature = format!("{branch}@{}", identifier.number);
+            let hash = revision::resolve_boxed(
+                repository.clone(),
+                signature,
+                ResolveSearchLocation::Local,
+            )
+            .await
+            .filter_slow_down()?
+            .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+            Ok(ResolveStart::Walk {
+                start: hash,
+                strategy: RevisionListStrategy::FullIteration,
+            })
         }
     }
+}
+
+/// Builds the page for a cached segment of `owner`.
+fn cached_start(
+    owner: &HistoryOwner,
+    segment: &[branch::CachedRevisionItem],
+    strategy: RevisionListStrategy,
+) -> ResolveStart {
+    // The segment is the owner's and can run past the branch point: a branch
+    // made at 150 does not contain the owner's 151..=200.
+    let visible = owner.visible(segment);
+    ResolveStart::Items {
+        items: cached_to_proto(visible),
+        branch: owner.branch,
+        next_older: cached_next_older(visible),
+        strategy,
+    }
+}
+
+/// Serves an identifier lookup from the acceleration data of `owner`, or
+/// `None` when that branch has none covering the number.
+async fn accelerated_start(
+    repository: &Arc<RepositoryContext>,
+    owner: &HistoryOwner,
+    number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Option<ResolveStart>, Status> {
+    if acceleration.list_cache {
+        if let Some(cached) =
+            cache::revision::load_cached_list(repository, owner.branch, number, history_step_size)
+                .await
+                .filter_slow_down()?
+                .unwrap_or_default()
+            && cached.items().iter().any(|item| item.number == number)
+        {
+            debug!(number, "Served revision list from cache");
+            return Ok(Some(cached_start(
+                owner,
+                cached.items(),
+                RevisionListStrategy::ListCache,
+            )));
+        }
+
+        if let Some(cached) = cache::revision::try_backfill_segment(
+            repository,
+            owner.branch,
+            number,
+            history_step_size,
+        )
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default()
+            && cached.items().iter().any(|item| item.number == number)
+        {
+            debug!(number, "Backfilled revision list cache");
+            return Ok(Some(cached_start(
+                owner,
+                cached.items(),
+                RevisionListStrategy::ListCacheBackfill,
+            )));
+        }
+    }
+
+    if !acceleration.step_keys {
+        return Ok(None);
+    }
+    let step_key_hit =
+        cache::revision::resolve_via_step_key(repository, owner.branch, number, history_step_size)
+            .await
+            .filter_slow_down()?
+            .unwrap_or_default();
+    Ok(step_key_hit.map(|hash| ResolveStart::Walk {
+        start: hash,
+        strategy: RevisionListStrategy::HistoryStep,
+    }))
 }
 
 /// Try to serve a signature-anchored request from the cache: deserialize
@@ -394,83 +460,69 @@ async fn try_serve_signature_from_cache(
     repository: &Arc<RepositoryContext>,
     signature: Hash,
     history_step_size: u64,
-) -> Option<ResolveStart> {
-    let state = match state::State::deserialize(repository.clone(), signature).await {
+) -> Result<Option<ResolveStart>, Status> {
+    let state = match state::State::deserialize(repository.clone(), signature)
+        .await
+        .filter_slow_down()?
+    {
         Ok(state) => state,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: state deserialize failed");
-            return None;
+            return Ok(None);
         }
     };
-    let metadata = match Metadata::deserialize(repository.clone(), state.metadata_hash()).await {
+    let metadata = match Metadata::deserialize(repository.clone(), state.metadata_hash())
+        .await
+        .filter_slow_down()?
+    {
         Ok(metadata) => metadata,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: metadata deserialize failed");
-            return None;
+            return Ok(None);
         }
     };
     let branch = match metadata.get_branch() {
         Ok(branch) => branch,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: metadata missing branch");
-            return None;
+            return Ok(None);
         }
     };
     let revision_number = state.revision_number();
-    let (cached, strategy) = match cache::revision::load_cached_list(
-        repository,
-        branch,
-        revision_number,
-        history_step_size,
-    )
-    .await
+    let (cached, strategy) = if let Some(items) =
+        cache::revision::load_cached_list(repository, branch, revision_number, history_step_size)
+            .await
+            .filter_slow_down()?
+            .unwrap_or_default()
     {
-        Some(items) => (items, RevisionListStrategy::ListCache),
-        None => (
-            cache::revision::try_backfill_segment(
-                repository,
-                branch,
-                revision_number,
-                history_step_size,
-            )
-            .await?,
-            RevisionListStrategy::ListCacheBackfill,
-        ),
+        (items, RevisionListStrategy::ListCache)
+    } else {
+        let Some(backfilled) = cache::revision::try_backfill_segment(
+            repository,
+            branch,
+            revision_number,
+            history_step_size,
+        )
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default() else {
+            return Ok(None);
+        };
+        (backfilled, RevisionListStrategy::ListCacheBackfill)
     };
     if !cached
         .items()
         .iter()
         .any(|item| item.signature == signature)
     {
-        return None;
+        return Ok(None);
     }
-    Some(ResolveStart::Items {
+    Ok(Some(ResolveStart::Items {
         items: cached_to_proto(cached.items()),
         branch,
         next_older: cached_next_older(cached.items()),
         strategy,
-    })
-}
-
-async fn find_exact_revision(
-    repository: &Arc<RepositoryContext>,
-    branch: BranchId,
-    block_revision: Hash,
-    target_number: u64,
-) -> Result<Hash, lore_revision::find::FindError> {
-    find_revision(
-        repository.clone(),
-        branch,
-        block_revision,
-        false,
-        None,
-        |state, _metadata| match state.revision_number().cmp(&target_number) {
-            Ordering::Equal => FindMatchResult::Match,
-            Ordering::Less => FindMatchResult::Abort,
-            Ordering::Greater => FindMatchResult::Continue,
-        },
-    )
-    .await
+    }))
 }
 
 fn observe_resolve_start()
@@ -513,7 +565,7 @@ async fn walk_revisions(
     // Segment-aligns the walk: walk-served pages stop at the floor so they line up
     // with cache-served pages and consecutive backward-cursor calls don't overlap.
     let mut segment_floor: Option<u64> = None;
-    let mut prev_step_info: Option<(u64, Hash, Hash)> = None;
+    let mut prev_step_state: Option<Arc<state::State>> = None;
 
     while items.len() < MAX_REVISION_LIST_RESPONSE_ITEMS && !current.is_zero() {
         let state = state::State::deserialize(repository.clone(), current)
@@ -540,8 +592,9 @@ async fn walk_revisions(
             })?;
 
         if first
-            && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), state.metadata_hash()).await
+            && let Ok(metadata) = Metadata::deserialize(repository.clone(), state.metadata_hash())
+                .await
+                .filter_slow_down()?
         {
             if let Ok(b) = metadata.get_branch() {
                 branch = Some(b);
@@ -558,6 +611,43 @@ async fn walk_revisions(
 
         let current_number = state.revision_number();
 
+        // Backfill missing history-step keys when full-iteration crosses a
+        // step boundary. Subsequent paginated calls can then take the
+        // HistoryStep fast path. Skipped when step keys are disabled. Must
+        // run before the segment-floor check below: the crossing this
+        // detects and the walk's exit point are the same revision, so
+        // checking floor first would break out before this ever ran.
+        if acceleration.step_keys
+            && matches!(strategy, RevisionListStrategy::FullIteration)
+            && let Some(previous_state) = &prev_step_state
+            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
+                state.revision_number(),
+                previous_state.revision_number(),
+                history_step_size,
+            )
+            // no filter_slow_down()? usage here: this read only enables the
+            // best-effort step-key backfill below.
+            && let Ok(metadata) =
+                Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
+            && let Ok(branch_id) = metadata.get_branch()
+        {
+            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+                let _ = cache::revision::seal_boundary_revision_number(
+                    repository.clone(),
+                    branch_id,
+                    history_step_size,
+                    boundary,
+                    &state,
+                    previous_state,
+                )
+                .await;
+                debug!(boundary, "Backfilled history step key");
+            }
+        }
+        if matches!(strategy, RevisionListStrategy::FullIteration) {
+            prev_step_state = Some(state.clone());
+        }
+
         if first {
             let b = current_number.div_ceil(history_step_size) * history_step_size;
             segment_floor = Some(b.saturating_sub(history_step_size).saturating_add(1));
@@ -566,35 +656,6 @@ async fn walk_revisions(
         {
             next_older = Some(current);
             break;
-        }
-
-        // Backfill missing history-step keys when full-iteration crosses a
-        // step boundary. Subsequent paginated calls can then take the
-        // HistoryStep fast path. Skipped when step keys are disabled.
-        if acceleration.step_keys
-            && matches!(strategy, RevisionListStrategy::FullIteration)
-            && let Some((prev_number, prev_hash, prev_metadata_hash)) = prev_step_info
-            && prev_number / history_step_size != current_number / history_step_size
-            && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), prev_metadata_hash).await
-            && let Ok(branch_id) = metadata.get_branch()
-        {
-            let (key, key_type) = branch::revision_step_key(
-                repository::SALT_LORE,
-                repository.id,
-                branch_id,
-                prev_number,
-                history_step_size,
-            );
-            let write_token = get_write_token();
-            let _ = repository
-                .write_mutable_store(&write_token)
-                .store(repository.id, key, prev_hash, key_type)
-                .await;
-            debug!(number = prev_number, key = %key, "Backfilled history step key");
-        }
-        if matches!(strategy, RevisionListStrategy::FullIteration) {
-            prev_step_info = Some((current_number, current, state.metadata_hash()));
         }
 
         items.push(model_v1::RevisionItem {
@@ -627,1132 +688,480 @@ async fn walk_revisions(
     })
 }
 
-/// Looks up the revision whose `parent_self` is items[0]'s signature
-/// — i.e. the cursor for the next newer page — by querying the
-/// `BranchLatestPointer` step key for `items[0].number + 1` and then
-/// walking that step block back to the exact target number. Returns
-/// `None` when the step key isn't registered (the forward position
-/// isn't covered by recorded boundaries) or when the walk inside the
-/// block can't find the target.
-async fn forward_cursor(
-    repository: &Arc<RepositoryContext>,
-    walked: &Walked,
-    history_step_size: u64,
-) -> Option<Hash> {
-    let first = walked.items.first()?;
-    let target_number = first.number.checked_add(1)?;
-    let branch = walked.branch?;
+/// Outcome of reading the step-boundary skip pointer at a boundary `B`.
+/// `B`'s pointer holds the highest revision numbered `<= B`, so a value
+/// other than `first_signature` proves that revision is strictly above
+/// `first_number` (`Found`). A pointer still equal to `first_signature`
+/// proves nothing above `B` exists (`Empty`) — a real, load-bearing fact
+/// callers use to safely widen the search. A missing key proves nothing
+/// either way (`Unknown`): the seal write is best-effort and silently
+/// dropped on failure, and the key type was renamed once already,
+/// orphaning older entries under the previous name. Only `Empty` may
+/// narrow a search towards a single-band answer: treating `Unknown` as
+/// `Empty` would let that answer span a boundary that is genuinely
+/// non-empty but whose pointer was simply lost.
+enum BoundaryProbe {
+    Found(Hash),
+    Empty,
+    Unknown,
+}
 
+/// Reads the step-boundary skip pointer at `boundary`. See [`BoundaryProbe`].
+async fn probe_step_boundary(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    boundary: u64,
+    first_signature: Hash,
+    history_step_size: u64,
+) -> Result<BoundaryProbe, Status> {
     let (key, key_type) = branch::revision_step_key(
         repository::SALT_LORE,
         repository.id,
         branch,
-        target_number,
+        boundary,
         history_step_size,
     );
-    let block_revision = repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .ok()?;
-
-    find_exact_revision(repository, branch, block_revision, target_number)
-        .await
-        .ok()
+    match none_or_status(
+        repository
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )? {
+        Some(revision) if revision != first_signature => Ok(BoundaryProbe::Found(revision)),
+        Some(_) => Ok(BoundaryProbe::Empty),
+        None => Ok(BoundaryProbe::Unknown),
+    }
 }
 
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
+/// Where the descent to the forward-cursor target should start from, and
+/// how far it is safe to trust a single-band bound.
+enum ForwardAnchor {
+    /// A sealed boundary was found; every boundary below it down to
+    /// `first_number`'s own was proven empty, so its band — at most
+    /// `history_step_size` revisions — is guaranteed to hold the target.
+    Sealed { anchor: Hash, boundary: u64 },
+    /// No boundary above `first_number` is sealed at all: the target, if
+    /// any, lives in the branch's latest revision's own (always-open)
+    /// band, likewise bounded to `history_step_size` revisions. The latest
+    /// revision is not numbered above `first_number` when the branch does
+    /// not reach the revision numbered `first_number`.
+    LatestBand { anchor: Hash },
+    /// A boundary somewhere in the search could not be read, so `Empty`'s
+    /// monotonicity no longer covers the boundaries below it and the gap
+    /// between `first_number` and `anchor` cannot be trusted to hold a
+    /// single band. `anchor` is the revision held by the lowest boundary
+    /// the search went on to prove `Found`, which is not necessarily the
+    /// lowest sealed boundary there is: narrowing past an unreadable
+    /// boundary skips whatever lies beneath it. Where the search proved
+    /// none, `anchor` is the branch's latest revision, numbered above
+    /// `first_number` unless the branch does not reach that revision. The
+    /// descent walks every revision between the two, so how low `anchor`
+    /// sits sets the cost.
+    UnverifiedGap { anchor: Hash },
+}
 
-    use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::types::Hash;
-    use lore_revision::branch;
-    use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
-    use lore_revision::lore::RepositoryId;
-    use lore_revision::metadata::Metadata;
-    use lore_revision::repository::RepositoryContext;
-    use lore_revision::state::State;
-    use lore_telemetry::InstrumentProvider;
-    use lore_transport::grpc::REPOSITORY_ID_KEY;
-    use opentelemetry::KeyValue;
-    use rand::random;
-    use tonic::Request;
+/// Finds where to start descending to the lowest revision numbered
+/// strictly above `first_number`.
+///
+/// A boundary `B`'s skip pointer holds the highest revision numbered
+/// `<= B`, which only increases with `B`. So "boundary `B` is `Empty`" is
+/// monotonic in `B` — true up to some point, then false from there on —
+/// and the lowest boundary where it turns false can be found by binary
+/// search instead of a linear scan, using `Empty` results (not `Unknown`
+/// ones — see [`BoundaryProbe`]) to narrow the range. The search is
+/// bounded above by `latest`'s own boundary, which is never sealed (the
+/// segment holding the branch's latest revision is always open), giving
+/// a correct upper limit no matter how wide the gap above `first_number`
+/// is. A fixed probe budget cannot do this safely: it has no way to tell
+/// "nothing is sealed above this point" (target lives in latest's open
+/// band) apart from "the real answer is just further away than the
+/// budget allows" (which would wrongly fall back to a walk anchored on
+/// latest, spanning however much ordinary history has since accumulated).
+///
+/// Hitting `Unknown` — the boundary's true state cannot be determined —
+/// rules out both single-band answers for the rest of the search, since
+/// `Empty`'s monotonicity no longer covers the boundaries below it. The
+/// search continues upward regardless and reports
+/// [`ForwardAnchor::UnverifiedGap`] anchored on the lowest boundary it
+/// goes on to prove `Found`, or on `latest` when it proves none.
+///
+/// The immediately-following boundary is tried first as a fast path: for
+/// ordinary, non-gapped pagination this resolves in one probe and never
+/// needs to deserialize `latest`. Only a miss there pays for one `latest`
+/// deserialize (to learn its boundary) before binary-searching.
+async fn forward_anchor(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    first_number: u64,
+    first_signature: Hash,
+    latest: Hash,
+    history_step_size: u64,
+) -> Result<ForwardAnchor, Status> {
+    let first_boundary = first_number
+        .saturating_add(1)
+        .div_ceil(history_step_size)
+        .saturating_mul(history_step_size);
 
-    use super::*;
-    use crate::grpc::get_write_token;
-    use crate::grpc::handlers::branch_push;
-    use crate::store::test_store_create;
+    let mut saw_unreadable_boundary = false;
 
-    struct TestInstrumentProvider {}
-
-    impl InstrumentProvider for TestInstrumentProvider {
-        fn namespace(&self) -> &'static str {
-            "test"
+    match probe_step_boundary(
+        repository,
+        branch,
+        first_boundary,
+        first_signature,
+        history_step_size,
+    )
+    .await?
+    {
+        BoundaryProbe::Found(revision) => {
+            return Ok(ForwardAnchor::Sealed {
+                anchor: revision,
+                boundary: first_boundary,
+            });
         }
-        fn labels(&self) -> &[KeyValue] {
-            &[]
+        BoundaryProbe::Empty => {}
+        // Records the gap without ending the search: a `Found` boundary
+        // above this one is still a far lower descent anchor than `latest`.
+        BoundaryProbe::Unknown => saw_unreadable_boundary = true,
+    }
+
+    let latest_state = state::State::deserialize(repository.clone(), latest)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+    let latest_boundary =
+        latest_state.revision_number().div_ceil(history_step_size) * history_step_size;
+
+    if latest_boundary <= first_boundary {
+        // `latest` is at or below `first_boundary`, itself at most one step
+        // above `first_number`: any target sits in latest's band whatever the
+        // probe above reported.
+        return Ok(ForwardAnchor::LatestBand { anchor: latest });
+    }
+
+    // Invariant: `low` is a boundary proven `Empty`, or one that could
+    // not be read; `high` is either
+    // `latest_boundary` (an unsealed sentinel) or a boundary proven
+    // `Found`, whose hash is cached in `high_anchor`. Both start, and
+    // every `mid` stays, a multiple of `history_step_size`, so
+    // `high - low` is always a multiple of it too; the loop only runs
+    // while that gap exceeds one step, so `mid` strictly separates `low`
+    // and `high` every iteration.
+    let mut low = first_boundary;
+    let mut high = latest_boundary;
+    let mut high_anchor: Option<Hash> = None;
+
+    while high - low > history_step_size {
+        let mid = low + ((high - low) / (2 * history_step_size)) * history_step_size;
+        match probe_step_boundary(repository, branch, mid, first_signature, history_step_size)
+            .await?
+        {
+            BoundaryProbe::Found(revision) => {
+                high = mid;
+                high_anchor = Some(revision);
+            }
+            BoundaryProbe::Empty => low = mid,
+            // An unreadable boundary leaves the half below `mid`
+            // unexcluded, so narrowing upward can only overshoot the
+            // lowest `Found` boundary, never settle on a bad anchor:
+            // every `Found` is proven above `first_number` on its own,
+            // however the search reached it.
+            BoundaryProbe::Unknown => {
+                saw_unreadable_boundary = true;
+                low = mid;
+            }
         }
     }
 
-    fn make_instruments() -> RevisionListInstruments {
-        let provider = TestInstrumentProvider {};
-        RevisionListInstruments {
-            resolve_start_duration: provider.latency_histogram_ms("test.resolve_start.duration"),
-            relative_age_seconds: provider
-                .length_histogram("test.relative_age_seconds", vec![1.0, 2.0, 3.0]),
-            walk_duration: provider.latency_histogram_ms("test.walk.duration"),
-        }
+    match (saw_unreadable_boundary, high_anchor) {
+        // Both single-band answers rest on `Empty` holding for every
+        // boundary at or below `low`, which one unreadable boundary
+        // anywhere in the search breaks.
+        (true, high_anchor) => Ok(ForwardAnchor::UnverifiedGap {
+            anchor: high_anchor.unwrap_or(latest),
+        }),
+        (false, Some(revision)) if high < latest_boundary => Ok(ForwardAnchor::Sealed {
+            anchor: revision,
+            boundary: high,
+        }),
+        (false, _) => Ok(ForwardAnchor::LatestBand { anchor: latest }),
+    }
+}
+
+/// Descends from a [`ForwardAnchor::Sealed`] or [`ForwardAnchor::LatestBand`]
+/// anchor to the lowest revision numbered strictly above `first_number`, or
+/// `None` when the anchor is not numbered above it, as the branch's latest
+/// revision is not for a revision the branch does not reach.
+/// `anchor_boundary`, when set, is the sealed step boundary `anchor` was
+/// read from; when `list_cache_enabled`, the persisted list-cache blob for
+/// that band is tried first (one blob read) before falling back to a
+/// walk. Either way — a sealed boundary's band, or (when `anchor_boundary`
+/// is unset) the branch's latest revision's own open band — the band
+/// holds at most `history_step_size` revisions, so the walk below is
+/// bounded by that alone; no larger cap is needed.
+async fn forward_target(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    anchor: Hash,
+    anchor_boundary: Option<u64>,
+    first_number: u64,
+    history_step_size: u64,
+    list_cache_enabled: bool,
+) -> Result<Option<Hash>, Status> {
+    if list_cache_enabled
+        && let Some(boundary) = anchor_boundary
+        && let Some(cached) =
+            cache::revision::load_cached_list(repository, branch, boundary, history_step_size)
+                .await
+                .filter_slow_down()?
+                .unwrap_or_default()
+        && let Some(item) = cached
+            .items()
+            .iter()
+            .rev()
+            .find(|item| item.number > first_number)
+    {
+        return Ok(Some(item.signature));
     }
 
-    fn make_request_identifier(
-        repository: RepositoryId,
-        branch: BranchId,
-        number: u64,
-    ) -> Request<RevisionListRequest> {
-        let mut request = Request::new(RevisionListRequest {
-            start: Some(Start::Identifier(model_v1::RevisionIdentifier {
-                branch_id: branch.into(),
+    let max_items = history_step_size as usize + 1;
+    let walk = cache::revision::walk_segment_revisions(repository, anchor, first_number, max_items)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+    if !walk.reached_terminator {
+        return Err(Status::internal(format!(
+            "forward cursor descent from {anchor} exceeded {max_items} hops without \
+             resolving the successor of revision {first_number}",
+        )));
+    }
+
+    Ok(walk
+        .items
+        .into_iter()
+        .rev()
+        .find(|item| item.number > first_number)
+        .map(|item| item.signature))
+}
+
+/// Walks `parent_self` from `anchor` down to the lowest revision numbered
+/// strictly above `first_number`, without assuming the gap fits in one
+/// band, or `None` when `anchor` is not numbered above it. When `step_keys` acceleration is enabled, writes the
+/// step-boundary skip pointer for every boundary the walk crosses, so a
+/// request that pays this walk's cost once leaves the fast path in place
+/// for later requests instead of leaving every subsequent lookup to
+/// rediscover the same gap.
+///
+/// Deliberately uncapped by hop count: revision numbers strictly decrease
+/// along `parent_self`, so this always terminates at `first_number` or the
+/// root, bounded only by the branch's real history depth — the same
+/// guarantee `resolve_start`'s `FullIteration` fallback already relies on
+/// via `revision::resolve` when no acceleration is
+/// available. An item-count cap here would fail requests anchored deep in
+/// a long, legitimately un-accelerated history — worse, retrying such a
+/// request would fail identically every time, since this always restarts
+/// from `anchor` and backfills top-down without ever reaching the
+/// boundary nearer `first_number` that a retry's first probe would check.
+/// `RevisionList` is wrapped in `timeout_grpc` at the service layer, which
+/// is the appropriate backstop for a pathologically deep walk, not a
+/// count that silently caps correctness.
+async fn descend_unverified_gap(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    anchor: Hash,
+    first_number: u64,
+    history_step_size: u64,
+    step_keys_enabled: bool,
+) -> Result<Option<Hash>, Status> {
+    let mut hash = anchor;
+    let mut prev_state: Option<Arc<state::State>> = None;
+    // Invariant: `last_above` is the most recently visited hash whose
+    // number was confirmed `> first_number`, if any.
+    let mut last_above = None;
+    let mut hops: u64 = 0;
+    let mut sealed: u64 = 0;
+
+    loop {
+        let current_state = state::State::deserialize(repository.clone(), hash)
+            .await
+            .filter_slow_down()?
+            .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+        let number = current_state.revision_number();
+
+        hops += 1;
+        if hops.is_multiple_of(GAP_DESCENT_PROGRESS_HOPS) {
+            debug!(
+                {BRANCH} = %branch, hops, number, first_number, sealed,
+                "Forward-cursor gap descent still walking",
+            );
+        }
+
+        if step_keys_enabled
+            && let Some(previous_state) = &prev_state
+            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
                 number,
-            })),
-        });
-        request.metadata_mut().insert_bin(
-            REPOSITORY_ID_KEY,
-            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-        );
-        request
+                previous_state.revision_number(),
+                history_step_size,
+            )
+        {
+            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+                // Counts what reached the store, not what was attempted:
+                // a descent reporting repairs it did not make reads as a
+                // fast path restored, when the next request will walk the
+                // same distance again.
+                if cache::revision::seal_boundary_revision_number(
+                    repository.clone(),
+                    branch,
+                    history_step_size,
+                    boundary,
+                    &current_state,
+                    previous_state,
+                )
+                .await
+                .is_ok()
+                {
+                    sealed += 1;
+                }
+            }
+        }
+
+        if number <= first_number {
+            debug!(
+                {BRANCH} = %branch, %anchor, first_number, hops, sealed,
+                "Forward-cursor gap descent complete",
+            );
+            return Ok(last_above);
+        }
+        last_above = Some(hash);
+        hash = current_state.parent_self();
+        prev_state = Some(current_state);
+    }
+}
+
+/// Looks up the revision whose `parent_self` is items[0]'s signature —
+/// i.e. the cursor for the next newer page. Revision numbers increase
+/// strictly along `parent_self`, so that revision is exactly the lowest
+/// one numbered above items[0]; this walks the skip-pointer chain
+/// upward from the current page to find it, rather than assuming
+/// `items[0].number + 1` exists (a merge or fast-forward can leave
+/// numbering gaps). Returns `Ok(None)` when no revision of the branch is
+/// numbered above items[0]: items[0] is the branch's latest revision, or
+/// one numbered above it that the branch does not reach, such as a
+/// revision a client stored but has not pushed.
+async fn forward_cursor(
+    repository: &Arc<RepositoryContext>,
+    walked: &Walked,
+    lineage: Option<&BranchLineage>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Option<Hash>, Status> {
+    let Some(first) = walked.items.first() else {
+        return Ok(None);
+    };
+    let Some(page_branch) = walked.branch else {
+        return Ok(None);
+    };
+    let first_number = first.number;
+    // A page created on the requested branch has its successor there too. A
+    // page from an ancestor ends at a branch point, whose successor sits on
+    // whichever branch holds the next number in the requested branch's history.
+    let owner = match lineage {
+        Some(lineage) if lineage.branch() != page_branch => {
+            lineage
+                .owner_of(repository, first_number.saturating_add(1))
+                .await?
+        }
+        _ => None,
+    };
+    let branch = owner.map_or(page_branch, |owner| owner.branch);
+    let first_signature = Hash::from(first.signature.as_ref());
+
+    let latest = branch::load_latest(repository.clone(), branch)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| {
+            if err.is_branch_not_found() {
+                Status::not_found(format!("Branch {branch} not found: {err}"))
+            } else {
+                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+            }
+        })?;
+    if latest.is_zero() || latest == first_signature {
+        return Ok(None);
     }
 
-    fn make_request_signature(
-        repository: RepositoryId,
-        signature: Hash,
-    ) -> Request<RevisionListRequest> {
-        let mut request = Request::new(RevisionListRequest {
-            start: Some(Start::Signature(signature.into())),
-        });
-        request.metadata_mut().insert_bin(
-            REPOSITORY_ID_KEY,
-            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-        );
-        request
-    }
-
-    /// Push `count` chained revisions to a freshly-created branch.
-    /// Returns `(branch_id, signatures-newest-first)`.
-    async fn create_branch_with_history(
-        repository: &Arc<RepositoryContext>,
-        count: u64,
-    ) -> (BranchId, Vec<Hash>) {
-        let write_token = get_write_token();
-        let branch_id = BranchId::from(uuid::Uuid::now_v7());
-        branch::create(
-            repository.clone(),
-            &write_token,
-            branch_id,
-            "test-branch",
-            branch::default_category(),
-            "creator",
-            1,
-            vec![],
-            false,
+    // With step-key acceleration disabled, `forward_anchor` has nothing to
+    // probe — every read it would perform is exactly the data this flag is
+    // documented to gate (`RevisionListAcceleration::step_keys`: "read +
+    // write"). `latest` is the only anchor available; descend from it
+    // directly, same as `resolve_start` falling through to `FullIteration`.
+    if !acceleration.step_keys {
+        debug!({BRANCH} = %branch, first_number, "forward_cursor - descend_unverified_gap");
+        return descend_unverified_gap(
+            repository,
+            branch,
+            latest,
+            first_number,
+            history_step_size,
             false,
         )
-        .await
-        .expect("create branch");
+        .await;
+    }
 
-        let mut signatures = Vec::with_capacity(count as usize);
-        let mut parent = Hash::default();
-        for n in 1..=count {
-            // The state's metadata blob has to carry `branch` so the
-            // forward-cursor lookup can derive it from items[0].
-            let mut metadata = Metadata::new();
-            metadata.set_branch(branch_id).expect("set branch");
-            let metadata_hash = metadata
-                .serialize(repository.clone())
-                .await
-                .expect("serialize metadata");
+    debug!({BRANCH} = %branch, first_number, "forward_cursor - find forward anchor");
+    let anchor = forward_anchor(
+        repository,
+        branch,
+        first_number,
+        first_signature,
+        latest,
+        history_step_size,
+    )
+    .await?;
 
-            let state = State::new();
-            state.set_parent_self(parent);
-            state.set_revision_number(n);
-            state.set_metadata_hash(metadata_hash);
-            let serialized = state
-                .serialize(repository.clone(), &write_token)
-                .await
-                .expect("serialize state");
-            let pushed = branch_push::push(
-                repository.clone(),
-                branch_id,
-                serialized,
-                true,
-                true,
-                false,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
+    let target = match anchor {
+        ForwardAnchor::Sealed { anchor, boundary } => {
+            debug!({BRANCH} = %branch, boundary, "forward_cursor - calculating from sealed");
+            forward_target(
+                repository,
+                branch,
+                anchor,
+                Some(boundary),
+                first_number,
+                history_step_size,
+                acceleration.list_cache,
             )
-            .await
-            .expect("push revision")
-            .revision;
-            signatures.push(pushed);
-            parent = pushed;
+            .await?
         }
-        signatures.reverse();
-        (branch_id, signatures)
-    }
-
-    #[tokio::test]
-    async fn unset_start_returns_invalid_argument() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let mut request = Request::new(RevisionListRequest { start: None });
-            request.metadata_mut().insert_bin(
-                REPOSITORY_ID_KEY,
-                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-            );
-            let err = handler(
-                request,
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect_err("unset start should fail");
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn lists_branch_history_via_tip_identifier() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
+        ForwardAnchor::LatestBand { anchor } => {
+            debug!({BRANCH} = %branch, "forward_cursor - calculating from latest band");
+            forward_target(
                 repository,
-            ));
-            let (branch_id, signatures) = create_branch_with_history(&repository_context, 3).await;
-
-            let response = handler(
-                make_request_identifier(repository, branch_id, 0),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
+                branch,
+                anchor,
+                None,
+                first_number,
+                history_step_size,
+                acceleration.list_cache,
             )
-            .await
-            .expect("Request failed");
-
-            // Strategy header should reflect the direct tip path.
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("direct"),
+            .await?
+        }
+        ForwardAnchor::UnverifiedGap { anchor } => {
+            debug!(
+                {BRANCH} = %branch, first_number, %anchor,
+                "forward_cursor - calculating from unverified gap",
             );
-
-            let inner = response.into_inner();
-            assert_eq!(inner.items.len(), 3);
-            assert_eq!(Hash::from(inner.items[0].signature.as_ref()), signatures[0]);
-            assert_eq!(inner.items[0].number, 3);
-            assert_eq!(Hash::from(inner.items[2].signature.as_ref()), signatures[2]);
-            assert_eq!(inner.items[2].number, 1);
-            assert!(inner.signature_forward.is_none());
-            assert!(inner.signature_backward.is_none());
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn empty_branch_returns_no_items() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
+            descend_unverified_gap(
                 repository,
-            ));
-            let write_token = get_write_token();
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            branch::create(
-                repository_context,
-                &write_token,
-                branch_id,
-                "empty-branch",
-                branch::default_category(),
-                "creator",
-                1,
-                vec![],
-                false,
-                false,
+                branch,
+                anchor,
+                first_number,
+                history_step_size,
+                acceleration.step_keys,
             )
-            .await
-            .expect("create empty branch");
-
-            let response = handler(
-                make_request_identifier(repository, branch_id, 0),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed")
-            .into_inner();
-            // Empty branch resolves tip to zero hash; walk exits with
-            // no items, no cursors.
-            assert!(response.items.is_empty());
-            assert!(response.signature_forward.is_none());
-            assert!(response.signature_backward.is_none());
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn pages_via_signature_backward_cursor_segment_aligned() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            // 250 revisions, step=100. Segments 100 and 200 are closed
-            // (their +step boundary was crossed by subsequent pushes).
-            // Segment 300 is open (rev 250 sits in it).
-            let (branch_id, signatures) =
-                create_branch_with_history(&repository_context, 250).await;
-
-            // Page 1: tip → rev 250, in open segment 300. Walk is
-            // segment-aligned: floor = 201, items 250..201 (50), then
-            // current_number=200 < floor, so next_older = rev 200.
-            let first_page = handler(
-                make_request_identifier(repository, branch_id, 0),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("first page")
-            .into_inner();
-            assert_eq!(first_page.items.len(), 50);
-            assert_eq!(first_page.items[0].number, 250);
-            assert_eq!(first_page.items[49].number, 201);
-            let backward = first_page
-                .signature_backward
-                .clone()
-                .expect("backward cursor");
-            assert_eq!(Hash::from(backward.as_ref()), signatures[250 - 200]);
-            assert!(first_page.signature_forward.is_none());
-
-            // Page 2: anchor = rev 200, in closed segment 200 (cached).
-            // Cache serves items 200..101. Forward cursor targets rev
-            // 201; seg 300's step key isn't registered (only 250 revs
-            // exist), so no forward cursor.
-            let second_page = handler(
-                make_request_signature(repository, Hash::from(backward.as_ref())),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("second page");
-            assert_eq!(
-                second_page
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-            let second_page = second_page.into_inner();
-            assert_eq!(second_page.items.len(), MAX_REVISION_LIST_RESPONSE_ITEMS);
-            assert_eq!(second_page.items[0].number, 200);
-            assert_eq!(
-                second_page.items[MAX_REVISION_LIST_RESPONSE_ITEMS - 1].number,
-                101,
-            );
-            assert!(second_page.signature_forward.is_none());
-            // Backward cursor: parent of items[N-1] = rev 101 is rev 100,
-            // the segment-100 anchor for the next-older page.
-            let next_backward = second_page
-                .signature_backward
-                .clone()
-                .expect("backward cursor on second page");
-            assert_eq!(Hash::from(next_backward.as_ref()), signatures[250 - 100]);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn lists_via_by_number_identifier_uses_list_cache_strategy() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, signatures) =
-                create_branch_with_history(&repository_context, 250).await;
-
-            // Revision 100 sits in the closed segment whose List_100
-            // cache entry was populated when revision 101 was pushed.
-            let response = handler(
-                make_request_identifier(repository, branch_id, 100),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-            let inner = response.into_inner();
-            assert_eq!(inner.items.len(), 100);
-            assert_eq!(inner.items[0].number, 100);
-            assert_eq!(
-                Hash::from(inner.items[0].signature.as_ref()),
-                signatures[250 - 100],
-            );
-            // Cache items carry the serialized state header.
-            assert_eq!(
-                inner.items[0].state.len(),
-                std::mem::size_of::<lore_revision::state::StateData>(),
-            );
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn lists_via_signature_anchor() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            // 250 revisions: segment 100 closes when revision 101 is
-            // pushed, so List_100 is populated. The signature anchor
-            // at revision 100 hits that cache.
-            let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
-
-            let anchor = signatures[250 - 100];
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-            let inner = response.into_inner();
-            assert_eq!(inner.items[0].number, 100);
-            // Forward cursor for target=101 walks from the step key at
-            // 200 down to 101.
-            let forward = inner.signature_forward.expect("forward cursor");
-            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 101]);
-            // Backward cursor is None: cached items cover 100..1 and
-            // items[N-1] = revision 1's parent is the zero hash.
-            assert!(inner.signature_backward.is_none());
-            // Cache items carry the serialized state header.
-            assert_eq!(
-                inner.items[0].state.len(),
-                std::mem::size_of::<lore_revision::state::StateData>(),
-            );
-        }))
-        .await;
-    }
-
-    /// Wipe the cached `List_100` entry to simulate eviction. The next
-    /// identifier-anchored request must rebuild it via the
-    /// list-cache-backfill path, and a subsequent request must hit the
-    /// fast path.
-    #[tokio::test]
-    async fn identifier_backfills_when_cache_missing_but_next_skip_exists() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
-
-            let (key, key_type) = branch::revision_list_step_key(
-                lore_revision::repository::SALT_LORE,
-                repository,
-                branch_id,
-                100,
-                DEFAULT_HISTORY_STEP_SIZE,
-            );
-
-            // Storing zero deletes the mutable store entry.
-            mutable_store
-                .clone()
-                .store(repository, key, Hash::default(), key_type)
-                .await
-                .expect("evict cache entry");
-            assert!(
-                mutable_store
-                    .clone()
-                    .load(repository, key, key_type)
-                    .await
-                    .is_err(),
-                "cache should be evicted",
-            );
-
-            let response = handler(
-                make_request_identifier(repository, branch_id, 50),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("first call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache-backfill"),
-            );
-
-            let response = handler(
-                make_request_identifier(repository, branch_id, 50),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("second call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn forward_cursor_is_none_when_no_step_key_covers_target() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            // 50 revisions: only block 0 is populated; no step key
-            // ever registered (no boundary crossing happened).
-            // Anchor at revision 25 — target 26 has no step key
-            // registered, so forward cursor must be None.
-            let (_branch, signatures) = create_branch_with_history(&repository_context, 50).await;
-
-            let anchor = signatures[50 - 25];
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed")
-            .into_inner();
-            assert_eq!(response.items[0].number, 25);
-            assert!(response.signature_forward.is_none());
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn unknown_signature_returns_not_found() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let bogus = Hash::from(random::<[u8; 32]>());
-            let err = handler(
-                make_request_signature(repository, bogus),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect_err("unknown signature should fail");
-            assert_eq!(err.code(), tonic::Code::NotFound);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn unknown_identifier_returns_not_found() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let unknown_branch = BranchId::from(uuid::Uuid::now_v7());
-            let err = handler(
-                make_request_identifier(repository, unknown_branch, 0),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect_err("unknown branch should fail");
-            assert_eq!(err.code(), tonic::Code::NotFound);
-        }))
-        .await;
-    }
-
-    /// Signature anchor pointing mid-segment must return the full
-    /// cached segment (200..101), not just the items from the anchor
-    /// down. The anchor is guaranteed to appear in the response per
-    /// the relaxed v1 contract.
-    #[tokio::test]
-    async fn mid_segment_signature_returns_full_cached_segment() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
-
-            // Revision 150 sits mid-way in closed segment 200.
-            let anchor = signatures[250 - 150];
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-            let inner = response.into_inner();
-            // Full segment served: 200..101 inclusive.
-            assert_eq!(inner.items.len(), MAX_REVISION_LIST_RESPONSE_ITEMS);
-            assert_eq!(inner.items[0].number, 200);
-            assert_eq!(
-                inner.items[MAX_REVISION_LIST_RESPONSE_ITEMS - 1].number,
-                101,
-            );
-            // The anchor lives somewhere in the page (not items[0]).
-            let anchor_position = inner
-                .items
-                .iter()
-                .position(|item| Hash::from(item.signature.as_ref()) == anchor)
-                .expect("anchor must appear in cached page");
-            assert_eq!(inner.items[anchor_position].number, 150);
-            assert_ne!(anchor_position, 0, "anchor is mid-page, not items[0]");
-        }))
-        .await;
-    }
-
-    /// Evict `List_100` and request `rev_50` by signature. The handler's
-    /// signature path must rebuild the segment via backfill (the +step
-    /// skip pointer at seg 200 exists, so the segment is backfillable)
-    /// and report the `list-cache-backfill` strategy. Subsequent calls
-    /// then hit the warm cache.
-    #[tokio::test]
-    async fn signature_path_backfills_evicted_segment() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, signatures) =
-                create_branch_with_history(&repository_context, 250).await;
-
-            // Evict the List_100 cache entry.
-            let (key, key_type) = branch::revision_list_step_key(
-                lore_revision::repository::SALT_LORE,
-                repository,
-                branch_id,
-                100,
-                DEFAULT_HISTORY_STEP_SIZE,
-            );
-            mutable_store
-                .clone()
-                .store(repository, key, Hash::default(), key_type)
-                .await
-                .expect("evict cache");
-
-            let anchor = signatures[250 - 50];
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("first call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache-backfill"),
-            );
-            // Backfill returned the same page the cache would now hold.
-            let inner = response.into_inner();
-            assert_eq!(inner.items.len(), MAX_REVISION_LIST_RESPONSE_ITEMS);
-            assert_eq!(inner.items[0].number, 100);
-            assert_eq!(inner.items[MAX_REVISION_LIST_RESPONSE_ITEMS - 1].number, 1,);
-
-            // Subsequent call: warm cache.
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("second call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-        }))
-        .await;
-    }
-
-    /// Signature in an open segment (no cache, no backfill possible
-    /// because the +step skip pointer doesn't exist yet) must fall
-    /// through to the direct walk, and the walk must be segment-aligned.
-    #[tokio::test]
-    async fn open_segment_signature_walk_is_segment_aligned() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            // 250 revs: segment 300 is open (rev 250 lives there but
-            // nothing crosses into seg 400 to register the +step key).
-            let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
-
-            // Anchor rev 220 — mid-open-segment-300. Floor = 201.
-            let anchor = signatures[250 - 220];
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("direct"),
-            );
-            let inner = response.into_inner();
-            // Walk segment-aligned: items 220..201 (20 items), not the
-            // full 100-item walk.
-            assert_eq!(inner.items.len(), 20);
-            assert_eq!(inner.items[0].number, 220);
-            assert_eq!(inner.items[19].number, 201);
-            // Backward = parent_self of rev_201 = rev_200.
-            let backward = inner.signature_backward.expect("backward cursor");
-            assert_eq!(Hash::from(backward.as_ref()), signatures[250 - 200]);
-        }))
-        .await;
-    }
-
-    /// Stuff the mutable store with a cache blob whose header version
-    /// is wrong. The loader must discard it (debug-logged), backfill
-    /// rebuilds with the current version, and the strategy is reported
-    /// as `list-cache-backfill`.
-    #[tokio::test]
-    async fn mismatched_cache_version_is_discarded_and_rebuilt() {
-        use zerocopy::IntoBytes;
-
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
-
-            // Overwrite the List_100 entry with a blob whose header
-            // carries a future/unknown version. Correct magic, wrong
-            // version — exercises the version-mismatch branch of the
-            // header check.
-            let bogus_header = branch::CachedRevisionListHeader {
-                magic: branch::CACHED_REVISION_LIST_MAGIC,
-                version: branch::CACHED_REVISION_LIST_VERSION + 99,
-            };
-            let bogus_item = branch::CachedRevisionItem {
-                number: 100,
-                signature: Hash::default(),
-                metadata: Hash::default(),
-                state: lore_revision::state::StateData::default(),
-            };
-            let mut buffer = bytes::BytesMut::new();
-            buffer.extend_from_slice(bogus_header.as_bytes());
-            buffer.extend_from_slice([bogus_item].as_bytes());
-            let (address, _) = lore_revision::immutable::write(
-                repository_context.clone(),
-                lore_storage::Context::default(),
-                buffer.freeze(),
-                lore_revision::immutable::write_options_from_repository(repository_context.clone()),
-            )
-            .await
-            .expect("write bogus blob");
-
-            let (key, key_type) = branch::revision_list_step_key(
-                lore_revision::repository::SALT_LORE,
-                repository,
-                branch_id,
-                100,
-                DEFAULT_HISTORY_STEP_SIZE,
-            );
-            mutable_store
-                .clone()
-                .store(repository, key, address.hash, key_type)
-                .await
-                .expect("install bogus blob");
-
-            // First call must reject the bogus blob and rebuild.
-            let response = handler(
-                make_request_identifier(repository, branch_id, 50),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("first call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache-backfill"),
-            );
-            let inner = response.into_inner();
-            assert_eq!(inner.items.len(), 100);
-            assert_eq!(inner.items[0].number, 100);
-            assert_eq!(inner.items[99].number, 1);
-
-            // Second call: cache is now rebuilt with the current
-            // format, so the fast path takes over.
-            let response = handler(
-                make_request_identifier(repository, branch_id, 50),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("second call");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("list-cache"),
-            );
-        }))
-        .await;
-    }
-
-    /// Every response item carries a `state` field that round-trips
-    /// back to a `StateData` whose `revision_number` matches the item.
-    /// Covers both the cache fast path (item 100) and the walk path
-    /// (item 220 in the open segment 300).
-    #[tokio::test]
-    async fn item_state_round_trips_to_state_data() {
-        use zerocopy::FromBytes;
-
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, signatures) =
-                create_branch_with_history(&repository_context, 250).await;
-
-            // Cache fast path: identifier rev 100.
-            let response = handler(
-                make_request_identifier(repository, branch_id, 100),
-                immutable_store.clone(),
-                mutable_store.clone(),
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("cache fast path")
-            .into_inner();
-            for item in &response.items {
-                let state = lore_revision::state::StateData::read_from_bytes(item.state.as_ref())
-                    .expect("state bytes must round-trip");
-                assert_eq!(state.revision_number, item.number);
-            }
-
-            // Walk path: signature for rev 220 (open seg 300, no cache).
-            let response = handler(
-                make_request_signature(repository, signatures[250 - 220]),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                crate::grpc::server::RevisionListAcceleration::default(),
-                &make_instruments(),
-            )
-            .await
-            .expect("walk path")
-            .into_inner();
-            assert!(!response.items.is_empty());
-            for item in &response.items {
-                let state = lore_revision::state::StateData::read_from_bytes(item.state.as_ref())
-                    .expect("state bytes must round-trip");
-                assert_eq!(state.revision_number, item.number);
-            }
-        }))
-        .await;
-    }
-
-    /// With `list_cache = false`, identifier lookups for revisions in
-    /// closed segments must NOT serve from cache. The handler falls
-    /// through to the step-key path (history-step strategy here, since
-    /// `step_keys` is still on).
-    #[tokio::test]
-    async fn list_cache_disabled_skips_cache() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
-
-            let acceleration = crate::grpc::server::RevisionListAcceleration {
-                step_keys: true,
-                list_cache: false,
-            };
-            let response = handler(
-                make_request_identifier(repository, branch_id, 100),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                acceleration,
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("history-step"),
-            );
-        }))
-        .await;
-    }
-
-    /// With `step_keys = false` (and cache also off), identifier
-    /// lookups fall through to the full-iteration walk.
-    #[tokio::test]
-    async fn both_disabled_falls_through_to_full_iteration() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
-
-            let acceleration = crate::grpc::server::RevisionListAcceleration {
-                step_keys: false,
-                list_cache: false,
-            };
-            let response = handler(
-                make_request_identifier(repository, branch_id, 100),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                acceleration,
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("full-iteration"),
-            );
-        }))
-        .await;
-    }
-
-    /// With `list_cache = false`, a signature lookup that would
-    /// otherwise hit the cache must instead walk directly. The walker
-    /// is still segment-aligned.
-    #[tokio::test]
-    async fn list_cache_disabled_signature_uses_direct_walk() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let (_branch, signatures) = create_branch_with_history(&repository_context, 250).await;
-
-            // Anchor rev 150, mid-segment 200. Cached, but we disable.
-            let anchor = signatures[250 - 150];
-            let acceleration = crate::grpc::server::RevisionListAcceleration {
-                step_keys: true,
-                list_cache: false,
-            };
-            let response = handler(
-                make_request_signature(repository, anchor),
-                immutable_store,
-                mutable_store,
-                DEFAULT_HISTORY_STEP_SIZE,
-                acceleration,
-                &make_instruments(),
-            )
-            .await
-            .expect("Request failed");
-            assert_eq!(
-                response
-                    .metadata()
-                    .get(REVISION_LIST_STRATEGY_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                Some("direct"),
-            );
-            let inner = response.into_inner();
-            // Segment-aligned walk: rev 150 down to floor 101.
-            assert_eq!(inner.items.len(), 50);
-            assert_eq!(inner.items[0].number, 150);
-            assert_eq!(inner.items[49].number, 101);
-        }))
-        .await;
-    }
+            .await?
+        }
+    };
+    Ok(target)
 }

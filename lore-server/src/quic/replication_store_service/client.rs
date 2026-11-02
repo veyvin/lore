@@ -10,8 +10,6 @@ use bytes::Bytes;
 use lore_base::error::AddressNotFound;
 use lore_base::error::PayloadNotFound;
 use lore_base::error::SlowDown;
-use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_base::types::Address;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
@@ -19,12 +17,14 @@ use lore_base::types::Partition;
 use lore_revision::lore_debug;
 use lore_revision::runtime::execution_context;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_telemetry::LabelArray;
 use lore_telemetry::observe::observe_result;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 use lore_transport::ProtocolError;
 use lore_transport::quic::QuicClientError;
+use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::client::AuthAdapter;
 use lore_transport::quic::client::CertificateSettings;
 pub use lore_transport::quic::client::ConnectionStats;
@@ -34,6 +34,8 @@ use lore_transport::quic::client::SendWithReconnectError;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::connect;
+use lore_transport::quic::client::send_client_identify;
+use lore_transport::quic::client::send_high_priority_with_reconnect;
 use lore_transport::quic::client::send_normal_with_reconnect;
 use opentelemetry::KeyValue;
 use thiserror::Error;
@@ -42,10 +44,11 @@ use tokio::sync::SemaphorePermit;
 use tracing::trace;
 use tracing::warn;
 
-use crate::protocol::replication_store::exists_batch::ExistsBatch;
-use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
+use crate::protocol::replication_store::copy::ImmutableCopy;
+use crate::protocol::replication_store::get;
 use crate::protocol::replication_store::get::Get;
-use crate::protocol::replication_store::get::GetResponse;
+use crate::protocol::replication_store::get_metadata;
+use crate::protocol::replication_store::get_metadata::GetMetadata;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::replication_store::obliterate::Obliterate;
 use crate::protocol::replication_store::obliterate::ObliterateResponse;
@@ -83,6 +86,22 @@ impl From<ReplicationServiceErrorCode> for ReplicationStoreClientError {
 
 struct ReplicationStoreAuth {
     certs: CertificateSettings,
+    user_agent: String,
+}
+
+impl ReplicationStoreAuth {
+    async fn announce_user_agent(
+        &self,
+        connection: Arc<QuicConnection>,
+    ) -> Result<(), QuicClientError> {
+        send_client_identify(
+            connection,
+            Command::ClientIdentify as QuicOpCode,
+            false,
+            &self.user_agent,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -91,16 +110,18 @@ impl AuthAdapter for ReplicationStoreAuth {
 
     async fn initial_authorize(
         &self,
-        _connection: Arc<QuicConnection>,
+        connection: Arc<QuicConnection>,
     ) -> Result<(), Self::ErrorType> {
-        Ok(())
+        self.announce_user_agent(connection)
+            .await
+            .map_err(ReplicationStoreClientError::UnexpectedClientError)
     }
 
     async fn reconnect_authorize(
         &self,
-        _connection: Arc<QuicConnection>,
+        connection: Arc<QuicConnection>,
     ) -> Result<(), QuicClientError> {
-        Ok(())
+        self.announce_user_agent(connection).await
     }
 
     fn client_certs(&self) -> CertificateSettings {
@@ -117,12 +138,6 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Put` on the server
     async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-    /// Request an Immutable `ExistsBatch` on the server
-    async fn exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
     /// Request an Immutable `Obliterate` on the server
     async fn obliterate(
         &self,
@@ -130,28 +145,37 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     ) -> Result<ObliterateResponse, ReplicationStoreClientError>;
 
     /// Request an Immutable `Get` on the server
-    async fn get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
+    async fn get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
 
-    /// Request an Immutable `Query` on the server
-    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+    /// Request the representation of an address from the peer
+    async fn get_metadata(
+        &self,
+        request: GetMetadata,
+    ) -> Result<StoreGetData, ReplicationStoreClientError>;
 
     /// Request an Immutable `Put` on the server's local store
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-    /// Request an Immutable `ExistsBatch` on the server's local store
-    async fn local_exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
     /// Request an Immutable `Get` on the server's local store
-    async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
+    async fn local_get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
+
+    /// Request the representation of an address from the peer's local store
+    async fn local_get_metadata(
+        &self,
+        request: GetMetadata,
+    ) -> Result<StoreGetData, ReplicationStoreClientError>;
+
+    /// Request an Immutable `Query` on the server
+    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
 
     /// Request an Immutable `Query` on the server's local store
     async fn local_query(
         &self,
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+    /// Request an Immutable `Copy` on the server
+    async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError>;
 }
 
 #[derive(Clone)]
@@ -172,19 +196,11 @@ pub struct ReplicationStoreClient {
 
 impl Drop for ReplicationStoreClient {
     fn drop(&mut self) {
-        let runtime = runtime();
-        if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            // Only in tests, here we cannot block in place to call the async flush
-            // Just ignore for now, until we actually need to flush on drop in tests
-        } else {
-            trace!("ReplicationStoreClient drop block on readers in place");
-            tokio::task::block_in_place(move || {
-                runtime.block_on(LORE_CONTEXT.scope(execution_context(), async move {
-                    self.quic.close().await;
-                }));
-            });
-        }
-
+        // Close the QUIC connection immediately without draining streams. Quinn sends
+        // a CLOSE frame and RSTs open streams; the server cleans up sessions on
+        // connection close. Non-blocking, so Drop never stalls a per-core worker -
+        // this fires on every client refresh/reconnect, not just at shutdown.
+        self.quic.close_immediate();
         trace!("ReplicationStoreClient dropped");
     }
 }
@@ -200,11 +216,13 @@ impl ReplicationStoreClient {
         transport_config: TransportConfig,
         command_behavior: CommandBehavior,
         max_reconnects: Option<u32>,
+        user_agent: Option<String>,
     ) -> Result<Self, ProtocolError> {
         trace!("ReplicationStoreClient connecting to {remote_url}");
 
         let start = Instant::now();
-        let auth = Arc::new(ReplicationStoreAuth { certs });
+        let user_agent = user_agent.unwrap_or_else(|| lore_transport::user_agent().to_string());
+        let auth = Arc::new(ReplicationStoreAuth { certs, user_agent });
 
         let quinn = connect(
             &EndpointConfig {
@@ -239,8 +257,16 @@ impl ReplicationStoreClient {
         client.quic.create_initial_stream().await.map_err(|e| {
             lore_debug!("ReplicationStoreClient connection {connection_id} to {remote_url} - error making initial stream: {e:?}");
             ProtocolError::internal(format!("connecting to {remote_url}"))
-        }
-        )?;
+        })?;
+
+        client
+            .auth
+            .initial_authorize(client.quic.clone())
+            .await
+            .map_err(|err| {
+                ProtocolError::internal(format!("authorizing connection to {remote_url}: {err}"))
+            })?;
+
         client.quic.stream_count.store(1, Ordering::Relaxed);
 
         lore_debug!(
@@ -261,33 +287,26 @@ impl ReplicationStoreClient {
         Ok(())
     }
 
-    async fn send_exists_batch(
-        &self,
-        request: ExistsBatch,
-        command: Command,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        let num_input_addresses = request.addresses.len();
-        let quic_chunks = request.to_quic_chunks();
-        let response_bytes =
-            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
-        let response = ExistsBatchResponse::parse(response_bytes)?;
-        if num_input_addresses != response.matches.len() {
-            return Err(ReplicationStoreClientError::ResponseError(
-                "response length mismatch",
-            ));
-        }
-        Ok(response)
-    }
-
     async fn send_get(
         &self,
         request: Get,
         command: Command,
-    ) -> Result<GetResponse, ReplicationStoreClientError> {
+    ) -> Result<StoreGetData, ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
-        let response_chunks =
+        let response_bytes =
             send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
-        GetResponse::parse(response_chunks)
+        get::parse_response(response_bytes)
+    }
+
+    async fn send_metadata(
+        &self,
+        request: GetMetadata,
+        command: Command,
+    ) -> Result<StoreGetData, ReplicationStoreClientError> {
+        let quic_chunks = request.to_quic_chunks();
+        let response_bytes =
+            send_high_priority_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+        get_metadata::parse_response(response_bytes)
     }
 
     async fn send_query(
@@ -295,10 +314,17 @@ impl ReplicationStoreClient {
         request: Query,
         command: Command,
     ) -> Result<QueryResponse, ReplicationStoreClientError> {
+        let num_input_addresses = request.addresses.len();
         let quic_chunks = request.to_quic_chunks();
-        let response_chunks =
-            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
-        QueryResponse::parse(response_chunks)
+        let response_bytes =
+            send_high_priority_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+        let response = QueryResponse::parse(response_bytes)?;
+        if num_input_addresses != response.results.len() {
+            return Err(ReplicationStoreClientError::ResponseError(
+                "response length mismatch",
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -310,14 +336,6 @@ impl StoreClient for ReplicationStoreClient {
 
     async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError> {
         self.send_put(request, Command::ImmutablePut).await
-    }
-
-    async fn exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        self.send_exists_batch(request, Command::ImmutableExistBatch)
-            .await
     }
 
     async fn obliterate(
@@ -333,28 +351,36 @@ impl StoreClient for ReplicationStoreClient {
         Ok(ObliterateResponse::parse(response_chunks)?)
     }
 
-    async fn get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError> {
+    async fn get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError> {
         self.send_get(request, Command::ImmutableGet).await
     }
 
-    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError> {
-        self.send_query(request, Command::ImmutableQuery).await
+    async fn get_metadata(
+        &self,
+        request: GetMetadata,
+    ) -> Result<StoreGetData, ReplicationStoreClientError> {
+        self.send_metadata(request, Command::ImmutableGetMetadata)
+            .await
     }
 
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError> {
         self.send_put(request, Command::ImmutableLocalPut).await
     }
 
-    async fn local_exists_batch(
+    async fn local_get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError> {
+        self.send_get(request, Command::ImmutableLocalGet).await
+    }
+
+    async fn local_get_metadata(
         &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        self.send_exists_batch(request, Command::ImmutableLocalExistBatch)
+        request: GetMetadata,
+    ) -> Result<StoreGetData, ReplicationStoreClientError> {
+        self.send_metadata(request, Command::ImmutableLocalGetMetadata)
             .await
     }
 
-    async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError> {
-        self.send_get(request, Command::ImmutableLocalGet).await
+    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError> {
+        self.send_query(request, Command::ImmutableQuery).await
     }
 
     async fn local_query(
@@ -362,6 +388,12 @@ impl StoreClient for ReplicationStoreClient {
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError> {
         self.send_query(request, Command::ImmutableLocalQuery).await
+    }
+
+    async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError> {
+        let quic_chunks = request.to_quic_chunks();
+        send_normal_with_reconnect(self, Command::ImmutableCopy, 0, || quic_chunks.clone()).await?;
+        Ok(())
     }
 }
 
@@ -552,131 +584,5 @@ pub fn observe_client_interaction<ResponseType>()
             },
         };
         labels.push(KeyValue::new("handled_status", handled_value));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn throttling_errors_map_to_slow_down() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ClientSideThrottling,
-            &meta,
-        );
-        assert!(matches!(error, StoreError::SlowDown(_)));
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ServerSideMessageThrottling,
-            &meta,
-        );
-        assert!(matches!(error, StoreError::SlowDown(_)));
-    }
-
-    #[test]
-    fn service_error_address_not_found_maps_correctly() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ServiceError(ReplicationServiceErrorCode::AddressNotFound),
-            &meta,
-        );
-        assert!(matches!(error, StoreError::AddressNotFound(_)));
-    }
-
-    #[test]
-    fn service_error_slow_down_maps_correctly() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ServiceError(ReplicationServiceErrorCode::SlowDown),
-            &meta,
-        );
-        assert!(matches!(error, StoreError::SlowDown(_)));
-    }
-
-    #[test]
-    fn service_error_payload_not_found_maps_correctly() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ServiceError(ReplicationServiceErrorCode::PayloadNotFound),
-            &meta,
-        );
-        assert!(matches!(error, StoreError::PayloadNotFound(_)));
-    }
-
-    #[test]
-    fn service_error_internal_maps_correctly() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ServiceError(ReplicationServiceErrorCode::Internal),
-            &meta,
-        );
-        assert!(matches!(error, StoreError::Internal(_)));
-    }
-
-    #[test]
-    fn connection_failed_maps_to_internal() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error =
-            map_client_error_to_store_error(ReplicationStoreClientError::ConnectionFailed, &meta);
-        assert!(matches!(error, StoreError::Internal(_)));
-    }
-
-    #[test]
-    fn make_put_message_rejects_oversized_payload() {
-        let payload = Bytes::from(vec![0u8; FRAGMENT_SIZE_THRESHOLD + 1]);
-        let result = make_put_message(
-            Partition::default(),
-            Address::default(),
-            Fragment::default(),
-            Some(payload),
-            false,
-        );
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ReplicationStoreClientError::UnexpectedClientError(
-                QuicClientError::ClientMessageTooBig
-            )
-        ));
-    }
-
-    #[test]
-    fn response_error_maps_to_internal() {
-        let meta = ServiceRequestMeta {
-            client_epoch: 0,
-            address: None,
-        };
-
-        let error = map_client_error_to_store_error(
-            ReplicationStoreClientError::ResponseError("bad response"),
-            &meta,
-        );
-        assert!(matches!(error, StoreError::Internal(_)));
     }
 }

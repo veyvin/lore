@@ -8,16 +8,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::Uri;
+use lore_base::lore_spawn_net;
 use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
 use lore_revision::cluster::peer::Locality;
 use lore_revision::cluster::peer::PeerInfo;
+use lore_revision::store::composite::METRICS_REPLICA_TYPE_LABEL;
+use lore_revision::store::composite::ReplicaType;
 use lore_revision::store::composite::ReplicationTarget;
 use lore_revision::store::composite::replica_factory::ReplicaFactory;
 use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
+use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
-use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
+use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use smallvec::smallvec;
@@ -25,6 +29,8 @@ use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::store::grpc_replica::GrpcReplica;
@@ -58,6 +64,10 @@ pub struct ReplicaFactorySettings {
     /// for peers with the `SameRegion` locality.
     #[serde(default = "default_enable_same_region_write")]
     pub enable_same_region_write: bool,
+    /// Initial congestion window, in bytes, for a new QUIC replica connection, and the floor for
+    /// the window a periodically refreshed connection carries over.
+    #[serde(default = "default_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 fn default_read_replicas_enabled() -> bool {
@@ -72,6 +82,10 @@ fn default_enable_same_region_write() -> bool {
     true
 }
 
+fn default_initial_cwnd_bytes() -> InitialCwndBytes {
+    DEFAULT_PEER_INITIAL_CWND_BYTES
+}
+
 #[derive(Debug)]
 pub struct ReplicationStoreTargetFactory {
     grpc_tls: Option<ClientTlsConfig>,
@@ -82,6 +96,7 @@ pub struct ReplicationStoreTargetFactory {
     use_grpc_write_replication: bool,
     pub quic_monitor_interval: Duration,
     pub enable_same_region_write: bool,
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 impl ReplicationStoreTargetFactory {
@@ -102,6 +117,7 @@ impl ReplicationStoreTargetFactory {
             use_grpc_write_replication,
             quic_monitor_interval: Duration::from_secs(default_quic_client_monitor_interval_secs()),
             enable_same_region_write: true,
+            initial_cwnd_bytes: DEFAULT_PEER_INITIAL_CWND_BYTES,
         }
     }
 
@@ -120,7 +136,9 @@ impl ReplicationStoreTargetFactory {
         if let Some(tls) = &self.grpc_tls {
             endpoint = endpoint.tls_config(tls.clone())?;
         }
-        let channel = endpoint.connect().await?;
+        // Connect from net so the hyper/h2 driver tasks this spawns bind there
+        // rather than to the core runtime the caller runs on.
+        let channel = lore_spawn_net!(async move { endpoint.connect().await }).await??;
         let grpc_client = ReplicationServiceClient::new(channel);
 
         let replication_client = ReplicationClient::new(
@@ -140,6 +158,7 @@ impl ReplicationStoreTargetFactory {
     async fn make_quic_target(
         &self,
         peer_info: &PeerInfo,
+        replica_type: ReplicaType,
     ) -> Result<ReplicationTarget, Box<dyn Error + Send + Sync>> {
         let scheme = if self.quic_certs.client.is_some() {
             "quics"
@@ -154,29 +173,10 @@ impl ReplicationStoreTargetFactory {
             None
         };
 
-        let rtt_ms;
-        let congestion_algorithm;
-        match peer_info.locality {
-            Locality::SameRegion => {
-                rtt_ms = 10;
-                // Communication within a region will have no packet loss
-                // so we don't need to worry about Cubic's aggressive ramp down
-                // of cwnd in the event of packet loss - we don't see it happening.
-                // The benefit of Cubic is that it only adjusts the cwnd in the event of
-                // packet loss. So quiet periods of time don't inadvertently scale down
-                // the cwnd then get blindsided by a large get/put message causing latency spikes.
-                // We want same region replication to be as fast as possible
-                congestion_algorithm = CongestionAlgorithm::Cubic;
-            }
-            Locality::OtherRegion => {
-                // todo(plockhart) configure expected_rtt_ms based off latency to replication target
-                rtt_ms = DEFAULT_EXPECTED_RTT_MS;
-                // We see packet loss in cross region communication. Bbr readjusts the cwnd within
-                // a few cycles of RTT, much faster than Cubic at recoverying from packet loss, at
-                // the expensive that periodically the internals of the algorithm ramp down cwnd
-                // based off bandwidth usage (which means quiet periods inadvertently reduce cwnd)
-                congestion_algorithm = CongestionAlgorithm::Bbr;
-            }
+        let (rtt_ms, user_agent_component) = match peer_info.locality {
+            Locality::SameRegion => (10, "replication-same-region"),
+            // todo(plockhart) configure expected_rtt_ms based off latency to replication target
+            Locality::OtherRegion => (DEFAULT_EXPECTED_RTT_MS, "replication-other-region"),
         };
 
         let mut factory =
@@ -186,7 +186,11 @@ impl ReplicationStoreTargetFactory {
         factory.quic_max_reconnects = Some(5);
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
-        factory.transport_config.congestion_algorithm = congestion_algorithm;
+        factory.transport_config.initial_cwnd = Some(self.initial_cwnd_bytes.get());
+        factory.user_agent = Some(make_user_agent_with_component(
+            user_agent_product(),
+            user_agent_component,
+        ));
 
         let container_config = ClientContainerConfig {
             regenerate_retry_policy: RetryPolicy::builder()
@@ -202,7 +206,10 @@ impl ReplicationStoreTargetFactory {
             container_config,
             smallvec![
                 KeyValue::new(METRICS_PEER_ID_LABEL, peer_info.metric_id.clone()),
-                KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str())
+                KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str()),
+                // A peer serving both roles is two targets holding a connection each. Without
+                // this they record under one series and the two connections' statistics merge.
+                KeyValue::new(METRICS_REPLICA_TYPE_LABEL, replica_type.as_str()),
             ],
         )
         .await?;
@@ -239,14 +246,14 @@ impl ReplicaFactory for ReplicationStoreTargetFactory {
             if self.use_grpc_write_replication && peer_info.locality == Locality::SameRegion {
                 Some(self.make_grpc_write_target(peer_info).await?)
             } else {
-                Some(self.make_quic_target(peer_info).await?)
+                Some(self.make_quic_target(peer_info, ReplicaType::Write).await?)
             }
         } else {
             None
         };
 
         let read = if appropriate_for_read && self.read_replicas_enabled {
-            Some(self.make_quic_target(peer_info).await?)
+            Some(self.make_quic_target(peer_info, ReplicaType::Read).await?)
         } else {
             None
         };

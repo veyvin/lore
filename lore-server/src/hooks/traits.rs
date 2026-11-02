@@ -20,10 +20,10 @@
 //!
 //! The hook system supports a three-phase execution model:
 //!
-//! 1. **Pre-handler** (synchronous): Called BEFORE the operation
+//! 1. **Pre-handler** (asynchronous, awaited): Called BEFORE the operation
 //!    - Read-only access to context
 //!    - Can veto/reject by returning `Err(HookError::Rejected)`
-//!    - Subject to timeout (default 200ms)
+//!    - Cancelled when it exceeds its timeout (default 1s, overridable per hook)
 //!    - Panics are caught and isolated
 //!
 //! 2. **Response handler** (synchronous): Called AFTER the operation succeeds
@@ -57,7 +57,7 @@
 //!         &[HookPoint::BranchPush, HookPoint::BranchCreate]
 //!     }
 //!
-//!     fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+//!     async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
 //!         // Check compliance rules before operation
 //!         if let Some(user) = ctx.user() {
 //!             if user.starts_with("blocked_") {
@@ -180,6 +180,10 @@ pub enum StatusCode {
 
     /// Internal failure → gRPC `INTERNAL`
     Internal,
+
+    /// A dependency the hook needs is temporarily unreachable, so the client
+    /// may retry → gRPC `UNAVAILABLE`
+    Unavailable,
 }
 
 impl std::fmt::Display for StatusCode {
@@ -191,6 +195,7 @@ impl std::fmt::Display for StatusCode {
             StatusCode::InvalidArgument => write!(f, "INVALID_ARGUMENT"),
             StatusCode::Aborted => write!(f, "ABORTED"),
             StatusCode::Internal => write!(f, "INTERNAL"),
+            StatusCode::Unavailable => write!(f, "UNAVAILABLE"),
         }
     }
 }
@@ -390,10 +395,11 @@ impl HookResponse {
 ///
 /// # Execution Model
 ///
-/// 1. **Pre-handler** (synchronous): Called BEFORE the operation
+/// 1. **Pre-handler** (asynchronous, awaited): Called BEFORE the operation
 ///    - Read-only access to context
 ///    - Can veto/reject by returning `Err(HookError::Rejected)`
-///    - Subject to timeout (default 200ms)
+///    - Cancelled when it exceeds its timeout (default 1s, see
+///      [`Hook::pre_handler_timeout`])
 ///    - Panics are caught and isolated
 ///
 /// 2. **Response handler** (synchronous): Called AFTER the operation succeeds
@@ -437,7 +443,7 @@ impl HookResponse {
 ///         &[HookPoint::BranchCreate, HookPoint::BranchPush]
 ///     }
 ///
-///     fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+///     async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
 ///         // Validate branch name in pre-handler (can veto)
 ///         if let Some(branch) = ctx.branch() {
 ///             let branch_str = format!("{:?}", branch);
@@ -487,12 +493,14 @@ pub trait Hook: Send + Sync {
     /// Return an empty slice to disable the hook for all points.
     fn hook_points(&self) -> &'static [HookPoint];
 
-    /// Synchronous pre-handler called BEFORE the operation executes.
+    /// Asynchronous pre-handler called BEFORE the operation executes.
     ///
     /// # Semantics
     ///
-    /// - Executes inline in the request handler thread
+    /// - Awaited by the request handler, so it may wait on I/O
     /// - All enabled hooks' pre-handlers complete before operation begins
+    /// - Cancelled at an await when it exceeds its timeout, which fails the
+    ///   operation with [`HookError::Timeout`]
     /// - Return `Ok(())` to allow the operation to proceed
     /// - Return `Err(HookError::Rejected { ... })` to veto the operation
     ///
@@ -508,9 +516,16 @@ pub trait Hook: Send + Sync {
     ///
     /// Return `HookError::Rejected` to veto the operation with a semantic
     /// status code that maps to gRPC status.
-    fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
         let _ = ctx;
         Ok(())
+    }
+
+    /// The time [`pre_handler`](Hook::pre_handler) may take before it is
+    /// cancelled. `None` uses the dispatcher's timeout, by default
+    /// [`DEFAULT_PRE_HANDLER_TIMEOUT`](crate::hooks::DEFAULT_PRE_HANDLER_TIMEOUT).
+    fn pre_handler_timeout(&self) -> Option<Duration> {
+        None
     }
 
     /// Synchronous response handler called AFTER the operation succeeds,
@@ -587,7 +602,7 @@ pub trait Hook: Send + Sync {
 ///         &[HookPoint::BranchPush]
 ///     }
 ///
-///     fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+///     async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
 ///         println!("{}", self.message);
 ///         Ok(())
 ///     }
@@ -643,247 +658,4 @@ pub trait HookFactory: Send + Sync {
     /// - [`HookError::ConfigError`] - Configuration parsing/validation failed
     /// - [`HookError::InitError`] - Hook initialization failed
     fn create(&self, config: &toml::Value) -> Result<Box<dyn Hook>, HookError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hook_point_display() {
-        assert_eq!(HookPoint::BranchPush.to_string(), "BranchPush");
-        assert_eq!(HookPoint::BranchCreate.to_string(), "BranchCreate");
-        assert_eq!(HookPoint::BranchDelete.to_string(), "BranchDelete");
-        assert_eq!(HookPoint::RepositoryCreate.to_string(), "RepositoryCreate");
-        assert_eq!(HookPoint::Obliterate.to_string(), "Obliterate");
-    }
-
-    #[test]
-    fn test_hook_point_all() {
-        let all = HookPoint::all();
-        assert_eq!(all.len(), 5);
-        assert!(all.contains(&HookPoint::BranchPush));
-        assert!(all.contains(&HookPoint::BranchCreate));
-        assert!(all.contains(&HookPoint::BranchDelete));
-        assert!(all.contains(&HookPoint::RepositoryCreate));
-        assert!(all.contains(&HookPoint::Obliterate));
-    }
-
-    #[test]
-    fn test_hook_point_hash_eq() {
-        use std::collections::HashSet;
-
-        let mut set = HashSet::new();
-        set.insert(HookPoint::BranchPush);
-        set.insert(HookPoint::BranchPush); // Duplicate
-
-        assert_eq!(set.len(), 1);
-        assert!(set.contains(&HookPoint::BranchPush));
-    }
-
-    #[test]
-    fn test_status_code_display() {
-        assert_eq!(
-            StatusCode::PermissionDenied.to_string(),
-            "PERMISSION_DENIED"
-        );
-        assert_eq!(
-            StatusCode::FailedPrecondition.to_string(),
-            "FAILED_PRECONDITION"
-        );
-        assert_eq!(
-            StatusCode::ResourceExhausted.to_string(),
-            "RESOURCE_EXHAUSTED"
-        );
-        assert_eq!(StatusCode::InvalidArgument.to_string(), "INVALID_ARGUMENT");
-        assert_eq!(StatusCode::Aborted.to_string(), "ABORTED");
-    }
-
-    #[test]
-    fn test_hook_error_rejected() {
-        let err = HookError::rejected("test_hook", "Access denied", StatusCode::PermissionDenied);
-        assert_eq!(err.hook_name(), "test_hook");
-        assert_eq!(err.status_code(), Some(StatusCode::PermissionDenied));
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("rejected"));
-        assert!(msg.contains("Access denied"));
-    }
-
-    #[test]
-    fn test_hook_error_rejected_default() {
-        let err = HookError::rejected_default("test_hook", "Validation failed");
-        assert_eq!(err.hook_name(), "test_hook");
-        assert_eq!(err.status_code(), Some(StatusCode::Internal));
-    }
-
-    #[test]
-    fn test_hook_error_execution_failed() {
-        let err = HookError::execution_failed("test_hook", "Something went wrong");
-        assert_eq!(err.hook_name(), "test_hook");
-        assert_eq!(err.status_code(), None);
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("execution failed"));
-        assert!(msg.contains("Something went wrong"));
-    }
-
-    #[test]
-    fn test_hook_error_timeout() {
-        let err = HookError::timeout("test_hook", Duration::from_secs(5));
-        assert_eq!(err.hook_name(), "test_hook");
-        assert_eq!(err.status_code(), None);
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("timed out"));
-        assert!(msg.contains("5s"));
-    }
-
-    #[test]
-    fn test_hook_error_panic() {
-        let err = HookError::panic("test_hook", "panic message");
-        assert_eq!(err.hook_name(), "test_hook");
-        assert_eq!(err.status_code(), None);
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("panicked"));
-        assert!(msg.contains("panic message"));
-    }
-
-    #[test]
-    fn test_hook_error_config_error() {
-        let err = HookError::config_error("test_hook", "missing field 'pattern'");
-        assert_eq!(err.hook_name(), "test_hook");
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("configuration error"));
-        assert!(msg.contains("missing field 'pattern'"));
-    }
-
-    #[test]
-    fn test_hook_error_init_error() {
-        let err = HookError::init_error("test_hook", "failed to connect");
-        assert_eq!(err.hook_name(), "test_hook");
-        let msg = err.to_string();
-        assert!(msg.contains("test_hook"));
-        assert!(msg.contains("initialization failed"));
-        assert!(msg.contains("failed to connect"));
-    }
-
-    #[test]
-    fn test_hook_response_empty() {
-        let response = HookResponse::empty();
-        assert!(response.message.is_none());
-    }
-
-    #[test]
-    fn test_hook_response_default() {
-        let response = HookResponse::default();
-        assert!(response.message.is_none());
-    }
-
-    #[test]
-    fn test_hook_response_with_message() {
-        let response = HookResponse::with_message("hello");
-        assert_eq!(response.message, Some("hello".to_string()));
-    }
-
-    struct MinimalHook;
-
-    #[async_trait]
-    impl Hook for MinimalHook {
-        fn name(&self) -> &'static str {
-            "minimal"
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            &[HookPoint::BranchPush]
-        }
-    }
-
-    #[test]
-    fn test_hook_default_pre_handler() {
-        use lore_revision::lore::RepositoryId;
-
-        let hook = MinimalHook;
-        let ctx = HookContext::builder()
-            .correlation_id("test")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .build();
-
-        let result = hook.pre_handler(&ctx);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_hook_default_post_handler() {
-        use lore_revision::lore::RepositoryId;
-
-        let hook = MinimalHook;
-        let ctx = HookContext::builder()
-            .correlation_id("test")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .build();
-
-        let result = hook.post_handler(&ctx).await;
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_hook_default_response_handler() {
-        use lore_revision::lore::RepositoryId;
-
-        let hook = MinimalHook;
-        let ctx = HookContext::builder()
-            .correlation_id("test")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .build();
-
-        let result = hook.response_handler(&ctx);
-        assert!(result.is_ok());
-        assert!(result.unwrap().message.is_none());
-    }
-
-    struct RejectingHook;
-
-    #[async_trait]
-    impl Hook for RejectingHook {
-        fn name(&self) -> &'static str {
-            "rejecting"
-        }
-
-        fn hook_points(&self) -> &'static [HookPoint] {
-            &[HookPoint::BranchPush]
-        }
-
-        fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-            Err(HookError::rejected(
-                self.name(),
-                "Operation not allowed",
-                StatusCode::PermissionDenied,
-            ))
-        }
-    }
-
-    #[test]
-    fn test_hook_pre_handler_rejection() {
-        use lore_revision::lore::RepositoryId;
-
-        let hook = RejectingHook;
-        let ctx = HookContext::builder()
-            .correlation_id("test")
-            .hook_point(HookPoint::BranchPush)
-            .repository(RepositoryId::default())
-            .build();
-
-        let result = hook.pre_handler(&ctx);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert_eq!(err.hook_name(), "rejecting");
-        assert_eq!(err.status_code(), Some(StatusCode::PermissionDenied));
-    }
 }

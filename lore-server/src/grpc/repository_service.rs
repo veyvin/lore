@@ -15,13 +15,18 @@ use super::handlers::repository_list;
 use super::handlers::repository_metadata_get;
 use super::handlers::repository_metadata_set;
 use super::handlers::repository_query;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::repository_service_server::RepositoryService;
 
 #[derive(Clone)]
 pub struct LoreRepositoryService {
-    environment: EnvironmentConfig,
+    registry: RepositoryRegistry,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -37,13 +42,17 @@ impl InstrumentProvider for LoreRepositoryService {
 impl LoreRepositoryService {
     pub fn new(
         environment: EnvironmentConfig,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
     ) -> Self {
         Self {
-            environment,
+            registry: RepositoryRegistry::of(&environment),
+            authorizer,
+            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -62,10 +71,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .clone()
-                    .and_then(|endpoint| endpoint.auth_url),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
@@ -83,10 +89,8 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .clone()
-                    .and_then(|endpoint| endpoint.auth_url),
+                &self.registry,
+                &self.authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self,
@@ -103,10 +107,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_query::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .clone()
-                    .and_then(|endpoint| endpoint.auth_url),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -122,10 +123,8 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_list::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .clone()
-                    .and_then(|endpoint| endpoint.auth_url),
+                self.repository_catalog.clone(),
+                self.rpc_timeout,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -141,6 +140,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -156,6 +156,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

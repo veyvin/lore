@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -37,7 +36,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event describing one entry in a file's history.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHistoryEventData {
     /// Path of the file.
@@ -56,11 +55,14 @@ pub struct LoreFileHistoryEventData {
     pub size: u64,
     /// Action applied to the file at this revision.
     pub action: LoreFileAction,
+    /// Path the file was moved from at this revision. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreFileHistoryEventData {
     pub fn new(
         path: String,
+        from_path: String,
         repository: Arc<RepositoryContext>,
         state: Arc<State>,
         address: Address,
@@ -87,6 +89,7 @@ impl LoreFileHistoryEventData {
             address,
             size,
             action: LoreFileAction::from(file_action),
+            from_path: from_path.into(),
         }
     }
 }
@@ -173,6 +176,32 @@ pub struct HistoryOptions {
     pub depth: u32,
 }
 
+async fn node_path_in_revision(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    node_id: NodeID,
+) -> String {
+    if revision.is_zero() || node_id == INVALID_NODE {
+        return String::new();
+    }
+
+    let state = match state::State::deserialize(repository.clone(), revision).await {
+        Ok(state) => state,
+        Err(err) => {
+            lore_debug!("Failed to deserialize revision {revision} for previous path: {err}");
+            return String::new();
+        }
+    };
+
+    match state.node_path(repository, node_id).await {
+        Ok(path) => path,
+        Err(err) => {
+            lore_debug!("Node {node_id} has no path in revision {revision}: {err}");
+            String::new()
+        }
+    }
+}
+
 async fn history_state(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -200,7 +229,7 @@ async fn history_state(
     };
 
     // File properties
-    let (file_action, file_metadata_hash) = {
+    let (file_action, file_metadata_hash, previous_revision, previous_node) = {
         if node_id != INVALID_NODE {
             let file_metadata_node_id = node::node_to_file_metadata(node_id);
             let file_metadata_block_index = NodeFileMetadataBlock::index(file_metadata_node_id);
@@ -211,16 +240,22 @@ async fn history_state(
                 .await
                 .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
 
-            let (file_action, file_metadata_hash) = {
-                let file_metadata_block_reader = file_metadata_block.read();
-                let file_metadata_node = file_metadata_block_reader.node(file_metadata_node_index);
+            let file_metadata_block_reader = file_metadata_block.read();
+            let file_metadata_node = file_metadata_block_reader.node(file_metadata_node_index);
 
-                (file_metadata_node.action[0], file_metadata_node.metadata)
-            };
-
-            (file_action, file_metadata_hash)
+            (
+                file_metadata_node.action[0],
+                file_metadata_node.metadata,
+                file_metadata_node.revision[0],
+                file_metadata_node.node[0],
+            )
         } else {
-            (FileAction::Delete as u16, Hash::default())
+            (
+                FileAction::Delete as u16,
+                Hash::default(),
+                Hash::default(),
+                INVALID_NODE,
+            )
         }
     };
 
@@ -231,9 +266,16 @@ async fn history_state(
         action
     };
 
+    let from_path = if action == FileAction::Move as u16 {
+        node_path_in_revision(repository.clone(), previous_revision, previous_node).await
+    } else {
+        String::new()
+    };
+
     // Revision
     event::LoreEvent::FileHistory(LoreFileHistoryEventData::new(
         path,
+        from_path,
         repository.clone(),
         state.clone(),
         node.as_ref().map(|node| node.address).unwrap_or_default(),
@@ -249,8 +291,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     // File metadata
@@ -259,8 +300,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
@@ -329,22 +369,7 @@ async fn find_start_revision(
         return Err(FileHistoryError::internal("Invalid options"));
     }
     if let Some(revision_spec) = options.revision {
-        return revision::resolve(
-            repository.clone(),
-            revision_spec.as_str(),
-            if options.depth > 0 {
-                Some(options.depth as usize)
-            } else {
-                None
-            },
-            execution_context().globals().search_location(),
-        )
-        .await
-        .map_err(|_err| {
-            FileHistoryError::from(RevisionNotFound {
-                revision: revision_spec,
-            })
-        });
+        return resolve_revision(repository, revision_spec.as_str()).await;
     }
 
     let branch = if options.branch.is_none() {
@@ -354,10 +379,10 @@ async fn find_start_revision(
         if current_branch.is_zero() {
             let metadata = repository::metadata_hash(repository.clone())
                 .await
-                .internal("Failed to load repository metadata")?;
+                .forward::<FileHistoryError>("Failed to load repository metadata")?;
             let metadata = repository::metadata(repository.clone(), metadata)
                 .await
-                .internal("Failed to load repository metadata")?;
+                .forward::<FileHistoryError>("Failed to load repository metadata")?;
             metadata.default_branch
         } else {
             current_branch
@@ -374,6 +399,12 @@ async fn find_start_revision(
         resolved.id
     };
 
+    if execution_context().globals().offline_or_local() {
+        return Ok(branch::load_latest(repository.clone(), branch)
+            .await
+            .unwrap_or_default());
+    }
+
     let remote_latest = if let Ok(remote) = repository.remote().await {
         branch::load_remote_latest(remote.clone(), repository.id, branch)
             .await
@@ -388,9 +419,6 @@ async fn find_start_revision(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    if execution_context().globals().local() {
-        return Ok(local_latest);
-    }
 
     // Is there a latest?
     if remote_latest.is_zero() {
@@ -437,6 +465,27 @@ async fn find_start_revision(
             break Ok(local_latest);
         }
     }
+}
+
+/// The revision a specifier names, in the forms `revision::resolve` accepts.
+pub(crate) async fn resolve_revision(
+    repository: Arc<RepositoryContext>,
+    revision: &str,
+) -> Result<Hash, FileHistoryError> {
+    revision::resolve(
+        repository,
+        revision,
+        execution_context().globals().search_location(),
+    )
+    .await
+    .map_err(|err| {
+        FileHistoryError::RevisionNotFound(
+            RevisionNotFound {
+                revision: revision.to_string(),
+            }
+            .chain_err_from(err, "resolving the revision to query at"),
+        )
+    })
 }
 
 async fn history_start(
@@ -525,6 +574,10 @@ async fn history_start(
     Ok(node_link)
 }
 
+/// Reports the history of the file at `path` along the first-parent line, reading and reporting
+/// each earlier revision at the node ID the history records for the file there. Where the file has
+/// no first-parent history before a revision, as for a file the second parent of a merge of
+/// divergent history added, the walk takes the second-parent line.
 pub async fn history(
     repository: Arc<RepositoryContext>,
     path: String,
@@ -569,10 +622,15 @@ pub async fn history(
                 node_id,
                 metadata_node
             );
+            let slot = if metadata_node.revision[0].is_zero() {
+                1
+            } else {
+                0
+            };
             (
-                metadata_node.action[0],
-                metadata_node.revision[0],
-                metadata_node.node[0],
+                metadata_node.action[slot],
+                metadata_node.revision[slot],
+                metadata_node.node[slot],
             )
         };
 
@@ -584,6 +642,7 @@ pub async fn history(
         state = state::State::deserialize(repository.clone(), signature_next)
             .await
             .forward::<FileHistoryError>("Failed to deserialize state")?;
+        node_id = node_id_next;
 
         history_state(repository.clone(), state.clone(), node_id, action).await?;
 
@@ -592,8 +651,6 @@ pub async fn history(
             break;
         }
 
-        // Next.
-        node_id = node_id_next;
         limit -= 1;
     }
 

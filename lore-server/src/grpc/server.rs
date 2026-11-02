@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
@@ -25,9 +26,12 @@ use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use serde::Deserialize;
+use tonic::service::Routes;
+use tonic::transport::Certificate;
 use tonic::transport::Identity;
 use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
+use tower::Layer;
 use tower::ServiceBuilder;
 use tower::layer::util::Stack;
 use tower_http::classify::GrpcCode;
@@ -35,11 +39,13 @@ use tower_http::classify::GrpcErrorsAsFailures;
 use tower_http::classify::SharedClassifier;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use tracing::warn;
 
 use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
@@ -57,44 +63,120 @@ use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
+use crate::grpc::tower::malformed_request::MalformedRequestLayer;
+use crate::grpc::tower::partition_access::PartitionAccessLayer;
+use crate::grpc::tower::partition_access::PartitionAccessService;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
 use crate::legacy::rpc::repository_service_server::RepositoryServiceServer;
 use crate::legacy::rpc::revision_service_server::RevisionServiceServer;
 use crate::legacy::rpc::storage_service_server::StorageServiceServer;
+use crate::util::core_hop::CoreHopLayer;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
-        GrpcResponseTraceLayer,
+        MalformedRequestLayer,
         Stack<
-            ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+            GrpcResponseTraceLayer,
             Stack<
-                LoreTracingLayer,
+                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                 Stack<
+                    LoreTracingLayer,
                     Stack<
-                        TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
-                        CorrelationIdLayer,
+                        Stack<
+                            TraceLayer<
+                                SharedClassifier<GrpcErrorsAsFailures>,
+                                MakeCorrelationIdSpan,
+                            >,
+                            CorrelationIdLayer,
+                        >,
+                        Stack<CoreHopLayer, tower::layer::util::Identity>,
                     >,
-                    tower::layer::util::Identity,
                 >,
             >,
         >,
     >,
 >;
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct GrpcServiceSettings {
-    // max size of response payloads
+/// Settings available in each public gRPC service block's `general` table.
+/// Each service applies only the fields it supports.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServiceSettings {
+    /// Maximum encoded response size in bytes.
+    #[serde(default)]
     pub max_encoding_message_size: Option<usize>,
 }
 
+/// The `enabled` / `general` pair carried by every public gRPC service block.
+/// [`GenericServiceSettings`] implements it.
+pub trait GrpcServiceSettings {
+    /// Whether the public gRPC router registers this service.
+    fn enabled(&self) -> bool;
+    /// Common settings for this service.
+    fn general(&self) -> &ServiceSettings;
+}
+
+const fn enabled_by_default() -> bool {
+    true
+}
+
+/// A service settings block with no fields beyond the shared `enabled` /
+/// `general` pair.
 #[derive(Clone, Debug, Deserialize)]
+pub struct GenericServiceSettings {
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub general: ServiceSettings,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` on a `bool` field
+/// yields `false`, which would disable every service a configuration omits.
+impl Default for GenericServiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: enabled_by_default(),
+            general: ServiceSettings::default(),
+        }
+    }
+}
+
+impl GrpcServiceSettings for GenericServiceSettings {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn general(&self) -> &ServiceSettings {
+        &self.general
+    }
+}
+
+/// One settings block per public gRPC service. Unknown keys are ignored, so a
+/// misspelled block or key leaves the service registered.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct GrpcPublicServicesSettings {
-    pub lock_service: Option<GrpcServiceSettings>,
+    #[serde(default)]
+    pub admin_service: GenericServiceSettings,
+    #[serde(default)]
+    pub storage_service: GenericServiceSettings,
+    #[serde(default)]
+    pub revision_service: GenericServiceSettings,
+    #[serde(default)]
+    pub repository_service: GenericServiceSettings,
+    #[serde(default)]
+    pub environment_service: GenericServiceSettings,
+    #[serde(default)]
+    pub thin_client_service: GenericServiceSettings,
+    #[serde(default)]
+    pub lock_service: GenericServiceSettings,
+    #[serde(default)]
+    pub notification_service: GenericServiceSettings,
+
+    /// Not a service. Configures forwarding for services that already register.
     pub forwarded_requests: Option<ForwardedRequestsSettings>,
 }
 
@@ -145,9 +227,22 @@ pub struct RevisionListAcceleration {
 
 impl RevisionListAcceleration {
     pub fn from_feature(feature: &FeatureSettings) -> Self {
+        let step_keys = feature.revision_step_keys.unwrap_or(true);
+
+        let wants_list_cache = feature.revision_list_cache.unwrap_or(true);
+        let list_cache = if !step_keys && wants_list_cache {
+            warn!(
+                ?feature,
+                "List Cache acceleration feature does not function without Step Keys feature"
+            );
+            false
+        } else {
+            wants_list_cache
+        };
+
         Self {
-            step_keys: feature.revision_step_keys.unwrap_or(true),
-            list_cache: feature.revision_list_cache.unwrap_or(true),
+            step_keys,
+            list_cache,
         }
     }
 }
@@ -159,6 +254,30 @@ impl Default for RevisionListAcceleration {
             list_cache: true,
         }
     }
+}
+
+/// Builds a [`ServerTlsConfig`] for a gRPC server endpoint.
+///
+/// `cert_path` and `key_path` are the server's own certificate and private key.
+/// `cert_chain_path`, when supplied, is the CA certificate used to verify client
+/// certificates; client certificates are accepted but not required. Without it
+/// no client verification is configured.
+#[lore_macro::test_pub]
+fn build_server_tls_config(
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    cert_chain_path: Option<PathBuf>,
+) -> Result<ServerTlsConfig> {
+    info!("Loading TLS certs - cert: {cert_path:?} key: {key_path:?}");
+    let identity = Identity::from_pem(std::fs::read(&cert_path)?, std::fs::read(&key_path)?);
+    let mut tls = ServerTlsConfig::new()
+        .identity(identity)
+        .client_auth_optional(true);
+    if let Some(chain_path) = cert_chain_path {
+        info!("Loading CA cert for client verification: {chain_path:?}");
+        tls = tls.client_ca_root(Certificate::from_pem(std::fs::read(chain_path)?));
+    }
+    Ok(tls)
 }
 
 #[derive(Debug, Default)]
@@ -333,25 +452,18 @@ impl GrpcServerBuilder<WantsTlsConfig> {
         key_path: Option<PathBuf>,
         cert_chain_path: Option<PathBuf>,
     ) -> Result<GrpcServerBuilder<WantsAdminEndpoints>> {
-        let tls_config = if let Some(key_path) = key_path {
-            let cert_path =
-                cert_chain_path.unwrap_or(cert_path.ok_or(anyhow!("Missing TLS cert path"))?);
-            info!(
-                "Loading TLS certs - cert: {:?} key: {:?}",
-                cert_path, key_path
-            );
-            let cert = std::fs::read(cert_path)?;
-            info!("Loading TLS key: {:?}", key_path);
-            let key = std::fs::read(key_path)?;
-            let identity = Identity::from_pem(cert, key);
-
-            Some(
-                ServerTlsConfig::new()
-                    .identity(identity)
-                    .client_auth_optional(true),
-            )
-        } else {
-            None
+        let tls_config = match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => Some(build_server_tls_config(
+                cert_path,
+                key_path,
+                cert_chain_path,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow!(
+                    "TLS is partially configured: cert_file and pkey_file must both be set or both be absent"
+                ));
+            }
         };
 
         Ok(GrpcServerBuilder(WantsAdminEndpoints {
@@ -426,13 +538,29 @@ pub struct WantsHttp2Config {
     admin_svc: LoreAdminService,
 }
 
+/// The two server-side bounds a partition-scoped RPC answers to. They stay
+/// separate because neither can stand in for the other: the authorization
+/// bound covers one online call this server makes and nothing else, while
+/// stretching it over the handler would also span tonic's decode of the
+/// request body and so expire on a client that is slow to finish sending.
+#[derive(Clone, Copy, Debug)]
+pub struct GrpcTimeouts {
+    /// What a handler allows itself for the work it owns. Kept below the load
+    /// balancer's timeout so a stuck request is observed here rather than as
+    /// a 504 at the balancer.
+    pub request_handler: Duration,
+    /// What the partition-access check ahead of a handler allows for reaching
+    /// the authorizer.
+    pub authorization: Duration,
+}
+
 impl GrpcServerBuilder<WantsHttp2Config> {
     pub fn with_http2_config(
         self,
         http2_keep_alive_interval: Option<Duration>,
         http2_keep_alive_timeout: Option<Duration>,
-        request_handler_timeout: Duration,
-        service_settings: Option<GrpcPublicServicesSettings>,
+        timeouts: GrpcTimeouts,
+        service_settings: GrpcPublicServicesSettings,
         user_agent_filter: Arc<UserAgentFilter>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
@@ -450,7 +578,8 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             admin_svc: self.0.admin_svc,
             http2_keep_alive_interval,
             http2_keep_alive_timeout,
-            request_handler_timeout,
+            request_handler_timeout: timeouts.request_handler,
+            authorization_timeout: timeouts.authorization,
             service_settings,
             user_agent_filter,
             forwarded_requests,
@@ -473,50 +602,146 @@ pub struct MaybeJwtVerifier {
     http2_keep_alive_interval: Option<Duration>,
     http2_keep_alive_timeout: Option<Duration>,
     request_handler_timeout: Duration,
-    service_settings: Option<GrpcPublicServicesSettings>,
+    authorization_timeout: Duration,
+    service_settings: GrpcPublicServicesSettings,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
     fn make_lock_service(
-        services_settings: &Option<GrpcPublicServicesSettings>,
+        settings: &ServiceSettings,
         inner: LoreLockService,
     ) -> LockServiceServer<LoreLockService> {
         let mut lock_service = LockServiceServer::new(inner);
 
-        if let Some(lock_service_settings) = services_settings
-            .as_ref()
-            .and_then(|s| s.lock_service.as_ref())
-            && let Some(max_encoding_message_size) = lock_service_settings.max_encoding_message_size
-        {
+        if let Some(max_encoding_message_size) = settings.max_encoding_message_size {
             lock_service = lock_service.max_encoding_message_size(max_encoding_message_size);
         }
 
         lock_service
     }
 
+    /// The one registration path for a partition-scoped service: the JWT
+    /// interceptor verifies the token, and the [`PartitionAccessLayer`]
+    /// inside it asks the configured authorizer whether that caller may
+    /// reach the partition the request names. Per-operation permissions are
+    /// checked in the handlers, answered from the `PartitionGrants`
+    /// extension the layer exposes (or the authorizer, when the grants are
+    /// not enumerable).
+    ///
+    /// This layer checks access only from the request metadata headers,
+    /// which covers most of the operations. If the authorization decision
+    /// needs to be done based on a request body value, needs custom authz
+    /// check inside the handler (e.g. notification subscribe, lock action
+    /// checks). The middleware sees the request body only as a binary stream,
+    /// so we cannot easily action on any body values.
+    ///
+    /// `authorization_timeout` bounds that access check alone, not the
+    /// service behind it: the body is decoded inside the wrapped service, so
+    /// a bound reaching that far would charge a client's send time to the
+    /// server. Handlers time out their own work.
+    fn partition_scoped<S>(
+        service: S,
+        jwt_interceptor: &JWTInterceptor,
+        authorizer: &Arc<dyn RepositoryAuthorizer>,
+        authorization_timeout: Duration,
+    ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
+    {
+        tonic::service::interceptor::InterceptedService::new(
+            PartitionAccessLayer::new(authorizer.clone(), authorization_timeout).layer(service),
+            jwt_interceptor.clone(),
+        )
+    }
+
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
-        let storage_svc = LoreStorageService::new(
-            self.0.immutable_store.clone(),
-            self.0.local_store.clone(),
-            self.0.mutable_store.clone(),
-        );
+        let rpc_timeout = self.0.request_handler_timeout;
+        let authorization_timeout = self.0.authorization_timeout;
+        let services = &self.0.service_settings;
+        let mut registered = Vec::new();
+        let mut check_enabled = |settings: &dyn GrpcServiceSettings, name: &'static str| {
+            let enabled = settings.enabled();
+            info!(service = name, enabled, "Public gRPC service enabled");
+            if enabled {
+                registered.push(name);
+            }
+            enabled
+        };
+
+        let metrics_layer = tower::ServiceBuilder::new()
+            .layer(GrpcMetricsLayer::new(self.0.user_agent_filter.clone()));
+        let mut server = Server::builder()
+            .http2_keepalive_interval(self.0.http2_keep_alive_interval)
+            .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
+        if let Some(tls_config) = self.0.tls_config {
+            server = server.tls_config(tls_config)?;
+        }
+        let trace_layer_config = {
+            let mut config = TraceLayerConfig::default();
+            config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
+            config
+        };
+        let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(CoreHopLayer)
+            .layer(
+                CorrelationIdLayerBuilder::new()
+                    .with_grpc_tracer(trace_layer_config)
+                    .build(),
+            )
+            .layer(LoreTracingLayer {})
+            .layer(metrics_layer)
+            .layer(GrpcResponseTraceLayer {})
+            // Innermost: the layers above must observe the reclassified status.
+            .layer(MalformedRequestLayer::new(self.0.user_agent_filter))
+            // Empty routes turn the `Server` into a `Router` without mounting
+            // anything; unmatched paths answer UNIMPLEMENTED.
+            .add_routes(Routes::default());
+
+        let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
+            source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
+                crate::grpc::thinclient::v1::revision_diff::DEFAULT_REVISION_DIFF_SOURCE_CAP,
+            ),
+            history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
+        };
         let history_step_size = self
             .0
             .feature
             .history_step_size
             .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
         let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
-        let rpc_timeout = self.0.request_handler_timeout;
+        let thin_client_v1_svc = LoreThinClientV1Service::new(
+            self.0.immutable_store.clone(),
+            self.0.mutable_store.clone(),
+            repository_authorizer.clone(),
+            rpc_timeout,
+            revision_diff_config,
+            history_step_size,
+            acceleration,
+        );
+
+        let mut admin_svc = self.0.admin_svc;
+        admin_svc.set_auth(jwt_verifier.clone(), repository_authorizer.clone());
+        admin_svc.set_rpc_timeout(rpc_timeout);
+
+        let storage_svc = LoreStorageService::new(
+            self.0.immutable_store.clone(),
+            self.0.local_store.clone(),
+            self.0.mutable_store.clone(),
+            repository_authorizer.clone(),
+        );
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            repository_authorizer.clone(),
             history_step_size,
             acceleration,
             rpc_timeout,
@@ -526,25 +751,16 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            repository_authorizer.clone(),
             history_step_size,
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
         );
-        let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
-            source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
-                crate::grpc::thinclient::v1::revision_diff::DEFAULT_REVISION_DIFF_SOURCE_CAP,
-            ),
-            history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
-        };
-        let thin_client_v1_svc = LoreThinClientV1Service::new(
-            self.0.immutable_store.clone(),
-            self.0.mutable_store.clone(),
-            rpc_timeout,
-            revision_diff_config,
-        );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
+            repository_catalog.clone(),
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
@@ -552,149 +768,126 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
+            repository_catalog,
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
+            self.0.forwarded_requests.clone(),
             rpc_timeout,
         );
 
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
-        let lock_svc = match self.0.lock_store {
-            Some(lock_store) => {
-                info!("Enabling LockService");
-                Some(LoreLockService::new(
-                    lock_store.clone(),
-                    self.0.notification_sender.clone(),
-                    rpc_timeout,
-                ))
-            }
-            None => None,
-        };
-        let metrics_layer =
-            tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(self.0.user_agent_filter));
-        let mut server = Server::builder()
-            .http2_keepalive_interval(self.0.http2_keep_alive_interval)
-            .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
-        if let Some(tls_config) = self.0.tls_config {
-            server = server.tls_config(tls_config)?;
-        }
-
-        let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_jwt_verifier(jwt_verifier.clone());
-        admin_svc.set_rpc_timeout(rpc_timeout);
-        let trace_layer_config = {
-            let mut config = TraceLayerConfig::default();
-            config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
-            config
-        };
-        let mut router = server
-            .layer(
-                CorrelationIdLayerBuilder::new()
-                    .with_grpc_tracer(trace_layer_config)
-                    .build(),
+        let lock_svc = self.0.lock_store.map(|lock_store| {
+            LoreLockService::new(
+                lock_store,
+                self.0.notification_sender.clone(),
+                repository_authorizer.clone(),
+                self.0.forwarded_requests.clone(),
+                rpc_timeout,
             )
-            .layer(LoreTracingLayer {})
-            .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {});
+        });
 
-        let mut router = router.add_service(AdminServiceServer::new(admin_svc));
+        let notification_service = self.0.notification_service;
 
-        if let Some(jwt_verifier) = jwt_verifier.as_ref() {
-            let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
-            // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-            let jwt_authn_interceptor = JWTAuthnInterceptor::new(jwt_verifier);
+        let authenticated = jwt_verifier.is_some();
+        let jwt_interceptor = JWTInterceptor::new(jwt_verifier.as_ref());
+
+        if check_enabled(&services.admin_service, "admin_service") {
+            router = router.add_service(AdminServiceServer::new(admin_svc));
+        }
+        if check_enabled(&services.storage_service, "storage_service") {
             router = router
-                .add_service(StorageServiceServer::with_interceptor(
-                    storage_svc.clone(),
-                    jwt_interceptor.clone(),
+                .add_service(Self::partition_scoped(
+                    StorageServiceServer::new(storage_svc.clone()),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
                 ))
-                .add_service(
-                    storage_service_v1_server::StorageServiceServer::with_interceptor(
-                        storage_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                )
-                .add_service(RevisionServiceServer::with_interceptor(
-                    revision_svc,
-                    jwt_interceptor.clone(),
+                .add_service(Self::partition_scoped(
+                    storage_service_v1_server::StorageServiceServer::new(storage_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
+                ));
+        }
+        if check_enabled(&services.revision_service, "revision_service") {
+            router = router
+                .add_service(Self::partition_scoped(
+                    RevisionServiceServer::new(revision_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
                 ))
-                .add_service(revision_v1_server::RevisionServiceServer::with_interceptor(
-                    revision_v1_svc,
-                    jwt_interceptor.clone(),
-                ))
-                .add_service(
-                    thin_client_v1_server::ThinClientServiceServer::with_interceptor(
-                        thin_client_v1_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                )
+                .add_service(Self::partition_scoped(
+                    revision_v1_server::RevisionServiceServer::new(revision_v1_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
+                ));
+        }
+        if check_enabled(&services.thin_client_service, "thin_client_service") {
+            router = router.add_service(Self::partition_scoped(
+                thin_client_v1_server::ThinClientServiceServer::new(thin_client_v1_svc),
+                &jwt_interceptor,
+                &repository_authorizer,
+                authorization_timeout,
+            ));
+        }
+        if check_enabled(&services.repository_service, "repository_service") {
+            router = router
                 .add_service(RepositoryServiceServer::with_interceptor(
                     repository_svc,
-                    // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-                    jwt_authn_interceptor.clone(),
+                    jwt_interceptor.clone(),
                 ))
                 .add_service(
                     repository_v1_server::RepositoryServiceServer::with_interceptor(
                         repository_v1_svc,
-                        jwt_authn_interceptor.clone(),
-                    ),
-                )
-                .add_service(EnvironmentServiceServer::new(environment_svc))
-                .add_service(environment_v1_server::EnvironmentServiceServer::new(
-                    environment_v1_svc,
-                ));
-
-            // Locks require auth, so set that up here
-            if let Some(lock_svc) = lock_svc {
-                let lock_service = Self::make_lock_service(&self.0.service_settings, lock_svc);
-                let intercepted_service = tonic::service::interceptor::InterceptedService::new(
-                    lock_service,
-                    jwt_interceptor.clone(),
-                );
-                router = router.add_service(intercepted_service);
-            }
-
-            // Notifications require auth
-            if let Some(notification_service) = self.0.notification_service {
-                router = router.add_service(
-                    lore_notification::NotificationServiceServer::with_interceptor(
-                        notification_service,
                         jwt_interceptor.clone(),
                     ),
                 );
-            }
-        } else {
+        }
+        if check_enabled(&services.environment_service, "environment_service") {
             router = router
-                .add_service(StorageServiceServer::new(storage_svc.clone()))
-                .add_service(storage_service_v1_server::StorageServiceServer::new(
-                    storage_svc,
-                ))
-                .add_service(RevisionServiceServer::new(revision_svc))
-                .add_service(revision_v1_server::RevisionServiceServer::new(
-                    revision_v1_svc,
-                ))
-                .add_service(thin_client_v1_server::ThinClientServiceServer::new(
-                    thin_client_v1_svc,
-                ))
-                .add_service(RepositoryServiceServer::new(repository_svc))
-                .add_service(repository_v1_server::RepositoryServiceServer::new(
-                    repository_v1_svc,
-                ))
                 .add_service(EnvironmentServiceServer::new(environment_svc))
                 .add_service(environment_v1_server::EnvironmentServiceServer::new(
                     environment_v1_svc,
                 ));
-            if let Some(lock_svc) = lock_svc {
-                let lock_service = Self::make_lock_service(&self.0.service_settings, lock_svc);
-                router = router.add_service(lock_service);
-            }
-            if let Some(notification_service) = self.0.notification_service {
-                router = router.add_service(lore_notification::NotificationServiceServer::new(
-                    notification_service,
-                ));
-            }
         }
+        if let Some(lock_svc) = lock_svc
+            && check_enabled(&services.lock_service, "lock_service")
+        {
+            let lock_service = Self::make_lock_service(services.lock_service.general(), lock_svc);
+            router = router.add_service(Self::partition_scoped(
+                lock_service,
+                &jwt_interceptor,
+                &repository_authorizer,
+                authorization_timeout,
+            ));
+        }
+        if let Some(notification_service) = notification_service
+            && check_enabled(&services.notification_service, "notification_service")
+        {
+            router = router.add_service(
+                lore_notification::NotificationServiceServer::with_interceptor(
+                    notification_service,
+                    jwt_interceptor.clone(),
+                ),
+            );
+        }
+
+        info!(
+            services = registered.join(", "),
+            authenticated, "Registered public gRPC services"
+        );
+        if registered.is_empty() {
+            warn!(
+                "No public gRPC services registered; every RPC on this listener \
+                 will answer UNIMPLEMENTED"
+            );
+        }
+
         Ok(GrpcServerBuilder(WantsAddress { router }))
     }
 }
@@ -704,8 +897,48 @@ pub struct WantsAddress {
 }
 
 impl GrpcServerBuilder<WantsAddress> {
-    pub async fn serve(self, addr: SocketAddr, signal: impl Future<Output = ()>) -> Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+    /// Serves on the net runtime. Handler bodies are hopped back to core by the
+    /// [`CoreHopLayer`] at the outside of the stack, so only the transport and
+    /// h2 driver stay here.
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
+        Ok(())
+    }
+
+    /// Serve on a socket the caller already bound, so the port is held from the moment it is
+    /// chosen.
+    ///
+    /// [`GrpcServerBuilder::serve`] binds the address itself, which leaves the caller no way to
+    /// reserve a port and hand it over: between learning a free port and this binding it, anything
+    /// on the machine can take it. A caller that cannot tolerate that window binds first and passes
+    /// the socket.
+    ///
+    /// The socket arrives as [`std::net::TcpListener`] rather than tokio's, because a tokio
+    /// listener belongs to the runtime that created it and this serves on the net runtime; the
+    /// conversion happens there.
+    pub async fn serve_with_listener(
+        self,
+        listener: std::net::TcpListener,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            self.0
+                .router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    signal,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await??;
         Ok(())
     }
 }
@@ -719,35 +952,34 @@ pub async fn serve_maintenance(
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     cert_chain_path: Option<PathBuf>,
-    signal: impl Future<Output = ()>,
+    signal: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let environment_svc = LoreEnvironmentService::maintenance(environment.clone());
     let environment_v1_svc = LoreEnvironmentV1Service::maintenance(environment);
 
     let mut server = Server::builder();
-    if let Some(key_path) = key_path {
-        let cert_path =
-            cert_chain_path.unwrap_or(cert_path.ok_or(anyhow!("Missing TLS cert path"))?);
-        info!(
-            "Loading maintenance TLS certs - cert: {:?} key: {:?}",
-            cert_path, key_path
-        );
-        let cert = std::fs::read(cert_path)?;
-        let key = std::fs::read(key_path)?;
-        let identity = Identity::from_pem(cert, key);
-        let tls_config = ServerTlsConfig::new()
-            .identity(identity)
-            .client_auth_optional(true);
-        server = server.tls_config(tls_config)?;
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            info!("Loading maintenance TLS certs - cert: {cert_path:?} key: {key_path:?}");
+            let tls_config = build_server_tls_config(cert_path, key_path, cert_chain_path)?;
+            server = server.tls_config(tls_config)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(anyhow!(
+                "Maintenance TLS is partially configured: cert_file and pkey_file must both be set or both be absent"
+            ));
+        }
     }
 
-    server
+    // Served from net like the other listeners. No `CoreHopLayer`: both handlers
+    // only return UNAVAILABLE, so there is nothing to keep off net.
+    let router = server
         .add_service(EnvironmentServiceServer::new(environment_svc))
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
-        ))
-        .serve_with_shutdown(addr, signal)
-        .await?;
+        ));
+    lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
 
     Ok(())
 }

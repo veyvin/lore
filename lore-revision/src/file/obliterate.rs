@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::lore::Address;
 use crate::node::NodeFlags;
@@ -19,12 +20,16 @@ use crate::stage::StageStats;
 use crate::stage::stage_delete;
 use crate::state;
 use crate::store::StoreObliterateStats;
-use crate::util;
 use crate::util::path::RelativePath;
+
+#[cfg(not(feature = "test-util"))]
+mod impact;
+#[cfg(feature = "test-util")]
+pub mod impact;
 
 /// Data for the event emitted when file content is obliterated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileObliterateEventData {
     /// Address of the obliterated content.
@@ -100,7 +105,7 @@ impl EventError for ObliterateError {
     }
 }
 
-pub async fn obliterate_file(
+pub(crate) async fn obliterate_file(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     path: String,
@@ -156,15 +161,20 @@ pub async fn obliterate_file(
 
     obliterate_address(repository.clone(), node.address).await?;
 
-    util::fs::unlink_recursive(relative_path.to_absolute_path(repository.require_path()?))
-        .await
-        .internal("Failed to unlink filesystem entry")?;
+    with_operation(repository.file_system(), async |operation| {
+        operation
+            .remove_recursive(&relative_path)
+            .await
+            .forward::<ObliterateError>("Failed to remove the obliterated path")
+    })
+    .await?;
 
     let stage_stats = Arc::new(StageStats::default());
 
     stage_delete(
         repository.clone(),
         state.clone(),
+        relative_path.clone(),
         node_link.node,
         NodeFlags::NoFlags,
         stage_stats,
@@ -184,27 +194,44 @@ pub async fn obliterate_file(
     Ok(())
 }
 
-pub async fn obliterate_address(
+/// Boxed version of [`obliterate_file`] for cross-crate use.
+pub fn obliterate_file_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    path: String,
+) -> crate::BoxFuture<'_, Result<(), ObliterateError>> {
+    Box::pin(obliterate_file(repository, token, path))
+}
+
+pub(crate) async fn obliterate_address(
     repository: Arc<RepositoryContext>,
     address: Address,
 ) -> Result<(), ObliterateError> {
+    impact::warn(&repository, address).await;
+
     let stats = Arc::new(StoreObliterateStats::default());
 
-    repository
-        .immutable_store()
-        .obliterate(repository.id, address, stats.clone())
-        .await
-        .forward::<ObliterateError>(&format!("Failed to obliterate an address: {address}"))?;
-
-    if let Ok(remote) = repository.remote().await
-        && let Ok(admin) = remote.admin(repository.id).await
-    {
-        admin
-            .obliterate(address)
+    // Obliterating removes the content here and on the remote, for good. A dry run reports the
+    // address with nothing counted.
+    if !crate::lore::execution_context().globals().dry_run() {
+        repository
+            .immutable_store()
+            .obliterate(repository.id, address, stats.clone())
             .await
-            .forward::<ObliterateError>(&format!(
-                "Failed to obliterate a remote address: {address}"
-            ))?;
+            .forward_with::<ObliterateError, _>(|| {
+                format!("Failed to obliterate an address: {address}")
+            })?;
+
+        if let Ok(remote) = repository.remote().await
+            && let Ok(admin) = remote.admin(repository.id).await
+        {
+            admin
+                .obliterate(address)
+                .await
+                .forward_with::<ObliterateError, _>(|| {
+                    format!("Failed to obliterate a remote address: {address}")
+                })?;
+        }
     }
 
     event::LoreEvent::FileObliterate(LoreFileObliterateEventData {
@@ -215,4 +242,12 @@ pub async fn obliterate_address(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`obliterate_address`] for cross-crate use.
+pub fn obliterate_address_boxed(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+) -> crate::BoxFuture<'static, Result<(), ObliterateError>> {
+    Box::pin(obliterate_address(repository, address))
 }

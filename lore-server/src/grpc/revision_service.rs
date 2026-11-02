@@ -26,6 +26,7 @@ use super::handlers::revision_describe;
 use super::handlers::revision_diff;
 use super::handlers::revision_state_history;
 use super::handlers::revision_tree;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::handlers::revision_list;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -53,6 +54,7 @@ pub struct LoreRevisionService {
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     rpc_timeout: Duration,
@@ -62,11 +64,13 @@ pub struct LoreRevisionService {
 }
 
 impl LoreRevisionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
         rpc_timeout: Duration,
@@ -97,6 +101,7 @@ impl LoreRevisionService {
             mutable_store,
             notification,
             hook_dispatcher,
+            repository_authorizer,
             history_step_size,
             acceleration,
             rpc_timeout,
@@ -116,6 +121,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_create::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -134,6 +140,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_delete::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -197,6 +204,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_push::handler(
                 request,
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -234,6 +242,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -249,6 +258,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -279,6 +289,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -307,6 +318,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_protect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -337,6 +349,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_metadata_set::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -352,6 +365,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_unprotect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

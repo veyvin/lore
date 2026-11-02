@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use lore_base::types::LockResource;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +28,7 @@ impl crate::event::EventError for NotificationError {}
 
 /// Data for a notification that a branch received a new revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchPushedEventData {
     /// Hash of the pushed revision.
@@ -44,7 +43,7 @@ pub struct LoreNotificationBranchPushedEventData {
 
 /// Data for a notification that a branch was created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchCreatedEventData {
     /// Identifier of the created branch.
@@ -53,7 +52,7 @@ pub struct LoreNotificationBranchCreatedEventData {
 
 /// Data for a notification that a branch was deleted.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchDeletedEventData {
     /// Identifier of the deleted branch.
@@ -62,7 +61,7 @@ pub struct LoreNotificationBranchDeletedEventData {
 
 /// Data for a notification that resources were locked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceLockedEventData {
     /// Identifier of the user that locked the resources.
@@ -75,7 +74,7 @@ pub struct LoreNotificationResourceLockedEventData {
 
 /// Data for a notification that resources were unlocked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceUnlockedEventData {
     /// Identifier of the user that unlocked the resources.
@@ -88,7 +87,7 @@ pub struct LoreNotificationResourceUnlockedEventData {
 
 /// Data for a notification carrying a text message.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationTextEventData {
     /// Text content of the notification.
@@ -97,7 +96,7 @@ pub struct LoreNotificationTextEventData {
 
 /// Data for a notification carrying binary content.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBinaryDataEventData {
     /// Binary content of the notification.
@@ -106,7 +105,7 @@ pub struct LoreNotificationBinaryDataEventData {
 
 /// Data for a notification that a subscription to a repository was established.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationSubscribedEventData {
     /// Identifier of the subscribed repository.
@@ -115,7 +114,7 @@ pub struct LoreNotificationSubscribedEventData {
 
 /// Data for a notification that a subscription to a repository was removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationUnsubscribedEventData {
     /// Identifier of the unsubscribed repository.
@@ -151,6 +150,20 @@ impl NotificationSubscription {
             cancellation_token,
         }
     }
+
+    /// Whether the subscription is still listening for notifications.
+    ///
+    /// A subscription goes inactive when its client gives up on its own, for
+    /// example when the network drops and reconnecting keeps failing.
+    pub fn is_active(&self) -> bool {
+        !self.cancellation_token.is_cancelled() && !self.task.is_finished()
+    }
+
+    /// Cancel the subscription and wait for its task to finish.
+    async fn shutdown(self) {
+        self.cancellation_token.cancel();
+        let _ = self.task.await;
+    }
 }
 
 static NOTIFICATION_SUBSCRIBERS: OnceLock<DashMap<RepositoryId, NotificationSubscription>> =
@@ -162,8 +175,20 @@ fn notification_subscribers() -> &'static DashMap<RepositoryId, NotificationSubs
 
 /// Subscribe to notifications for the given repository
 pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), NotificationError> {
-    if notification_subscribers().contains_key(&repository.id) {
+    if let Some(subscriber) = notification_subscribers().get(&repository.id)
+        && subscriber.is_active()
+    {
         return Ok(());
+    }
+
+    // A client that bailed out leaves its entry behind. Drop it so the caller
+    // can resubscribe without having to unsubscribe first.
+    if let Some((_, stale)) = notification_subscribers().remove(&repository.id) {
+        lore_debug!(
+            "Discarding inactive notification subscription for {}",
+            repository.id
+        );
+        stale.shutdown().await;
     }
 
     let Ok(remote) = repository.remote().await else {
@@ -183,7 +208,11 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         repository.id
     );
     let subscriber = client.subscribe_repository(repository.id).await?;
-    let _previous = notification_subscribers().insert(repository.id, subscriber);
+    // A concurrent subscribe may have won the race; stop its task rather than
+    // detaching it by dropping the join handle.
+    if let Some(previous) = notification_subscribers().insert(repository.id, subscriber) {
+        previous.shutdown().await;
+    }
     lore_debug!(
         "Subscribed to repository notifications for {}",
         repository.id
@@ -202,8 +231,7 @@ pub async fn unsubscribe(repository: Arc<RepositoryContext>) -> Result<(), Notif
 
     lore_debug!("Unsubscribing notification client from {}", repository.id);
 
-    subscriber.cancellation_token.cancel();
-    let _ = subscriber.task.await;
+    subscriber.shutdown().await;
 
     lore_debug!("Unsubscribed notification client from {}", repository.id);
 

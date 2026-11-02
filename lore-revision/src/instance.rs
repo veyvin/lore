@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: MIT
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_storage::store_types::KeyType;
-use serde::Deserialize;
 use serde::Serialize;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -20,10 +20,17 @@ use crate::errors::Disconnected;
 use crate::errors::FileNotFound;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event::EventError;
 use crate::hash;
@@ -31,9 +38,10 @@ use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore_debug;
-use crate::lore_spawn_blocking;
+use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
 
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
@@ -59,7 +67,8 @@ pub const ANCHOR_STAGED: &str = "anchor-staged";
     FromBytes,
     Immutable,
     Serialize,
-    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 pub struct InstanceId {
     /// The raw 16-byte identifier
@@ -92,13 +101,14 @@ impl InstanceId {
 
     /// Write an instance ID to the `.lore/instance` file.
     pub async fn write_to_file(&self, path: PathBuf) -> io::Result<()> {
-        let data = *self;
-        lore_spawn_blocking!(move || {
-            std::io::Write::write_all(&mut std::fs::File::create(path)?, data.as_bytes())
-        })
-        .await
-        .map_err(io::Error::other)
-        .flatten()
+        lore_io::IoDriver::global()
+            .write_file_bytes(path, bytes::Bytes::copy_from_slice(self.as_bytes()), false)
+            .await?;
+        Ok(())
+    }
+
+    pub fn text_encoding(&self) -> String {
+        hex::encode(self.data())
     }
 }
 
@@ -107,11 +117,7 @@ impl InstanceId {
 /// The value stored at this key is the hash of the instance metadata blob
 /// in the immutable store (containing instance ID, path, and creation timestamp).
 pub fn instance_key(salt: &[u8], instance: InstanceId) -> (Hash, KeyType) {
-    let key = hash::hash_function_arg(
-        salt,
-        INSTANCE_METADATA,
-        hex::encode(instance.data()).as_str(),
-    );
+    let key = hash::hash_function_arg(salt, INSTANCE_METADATA, instance.text_encoding().as_str());
     (key, KeyType::Instance)
 }
 
@@ -129,6 +135,7 @@ const CREATED: &str = "created";
 const INSTANCE_ID: &str = "instance-id";
 
 /// Instance metadata stored as a blob in the immutable store.
+#[derive(Debug)]
 pub struct InstanceMetadata {
     pub instance_id: InstanceId,
     pub path: String,
@@ -137,37 +144,231 @@ pub struct InstanceMetadata {
 
 /// Register an instance in the mutable store by writing its metadata to the
 /// immutable store and storing the metadata hash under the instance key.
+///
+/// A path holds one checkout, and that checkout's `.lore/instance` names
+/// `instance_id`, so any other instance still registered at `path` was left
+/// behind when the directory was re-created on a mutable store that outlived
+/// its `.lore` directory: `repository create --force` or a re-clone on a
+/// shared store, or a checkout moved onto the path of a deleted one. Those
+/// registrations are retired here, so the instance list never carries two
+/// entries for one root directory.
 pub async fn register_instance(
     repository: &Arc<RepositoryContext>,
     instance_id: InstanceId,
     path: &str,
 ) -> Result<(), InstanceError> {
     let normalized_path = crate::util::path::clean(path.to_owned());
+    store_normalized_registration(repository, instance_id, &normalized_path).await?;
+    retire_instances_at_path(repository, instance_id, &normalized_path).await;
+    Ok(())
+}
+
+/// Write the registration record for `instance_id` at `path` without retiring
+/// other registrations at that path.
+///
+/// [`register_instance`] is the entry point that keeps one registration per
+/// path. This is exposed so tests can build the duplicate state an earlier
+/// client left behind and check that prune and recovery handle it.
+#[doc(hidden)]
+pub async fn store_instance_registration(
+    repository: &Arc<RepositoryContext>,
+    instance_id: InstanceId,
+    path: &str,
+) -> Result<(), InstanceError> {
+    let normalized_path = crate::util::path::clean(path.to_owned());
+    store_normalized_registration(repository, instance_id, &normalized_path).await
+}
+
+/// Write the registration record for `instance_id`, whose `normalized_path` is
+/// already in the form [`crate::util::path::clean`] produces.
+async fn store_normalized_registration(
+    repository: &Arc<RepositoryContext>,
+    instance_id: InstanceId,
+    normalized_path: &str,
+) -> Result<(), InstanceError> {
     let mut metadata = Metadata::new();
     metadata
         .set_string(INSTANCE_ID, hex::encode(instance_id.data()).as_str())
-        .internal("failed to set instance ID in metadata")?;
+        .forward_any::<InstanceError>("failed to set instance ID in metadata")?;
     metadata
-        .set_string(PATH, normalized_path.as_str())
-        .internal("failed to set path in metadata")?;
+        .set_string(PATH, normalized_path)
+        .forward_any::<InstanceError>("failed to set path in metadata")?;
     metadata
         .set_u64(CREATED, crate::util::time::timestamp())
-        .internal("failed to set created in metadata")?;
+        .forward_any::<InstanceError>("failed to set created in metadata")?;
 
     let metadata_hash = metadata
         .serialize_local(repository.clone())
         .await
-        .internal("failed to serialize instance metadata")?;
+        .forward_any::<InstanceError>("failed to serialize instance metadata")?;
 
     let (key, key_type) = instance_key(repository.salt(), instance_id);
     let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
     handle
         .store(repository.id, key, metadata_hash, key_type)
         .await
-        .internal("failed to store instance registration")?;
+        .forward::<InstanceError>("failed to store instance registration")?;
 
     lore_debug!("Registered instance {instance_id} with metadata hash {metadata_hash}");
     Ok(())
+}
+
+/// Whether `path` names the location `normalized` already names, normalizing
+/// into `scratch` rather than allocating for each path compared.
+fn names_same_path(path: &str, normalized: &str, scratch: &mut String) -> bool {
+    scratch.clear();
+    scratch.push_str(path);
+    crate::util::path::clean_in_place(scratch);
+    scratch == normalized
+}
+
+/// Retire every registration other than `current` that records
+/// `normalized_path`, which is already in the form
+/// [`crate::util::path::clean`] produces.
+///
+/// Run by [`register_instance`] once its own record is written, so a path the
+/// registering checkout owns is left holding one entry without waiting for a
+/// reader to notice.
+///
+/// Best-effort: a failure to enumerate leaves the entries for
+/// [`instance_prune`], which classifies them as superseded.
+async fn retire_instances_at_path(
+    repository: &Arc<RepositoryContext>,
+    current: InstanceId,
+    normalized_path: &str,
+) {
+    let instances = match list_instances(repository).await {
+        Ok(instances) => instances,
+        Err(err) => {
+            lore_warn!("Failed to list instances while registering {current}: {err}");
+            return;
+        }
+    };
+    let mut scratch = String::new();
+    for instance in instances {
+        if instance.instance_id == current
+            || instance.instance_id.is_zero()
+            || !names_same_path(&instance.path, normalized_path, &mut scratch)
+        {
+            continue;
+        }
+        lore_debug!(
+            "Retiring instance {} registered at {normalized_path}, superseded by {current}",
+            instance.instance_id
+        );
+        remove_instance_keys(repository, instance.instance_id).await;
+    }
+}
+
+/// Zero the registration and anchor keys of `instance_id`, removing it from the
+/// store. Reports whether the write was possible: a read-only caller leaves the
+/// entry to the next writer. Failures are otherwise ignored, since a key that
+/// could not be zeroed is picked up by the next prune.
+async fn remove_instance_keys(
+    repository: &Arc<RepositoryContext>,
+    instance_id: InstanceId,
+) -> bool {
+    let Some(handle) = repository.try_write_mutable_store() else {
+        return false;
+    };
+    let (key, key_type) = instance_key(repository.salt(), instance_id);
+    let _ = handle
+        .store(repository.id, key, Hash::default(), key_type)
+        .await;
+    for function in [ANCHOR_CURRENT, ANCHOR_CURRENT_BRANCH, ANCHOR_STAGED] {
+        let (key, key_type) = anchor_key(repository.salt(), function, instance_id);
+        let _ = handle
+            .store(repository.id, key, Hash::default(), key_type)
+            .await;
+    }
+    true
+}
+
+/// A registration that no longer describes a live checkout.
+struct StaleInstance {
+    metadata: InstanceMetadata,
+    staleness: InstanceStaleness,
+    /// The anchor state read before retirement, absent while the registration
+    /// is left in place and its own anchors still answer.
+    retired_anchors: Option<(BranchId, String, Hash)>,
+}
+
+/// Which stale registrations a reader retires as it reads.
+enum RetirePolicy {
+    /// Only one the path's own `.lore/instance` contradicts. A path that holds
+    /// no checkout may be a filesystem that is not mounted at the moment, so
+    /// clearing it is left to an explicit prune.
+    Contradicted,
+    /// Every registration that describes no live checkout.
+    Stale,
+}
+
+/// What a caller does with the stale registrations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaleReport {
+    /// Nothing, so none are returned and no anchor state is read.
+    Discard,
+    /// Reports them, so all are returned, and the anchor state of one being
+    /// retired is read before its keys are zeroed.
+    Return,
+}
+
+/// The registrations describing a live checkout, and the stale ones `report`
+/// asks for, retiring those `policy` covers.
+///
+/// Neither the current instance nor a registration without a usable ID is
+/// classified: a checkout cannot conclude that it is itself gone, and an ID that
+/// could not be read names no keys to remove. A read-only reader retires
+/// nothing and reports what it found.
+async fn reconcile_instances(
+    repository: &Arc<RepositoryContext>,
+    policy: RetirePolicy,
+    report: StaleReport,
+) -> Result<(Vec<InstanceMetadata>, Vec<StaleInstance>), InstanceError> {
+    let instances = list_instances(repository).await?;
+    let mut live = Vec::with_capacity(instances.len());
+    let mut stale = Vec::new();
+    let mut retired_any = false;
+    for instance in instances {
+        if instance.instance_id == repository.instance_id || instance.instance_id.is_zero() {
+            live.push(instance);
+            continue;
+        }
+        let staleness = instance_staleness(&instance.path, instance.instance_id).await;
+        if !staleness.is_stale() {
+            live.push(instance);
+            continue;
+        }
+
+        let retire = match policy {
+            RetirePolicy::Contradicted => staleness == InstanceStaleness::Superseded,
+            RetirePolicy::Stale => true,
+        };
+        let mut retired_anchors = None;
+        if retire {
+            if report == StaleReport::Return {
+                retired_anchors =
+                    Some(instance_anchor_state(repository, instance.instance_id).await);
+            }
+            lore_debug!(
+                "Retiring {staleness:?} instance {} registered at {}",
+                instance.instance_id,
+                instance.path
+            );
+            retired_any |= remove_instance_keys(repository, instance.instance_id).await;
+        }
+        if report == StaleReport::Return {
+            stale.push(StaleInstance {
+                metadata: instance,
+                staleness,
+                retired_anchors,
+            });
+        }
+    }
+    if retired_any {
+        let _ = repository.flush(false).await;
+    }
+    Ok((live, stale))
 }
 
 /// Load instance metadata from the immutable store given the metadata hash.
@@ -177,7 +378,7 @@ pub async fn load_instance_metadata(
 ) -> Result<InstanceMetadata, InstanceError> {
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
-        .internal("failed to deserialize instance metadata")?;
+        .forward_any::<InstanceError>("failed to deserialize instance metadata")?;
 
     // Missing or corrupt fields are non-fatal — instance metadata is advisory
     // (used for branch checkout warnings and stale instance detection), not
@@ -214,7 +415,8 @@ pub async fn load_instance_metadata(
 
 /// Attempt to recover a lost instance ID by enumerating all registered
 /// instances and matching by filesystem path. Returns `Some(id)` if an
-/// existing instance entry has a path matching `current_path`.
+/// existing instance entry has a path matching `current_path`; the most
+/// recently registered one when several do.
 pub async fn recover_instance_id(
     repository_id: lore_storage::Partition,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -230,36 +432,43 @@ pub async fn recover_instance_id(
         .ok()?;
 
     // Build a temporary repository context for metadata deserialization
-    let temp_repo = Arc::new(RepositoryContext::new(
-        None,
+    let temp_repo = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        paths: None,
         immutable_store,
         mutable_store,
-        repository_id,
-        InstanceId::default(),
-        Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
-        Arc::default(),
-        crate::repository::RepositoryFormat::Lore,
-    ));
+        id: repository_id,
+        instance_id: InstanceId::default(),
+        remote: Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
+        filter: Arc::default(),
+        filesystem_provider: None,
+    }));
 
     let normalized_current = crate::util::path::clean(current_path.to_owned());
 
+    let mut newest: Option<InstanceMetadata> = None;
+    let mut scratch = String::new();
     while let Some((_key, metadata_hash)) = stream.next().await {
         if metadata_hash.is_zero() {
             continue;
         }
         if let Ok(metadata) = load_instance_metadata(&temp_repo, metadata_hash).await
-            && crate::util::path::clean(metadata.path.clone()) == normalized_current
             && !metadata.instance_id.is_zero()
+            && names_same_path(&metadata.path, &normalized_current, &mut scratch)
+            && newest.as_ref().is_none_or(|best| {
+                (metadata.created, metadata.instance_id) > (best.created, best.instance_id)
+            })
         {
-            lore_debug!(
-                "Recovered instance ID {} from path match",
-                metadata.instance_id
-            );
-            return Some(metadata.instance_id);
+            newest = Some(metadata);
         }
     }
 
-    None
+    newest.map(|metadata| {
+        lore_debug!(
+            "Recovered instance ID {} from path match",
+            metadata.instance_id
+        );
+        metadata.instance_id
+    })
 }
 
 /// List all registered instances for a repository by querying the mutable store.
@@ -274,41 +483,34 @@ pub async fn list_instances(
         .read_mutable_store()
         .list(repository.id, KeyType::Instance)
         .await
-        .internal("failed to list instances")?;
+        .forward::<InstanceError>("failed to list instances")?;
 
     let mut instances = Vec::new();
     while let Some((_key, metadata_hash)) = stream.next().await {
         if metadata_hash.is_zero() {
             continue;
         }
-        if let Ok(metadata) = load_instance_metadata(repository, metadata_hash).await
-            && !metadata.instance_id.is_zero()
-        {
-            instances.push(metadata);
-        }
+        instances.push(load_instance_metadata(repository, metadata_hash).await?);
     }
     Ok(instances)
 }
 
 /// Check if any other active instance has the given branch checked out.
 ///
-/// Returns the list of active instances on that branch (excluding self).
-/// Stale instances (path no longer exists) are silently skipped.
+/// Returns the list of active instances on that branch (excluding self). A
+/// stale registration is never returned, and is retired where the path
+/// contradicts it.
 pub async fn instances_on_branch(
     repository: &Arc<RepositoryContext>,
     target_branch: crate::lore::BranchId,
 ) -> Result<Vec<InstanceMetadata>, InstanceError> {
-    let instances = list_instances(repository).await?;
+    let (live, _stale) =
+        reconcile_instances(repository, RetirePolicy::Contradicted, StaleReport::Discard).await?;
     let self_id = repository.instance_id;
 
     let mut matches = Vec::new();
-    for instance in instances {
+    for instance in live {
         if instance.instance_id == self_id {
-            continue;
-        }
-
-        // Skip stale instances whose path no longer exists
-        if is_instance_stale(&instance.path).await {
             continue;
         }
 
@@ -337,7 +539,7 @@ pub async fn instances_on_branch(
 
 /// Event data warning that several instances share the same checked-out branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMultipleInstanceEventData {
     /// The branch checked out by more than one instance
@@ -376,8 +578,8 @@ pub async fn warn_branch_multiple_instance(
 ///
 /// The revision comes from `ANCHOR_CURRENT`, the branch from
 /// `ANCHOR_CURRENT_BRANCH`. If the branch key exists but the revision
-/// is zero, the repository has no commits yet (fresh repo after create).
-pub async fn load_current_anchor(
+/// is zero, the repository has no revisions yet (fresh repo after create).
+pub(crate) async fn load_current_anchor(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Hash, BranchId), AnchorError> {
     let (rev_key, rev_key_type) =
@@ -411,7 +613,8 @@ pub async fn load_current_anchor(
     // file-based `.urc/current` (32-byte revision + 16-byte branch). Migration
     // into the mutable store only runs in write-mode contexts, so a read-only
     // command on a repository with unmigrated anchors would otherwise fail.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+
+    let dot_path = repository.dot_dir_path()?;
     let current_anchor_path = dot_path.join(crate::anchor::CURRENT);
     if current_anchor_path.exists()
         && let Ok((file_revision, file_branch)) =
@@ -422,6 +625,13 @@ pub async fn load_current_anchor(
     }
 
     Err(AnchorError::internal("anchor branch is missing"))
+}
+
+/// Boxed version of [`load_current_anchor`] for cross-crate use.
+pub fn load_current_anchor_boxed(
+    repository: &Arc<RepositoryContext>,
+) -> crate::BoxFuture<'_, Result<(Hash, BranchId), AnchorError>> {
+    Box::pin(load_current_anchor(repository))
 }
 
 /// Load the staged revision hash for this instance from the mutable store.
@@ -447,7 +657,7 @@ pub async fn load_staged_revision(
     // file (32-byte revision + 16-byte branch — branch is ignored here, the
     // staged anchor only carries a revision). Mirrors load_current_anchor's
     // file-based fallback for read-only commands on unmigrated repositories.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.dot_dir_path()?;
     let staged_anchor_path = dot_path.join(crate::anchor::STAGED);
     if staged_anchor_path.exists()
         && let Ok((file_revision, _branch)) =
@@ -471,7 +681,7 @@ pub async fn store_current_anchor(
     handle
         .store(repository.id, key, revision, key_type)
         .await
-        .internal("failed to store current anchor")?;
+        .forward_any::<AnchorError>("failed to store current anchor")?;
     Ok(())
 }
 
@@ -492,7 +702,7 @@ pub async fn store_current_anchor_branch(
     handle
         .store(repository.id, key, Hash::from_context(branch), key_type)
         .await
-        .internal("failed to store current anchor branch")?;
+        .forward_any::<AnchorError>("failed to store current anchor branch")?;
     Ok(())
 }
 
@@ -506,7 +716,7 @@ pub async fn store_staged_anchor(
     handle
         .store(repository.id, key, revision, key_type)
         .await
-        .internal("failed to store staged anchor")?;
+        .forward_any::<AnchorError>("failed to store staged anchor")?;
     Ok(())
 }
 
@@ -527,6 +737,13 @@ pub enum InstanceError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
 }
 
 impl EventError for InstanceError {
@@ -542,19 +759,188 @@ impl EventError for InstanceError {
     }
 }
 
-/// Check whether an instance path refers to a directory that no longer exists on disk.
+/// Whether a registered instance still describes a live checkout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceStaleness {
+    /// The path exists and nothing there contradicts the registration.
+    Active,
+    /// The path no longer exists on disk.
+    PathMissing,
+    /// The path exists but its `.lore/instance` names a different instance:
+    /// the directory was re-created or re-cloned and this registration was
+    /// left behind.
+    Superseded,
+    /// The path exists but holds no readable `.lore/instance`, so no checkout
+    /// the registration could describe.
+    CheckoutMissing,
+}
+
+impl InstanceStaleness {
+    pub fn is_stale(self) -> bool {
+        self != Self::Active
+    }
+
+    /// The value [`LoreRepositoryInstanceEventData::stale`] carries.
+    pub fn as_event_flag(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::PathMissing => 1,
+            Self::Superseded => 2,
+            Self::CheckoutMissing => 3,
+        }
+    }
+}
+
+/// Whether `error`, from examining a path, shows that the path is gone rather
+/// than that it could not be reached.
+fn is_absent(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound && !names_unreachable_volume(error)
+}
+
+/// A drive letter carrying no volume and a network share that cannot be reached
+/// both report the `NotFound` a deleted directory reports. The volume can come
+/// back, so a registration on it is not evidence of a removed checkout.
+#[cfg(target_family = "windows")]
+fn names_unreachable_volume(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == windows_sys::Win32::Foundation::ERROR_INVALID_DRIVE as i32
+                || code == windows_sys::Win32::Foundation::ERROR_BAD_NETPATH as i32
+                || code == windows_sys::Win32::Foundation::ERROR_BAD_NET_NAME as i32
+    )
+}
+
+/// No kernel here reports an unreachable volume as a missing path.
+#[cfg(not(target_family = "windows"))]
+fn names_unreachable_volume(_error: &io::Error) -> bool {
+    false
+}
+
+/// Classify the registration of `instance_id` at `path`.
 ///
-/// An empty path is not considered stale — it indicates corrupt or missing metadata
-/// rather than a removed instance directory.
-async fn is_instance_stale(path: &str) -> bool {
-    !path.is_empty() && !tokio::fs::try_exists(path).await.unwrap_or(false)
+/// Only positive evidence makes a registration stale, since [`instance_prune`]
+/// discards the anchors of what it retires. An absent path and an absent or
+/// truncated instance file are such evidence; an empty path, a zero
+/// `instance_id`, a mount the manager cannot inspect, an unreachable volume,
+/// and a path or instance file that cannot be examined are not, and leave the
+/// registration active.
+///
+/// The instance file is looked up through
+/// [`crate::repository::get_dot_lore_path`], so a legacy `.urc` directory and
+/// an SWFS mount whose `.lore` lives outside the path are both resolved.
+///
+/// Outside the service no mount manager resolves an SWFS instance, whose path
+/// is absent or an empty mount point while it is not mounted. An SWFS instance
+/// cannot be removed by hand, so its external `.lore` in the global data
+/// directory is evidence it still exists, and outweighs a missing path or
+/// checkout.
+pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
+    let staleness = path_staleness(path, instance_id).await;
+    // SWFS instances will seem stale, so if the result would be stale AND there is an external
+    // config AND that config is an SWFS instance, then override the result.
+    if matches!(
+        staleness,
+        InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
+    ) && let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id)
+        && external_dot_lore_names_swfs(&external).await
+    {
+        InstanceStaleness::Active
+    } else {
+        staleness
+    }
+}
+
+/// Classify the registration of `instance_id` at `path` by what the path
+/// holds, as [`instance_staleness`] does before consulting external `.lore`
+/// directories.
+async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
+    if path.is_empty() {
+        return InstanceStaleness::Active;
+    }
+    let io = lore_io::IoDriver::global();
+    match io.metadata(path).await {
+        Ok(_) => {}
+        Err(err) if is_absent(&err) => return InstanceStaleness::PathMissing,
+        Err(_) => return InstanceStaleness::Active,
+    }
+    let Ok(dot_path) = crate::repository::get_dot_lore_path(Path::new(path)) else {
+        return InstanceStaleness::Active;
+    };
+    let expected = instance_id.as_bytes();
+    match io
+        .read_file_bytes(dot_path.join(crate::repository::INSTANCE))
+        .await
+    {
+        // Same read as `InstanceId::read_from_file`: the leading 16 bytes.
+        Ok(bytes) if bytes.len() >= expected.len() => {
+            if instance_id.is_zero() || bytes[..expected.len()] == *expected {
+                InstanceStaleness::Active
+            } else {
+                InstanceStaleness::Superseded
+            }
+        }
+        Ok(_) => InstanceStaleness::CheckoutMissing,
+        Err(err) if is_absent(&err) => InstanceStaleness::CheckoutMissing,
+        Err(_) => InstanceStaleness::Active,
+    }
+}
+
+/// Whether the external `.lore` directory at `dot_lore` holds the config of an
+/// SWFS-backed instance. An absent config names none; one that is present but
+/// cannot be read or parsed is not evidence against an SWFS instance, so it
+/// counts as one.
+#[lore_macro::test_pub]
+async fn external_dot_lore_names_swfs(dot_lore: &Path) -> bool {
+    crate::util::config::load::<crate::repository::RepositoryConfig>(
+        dot_lore.join(crate::repository::CONFIG),
+    )
+    .await
+    .map_or(true, |config| config.is_swfs())
+}
+
+/// The branch (ID and name) and revision an instance has checked out, read
+/// from its anchor keys. Zero or empty where an anchor is absent.
+async fn instance_anchor_state(
+    repository: &Arc<RepositoryContext>,
+    instance_id: InstanceId,
+) -> (BranchId, String, Hash) {
+    let (key, key_type) = anchor_key(repository.salt(), ANCHOR_CURRENT_BRANCH, instance_id);
+    let branch_id = repository
+        .read_mutable_store()
+        .load(repository.id, key, key_type)
+        .await
+        .ok()
+        .filter(|h| !h.is_zero())
+        .map(|h| h.to_context())
+        .unwrap_or_default();
+    let branch_name = if !branch_id.is_zero() {
+        crate::branch::metadata(repository.clone(), branch_id)
+            .await
+            .ok()
+            .and_then(|m| crate::branch::name(&m).ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let (key, key_type) = anchor_key(repository.salt(), ANCHOR_CURRENT, instance_id);
+    let revision = repository
+        .read_mutable_store()
+        .load(repository.id, key, key_type)
+        .await
+        .ok()
+        .filter(|h| !h.is_zero())
+        .unwrap_or_default();
+
+    (branch_id, branch_name, revision)
 }
 
 use crate::event::LoreEvent;
 
 /// Event data describing an instance — used for both listing and prune notifications.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceEventData {
     /// Identifier of the instance
@@ -567,158 +953,95 @@ pub struct LoreRepositoryInstanceEventData {
     pub branch: BranchId,
     /// Current revision hash for the instance
     pub revision: Hash,
-    /// Non-zero if the instance path no longer exists on disk
+    /// Non-zero if the registration no longer describes a live checkout: 1 when
+    /// the path no longer exists on disk, 2 when the path holds a repository
+    /// whose `.lore/instance` names a different instance (superseded by a
+    /// re-create or re-clone), 3 when the path holds no readable
+    /// `.lore/instance` at all
     pub stale: u8,
 }
 
-/// List all registered instances, emitting events for each entry.
+/// Emit a `RepositoryInstance` event describing one registration.
+fn send_instance_event(
+    instance: &InstanceMetadata,
+    staleness: InstanceStaleness,
+    branch: BranchId,
+    branch_name: &str,
+    revision: Hash,
+) {
+    LoreEvent::RepositoryInstance(LoreRepositoryInstanceEventData {
+        instance_id: instance.instance_id,
+        path: LoreString::from_str(&instance.path),
+        branch_name: LoreString::from_str(branch_name),
+        branch,
+        revision,
+        stale: staleness.as_event_flag(),
+    })
+    .send();
+}
+
+/// Emit a `RepositoryInstance` event for a stale registration, reading the
+/// anchors it still holds when they were not captured before retirement.
+async fn send_stale_instance_event(repository: &Arc<RepositoryContext>, entry: &StaleInstance) {
+    let read;
+    let (branch, branch_name, revision) =
+        if let Some((branch, branch_name, revision)) = entry.retired_anchors.as_ref() {
+            (*branch, branch_name.as_str(), *revision)
+        } else {
+            read = instance_anchor_state(repository, entry.metadata.instance_id).await;
+            (read.0, read.1.as_str(), read.2)
+        };
+    send_instance_event(
+        &entry.metadata,
+        entry.staleness,
+        branch,
+        branch_name,
+        revision,
+    );
+}
+
+/// List all registered instances, emitting events for each entry. The stale ones
+/// are reported with their `stale` flag; being a read-only command, this leaves
+/// removing them to [`instance_prune`].
 pub async fn instance_list(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
-    let instances = list_instances(&repository).await?;
-    for instance in &instances {
-        let is_stale = is_instance_stale(&instance.path).await;
-
-        // Read branch ID and name from ANCHOR_CURRENT_BRANCH key
-        let (branch_id, branch_name) = {
-            let (key, key_type) = anchor_key(
-                repository.salt(),
-                ANCHOR_CURRENT_BRANCH,
-                instance.instance_id,
-            );
-            let id = repository
-                .read_mutable_store()
-                .load(repository.id, key, key_type)
-                .await
-                .ok()
-                .filter(|h| !h.is_zero())
-                .map(|h| h.to_context())
-                .unwrap_or_default();
-            let name = if !id.is_zero() {
-                crate::branch::metadata(repository.clone(), id)
-                    .await
-                    .ok()
-                    .and_then(|m| crate::branch::name(&m).ok().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            (id, name)
-        };
-
-        // Read revision from ANCHOR_CURRENT key
-        let revision = {
-            let (key, key_type) =
-                anchor_key(repository.salt(), ANCHOR_CURRENT, instance.instance_id);
-            repository
-                .read_mutable_store()
-                .load(repository.id, key, key_type)
-                .await
-                .ok()
-                .filter(|h| !h.is_zero())
-                .unwrap_or_default()
-        };
-
-        LoreEvent::RepositoryInstance(LoreRepositoryInstanceEventData {
-            instance_id: instance.instance_id,
-            path: LoreString::from_str(&instance.path),
-            branch_name: LoreString::from_str(&branch_name),
-            branch: branch_id,
+    let (live, stale) =
+        reconcile_instances(&repository, RetirePolicy::Contradicted, StaleReport::Return).await?;
+    for instance in &live {
+        let (branch, branch_name, revision) =
+            instance_anchor_state(&repository, instance.instance_id).await;
+        send_instance_event(
+            instance,
+            InstanceStaleness::Active,
+            branch,
+            &branch_name,
             revision,
-            stale: is_stale as u8,
-        })
-        .send();
+        );
+    }
+    for entry in &stale {
+        send_stale_instance_event(&repository, entry).await;
     }
     Ok(())
 }
 
-/// Prune stale instances whose paths no longer exist.
-/// Emits an `Instance` event for each pruned instance.
+/// Prune stale instances: those whose path no longer exists, those whose path
+/// now holds a repository with a different current instance, and those whose
+/// path holds no checkout at all. An SWFS instance with an external `.lore` is
+/// kept whether or not it is mounted; see [`instance_staleness`].
+/// Emits a `RepositoryInstance` event for each pruned instance.
 pub async fn instance_prune(repository: Arc<RepositoryContext>) -> Result<u32, InstanceError> {
-    let instances = list_instances(&repository).await?;
-    let mut pruned = 0u32;
-    for instance in &instances {
-        if !is_instance_stale(&instance.path).await {
-            continue;
-        }
-
-        // Read branch and revision before zeroing so the event has the data
-        let branch_id = {
-            let (key, key_type) = anchor_key(
-                repository.salt(),
-                ANCHOR_CURRENT_BRANCH,
-                instance.instance_id,
-            );
-            repository
-                .read_mutable_store()
-                .load(repository.id, key, key_type)
-                .await
-                .ok()
-                .filter(|h| !h.is_zero())
-                .map(|h| h.to_context())
-                .unwrap_or_default()
-        };
-        let branch_name = if !branch_id.is_zero() {
-            crate::branch::metadata(repository.clone(), branch_id)
-                .await
-                .ok()
-                .and_then(|m| crate::branch::name(&m).ok().map(|s| s.to_string()))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let revision = {
-            let (key, key_type) =
-                anchor_key(repository.salt(), ANCHOR_CURRENT, instance.instance_id);
-            repository
-                .read_mutable_store()
-                .load(repository.id, key, key_type)
-                .await
-                .ok()
-                .filter(|h| !h.is_zero())
-                .unwrap_or_default()
-        };
-
-        // Stale: write zero hashes to remove all instance keys
-        let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
-        let (key, key_type) = instance_key(repository.salt(), instance.instance_id);
-        let _ = handle
-            .store(repository.id, key, Hash::default(), key_type)
-            .await;
-        let (key, key_type) = anchor_key(repository.salt(), ANCHOR_CURRENT, instance.instance_id);
-        let _ = handle
-            .store(repository.id, key, Hash::default(), key_type)
-            .await;
-        let (key, key_type) = anchor_key(
-            repository.salt(),
-            ANCHOR_CURRENT_BRANCH,
-            instance.instance_id,
-        );
-        let _ = handle
-            .store(repository.id, key, Hash::default(), key_type)
-            .await;
-        let (key, key_type) = anchor_key(repository.salt(), ANCHOR_STAGED, instance.instance_id);
-        let _ = handle
-            .store(repository.id, key, Hash::default(), key_type)
-            .await;
-
-        LoreEvent::RepositoryInstance(LoreRepositoryInstanceEventData {
-            instance_id: instance.instance_id,
-            path: LoreString::from_str(&instance.path),
-            branch_name: LoreString::from_str(&branch_name),
-            branch: branch_id,
-            revision,
-            stale: 1,
-        })
-        .send();
-
-        pruned += 1;
+    if repository.try_write_token().is_none() {
+        return Err(WriteRequired.into());
     }
-    if pruned > 0 {
-        let _ = repository.flush(false).await;
+    let (_live, stale) =
+        reconcile_instances(&repository, RetirePolicy::Stale, StaleReport::Return).await?;
+    for entry in &stale {
+        send_stale_instance_event(&repository, entry).await;
     }
-    Ok(pruned)
+    Ok(u32::try_from(stale.len()).unwrap_or(u32::MAX))
 }
 
-/// Update the current instance's metadata path to match the working directory.
+/// Update the current instance's metadata path to match the working directory,
+/// retiring any registration another instance left at that path.
 pub async fn update_path(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
     let current_path = repository.path_for_display().to_string();
     register_instance(&repository, repository.instance_id, &current_path).await?;
@@ -735,73 +1058,5 @@ impl fmt::Display for InstanceId {
 impl fmt::Debug for InstanceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "InstanceId({})", hex::encode(self.data))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::repository::SALT_LORE;
-
-    #[test]
-    fn instance_key_is_deterministic() {
-        let id = InstanceId::generate();
-        let (key1, typ1) = instance_key(SALT_LORE, id);
-        let (key2, typ2) = instance_key(SALT_LORE, id);
-        assert_eq!(key1, key2);
-        assert_eq!(typ1, typ2);
-        assert_eq!(typ1, KeyType::Instance);
-    }
-
-    #[test]
-    fn instance_key_differs_for_different_ids() {
-        let a = InstanceId::generate();
-        let b = InstanceId::generate();
-        let (key_a, _) = instance_key(SALT_LORE, a);
-        let (key_b, _) = instance_key(SALT_LORE, b);
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn anchor_keys_differ_for_current_vs_staged() {
-        let id = InstanceId::generate();
-        let (current, typ_c) = anchor_key(SALT_LORE, ANCHOR_CURRENT, id);
-        let (staged, typ_s) = anchor_key(SALT_LORE, ANCHOR_STAGED, id);
-        assert_ne!(current, staged);
-        assert_eq!(typ_c, KeyType::Untyped);
-        assert_eq!(typ_s, KeyType::Untyped);
-    }
-
-    #[test]
-    fn generate_produces_nonzero_unique_values() {
-        let a = InstanceId::generate();
-        let b = InstanceId::generate();
-        assert!(!a.is_zero());
-        assert!(!b.is_zero());
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn default_is_zero() {
-        let id = InstanceId::default();
-        assert!(id.is_zero());
-    }
-
-    #[test]
-    fn roundtrip_bytes() {
-        let id = InstanceId::generate();
-        let bytes = id.as_bytes().to_vec();
-        assert_eq!(bytes.len(), 16);
-        let mut restored = InstanceId::default();
-        restored.as_mut_bytes().copy_from_slice(&bytes);
-        assert_eq!(id, restored);
-    }
-
-    #[test]
-    fn display_is_hex() {
-        let id = InstanceId::generate();
-        let s = id.to_string();
-        assert_eq!(s.len(), 32); // 16 bytes = 32 hex chars
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -24,6 +24,7 @@ mod tests {
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreMetadata;
     use lore_revision::interface::LoreString;
+    use lore_revision::repository::LoreSharedStoreMode;
     use parking_lot::Mutex;
     use rand::Rng;
     use rand::distr::Alphanumeric;
@@ -54,8 +55,9 @@ mod tests {
             repository_url: url.into(),
             id: LoreString::default(),
             description: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
+            vfs: Default::default(),
         };
 
         let result = lore::repository::create(globals.clone(), args, None).await;
@@ -191,8 +193,9 @@ mod tests {
             repository_url: url.into(),
             id: LoreString::default(),
             description: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
+            vfs: Default::default(),
         };
 
         let result = lore::repository::create(globals.clone(), args, None).await;

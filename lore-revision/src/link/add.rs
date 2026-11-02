@@ -3,35 +3,38 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use tokio::fs;
 
 use super::LinkError;
 use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Address;
 use crate::lore::BranchId;
-use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::node::Node;
 use crate::node::NodeFlags;
-use crate::node::ROOT_NODE;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
+use crate::repository::clone::CloneContext;
 use crate::repository::clone::CloneStats;
 use crate::repository::clone::LoreRepositoryCloneBeginEventData;
 use crate::repository::clone::LoreRepositoryCloneCountData;
 use crate::repository::clone::LoreRepositoryCloneEndEventData;
 use crate::stage;
 use crate::stage::StageOptions;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
@@ -46,10 +49,28 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
-    let (remote_url, name) = repository::parse_url(&link_identifier, false)
-        .forward_with::<LinkError, _>(|| {
+    // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
+    // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
+    // which form this is. A schemeless identifier names a repository on the same remote as
+    // this one, so resolve it against this repository's own configured remote rather than
+    // reading its first segment as a host. Taking the remote from the config also keeps the
+    // link and the repository pointing at the same server, which the environment variable
+    // this replaces could not guarantee.
+    let (remote_url, name) = if link_identifier.contains("://") {
+        repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(|| {
             format!("Invalid repository URL or ID: {link_identifier}")
-        })?;
+        })?
+    } else {
+        let remote_url = repository
+            .require_path()
+            .ok()
+            .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
+            .unwrap_or_default();
+        if remote_url.is_empty() {
+            return Err(LinkError::from(crate::errors::NoRemote));
+        }
+        (remote_url, link_identifier.clone())
+    };
 
     let context = execution_context();
     let identity = context.globals().identity().unwrap_or_default();
@@ -72,7 +93,7 @@ pub async fn add(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     lore_debug!("Resolve link {link} {source_path}");
-    let link = Arc::new(repository.to_link_context(link).await);
+    let link = repository.to_link_context(link).await;
 
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
 
@@ -107,6 +128,13 @@ pub async fn add(
             branch::load_remote_latest(link_remote.clone(), link.id, current_branch_id).await
         {
             lore_debug!("Using existing link branch at LATEST ({link_latest})");
+            link::report_branch_outcome(
+                link_path.as_str(),
+                link.id,
+                current_branch_id,
+                link_latest,
+                true, /* reused */
+            );
             link_latest
         } else {
             let link_metadata = repository::metadata_hash(link.clone())
@@ -129,7 +157,7 @@ pub async fn add(
                     .await
                     .forward::<LinkError>("Failed getting branch metadata")?;
 
-            let link_latest = link::create_branch(
+            let outcome = link::create_branch(
                 link.clone(),
                 link_remote.clone(),
                 current_branch_id,
@@ -140,12 +168,21 @@ pub async fn add(
             )
             .await?;
 
-            lore_debug!(
-                "Created branch {} at LATEST ({link_latest}) in linked repo",
-                current_branch_id
+            link::report_branch_outcome(
+                link_path.as_str(),
+                link.id,
+                current_branch_id,
+                outcome.revision,
+                outcome.reused,
             );
 
-            link_latest
+            lore_debug!(
+                "Created branch {} at LATEST ({}) in linked repo",
+                current_branch_id,
+                outcome.revision
+            );
+
+            outcome.revision
         };
 
         let link_revision = if let Some(pin) = pin {
@@ -159,9 +196,15 @@ pub async fn add(
         (link_revision, current_branch_id)
     };
 
-    let branch_metadata = branch::metadata(link.clone(), link_branch)
-        .await
-        .forward::<LinkError>("Failed getting branch metadata")?;
+    // A dry run does not create a missing link branch, which takes the name of the branch it
+    // is created for in this repository.
+    let branch_metadata = match branch::metadata(link.clone(), link_branch).await {
+        Err(err) if err.is_branch_not_found() && execution_context().globals().dry_run() => {
+            branch::metadata(repository.clone(), link_branch).await
+        }
+        metadata => metadata,
+    }
+    .forward::<LinkError>("Failed getting branch metadata")?;
     let branch_name =
         branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
 
@@ -203,58 +246,59 @@ pub async fn add(
         ));
     }
 
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
+    let clone_path = link_path.clone();
 
-    // If a directory already exists, make sure it doesn't have any children
-    let link_path_exists = match fs::read_dir(absolute_path.clone()).await {
-        Ok(mut entries) => {
-            if entries
-                .next_entry()
-                .await
-                .internal("Failed to check link path")?
-                .is_some()
-            {
-                return Err(LinkError::internal(format!(
-                    "Link path already has children {}",
-                    absolute_path.display()
-                )));
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(LinkError::internal(format!(
-                "Failed to check link path: {error}"
-            )));
-        }
-    };
+    // Resolve through any parent links so the link lands in the innermost
+    // containing repository (empty chain for a plain top-level link).
+    let chain = link::resolve_link_chain(
+        NodeMapping::root(repository.clone(), state_staged.clone()),
+        state_current.clone(),
+        link_path.clone(),
+        current_branch,
+    )
+    .await?;
 
-    if let Ok(node_link) = state_staged
-        .find_node_link(repository.clone(), link_path.as_str())
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
+    let remainder_path = chain.remainder_path.clone();
+
+    // The stored path rather than the argument, which resolved case-insensitively.
+    let resolved_source_path =
+        link::link_source_path(link.clone(), &link_state, link_node_link.node)
+            .await
+            .forward::<LinkError>("Failed resolving link source path")?;
+
+    link::check_source_path_overlap(
+        &inner_state,
+        inner_repository.clone(),
+        link.clone(),
+        resolved_source_path,
+        crate::node::INVALID_NODE,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
+
+    if let Ok(node_link) = inner_state
+        .find_relative_node_link(
+            inner_repository.clone(),
+            chain.innermost.node,
+            remainder_path.as_str(),
+        )
         .await
-        && let Ok(node) = state_staged.node(repository.clone(), node_link.node).await
+        && let Ok(node) = inner_state.node(inner_repository.clone(), node_link.node).await
         // Allow re-adding a link to a path that is staged for delete
         && !node.is_staged_delete()
     {
-        // Prevent adding a link to a link
-        // TODO(vri): UCS-17744 - Allow adding nested links
-        if node_link.repository != repository.id {
-            return Err(LinkError::internal(
-                "Link path cannot be in a linked repository: Nested link",
-            ));
-        }
-
         // Prevent linking into file or other link
         if !node.is_directory() {
             return Err(LinkError::internal(format!(
-                "Link path is already a link {}",
-                absolute_path.display()
+                "Link path is already a link {clone_path}"
             )));
         }
 
         let mut children = StateNodeChildrenIterator::new(
-            state_staged.clone(),
-            repository.clone(),
+            inner_state.clone(),
+            inner_repository.clone(),
             node_link.node,
         )
         .await
@@ -265,59 +309,25 @@ pub async fn add(
             && child.is_some()
         {
             return Err(LinkError::internal(format!(
-                "Link path already has children {}",
-                absolute_path.display()
+                "Link path already has children {clone_path}"
             )));
         }
     };
 
-    let mut parent_path = link_path.clone();
-    parent_path.pop();
+    // Intermediate directories leading to the link, relative to the innermost repo.
+    let mut remainder_parent = remainder_path.clone();
+    remainder_parent.pop();
 
-    if !parent_path.is_empty() {
-        let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
-
-        if !fs::try_exists(parent_absolute_path.as_path())
-            .await
-            .unwrap_or_default()
-        {
-            lore_debug!("Creating directory {parent_absolute_path:?}");
-            fs::create_dir_all(parent_absolute_path.as_path())
-                .await
-                .internal_with(|| {
-                    format!(
-                        "Failed to create directory {}",
-                        parent_absolute_path.display()
-                    )
-                })?;
-        }
-
-        lore_debug!("Staging link parent path");
-        Box::pin(stage::stage_filesystem_path(
-            repository.clone(),
-            state_staged.clone(),
-            repository.require_path()?.to_path_buf(),
-            RelativePathBuf::new(),
-            ROOT_NODE,
-            parent_path,
-            Arc::default(),
-            StageOptions {
-                no_children: true,
-                ..Default::default()
-            },
-            None, // No link tracking when adding links
-            None, // No layer mask
-        ))
+    with_operation(repository.file_system(), async |operation| {
+        create_link_mount(
+            &operation,
+            chain.innermost.clone(),
+            remainder_parent,
+            &clone_path,
+        )
         .await
-        .forward::<LinkError>("Failed staging the link node")?;
-    }
-
-    if !link_path_exists {
-        lore_debug!("Creating directory {link_path}");
-        fs::create_dir_all(absolute_path.as_path())
-            .await
-            .internal_with(|| format!("Failed to create directory {}", absolute_path.display()))?;
-    }
+    })
+    .await?;
 
     lore_debug!("Staging link node");
     let node = Node {
@@ -330,9 +340,9 @@ pub async fn add(
         ..Default::default()
     };
     let link_node = stage::stage_single_node(
-        repository.clone(),
-        state_staged.clone(),
-        link_path.clone(),
+        inner_repository.clone(),
+        inner_state.clone(),
+        remainder_path.clone().freeze(),
         node,
         Arc::default(),
         None, // No link tracking when adding links
@@ -348,9 +358,9 @@ pub async fn add(
         (LinkFlags::NoFlags, BranchId::default())
     };
 
-    state_staged
+    inner_state
         .link_add(
-            repository.clone(),
+            inner_repository.clone(),
             link.id,
             stored_branch,
             link_revision,
@@ -368,7 +378,7 @@ pub async fn add(
         .await
         .forward::<LinkError>("Not connected")?;
 
-    lore_debug!("Clone link in {link_path}");
+    lore_debug!("Clone link in {}", link_path);
 
     event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
         repository: link.id,
@@ -379,18 +389,27 @@ pub async fn add(
     .send();
 
     let stats = Arc::new(CloneStats::default());
-    clone::clone_node(
-        link.clone(),
-        storage,
-        link_state,
-        absolute_path,
-        source_path,
-        link_node_link.node,
-        Arc::default(), /* Default options */
-        stats.clone(),
-    )
-    .await
-    .forward::<LinkError>("Failed cloning target link")?;
+    let clone_states = link.filter.mount_states(&clone_path);
+    with_operation(link.file_system(), async |operation| {
+        let clone_ctx = CloneContext {
+            repository: link.clone(),
+            state: link_state,
+            operation,
+            options: Arc::default(),
+            stats: stats.clone(),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        };
+        clone::clone_node(
+            clone_ctx,
+            storage,
+            clone_path,
+            link_node_link.node,
+            clone_states,
+        )
+        .await
+        .forward::<LinkError>("Failed cloning target link")
+    })
+    .await?;
 
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
@@ -399,14 +418,10 @@ pub async fn add(
     })
     .send();
 
-    state_staged.set_parent_self(state_current.revision());
+    // Fold nested link revisions up into the top-level state (no-op if flat).
+    link::propagate_link_chain(&chain, token).await?;
 
-    // If staged state is the initial stage based on current state, reset other parent. Otherwise
-    // leave it as is, in case previous staged state was a merge/integrate
-    if state_staged.revision() == state_current.revision() {
-        state_staged.set_parent_other(Hash::default());
-        state_staged.set_metadata_hash(Hash::default());
-    }
+    state_staged.reparent_onto(state_current.revision());
 
     // Serialize the staged state
     let signature = state_staged
@@ -426,6 +441,97 @@ pub async fn add(
         LoreFileAction::Add,
     ))
     .send();
+
+    Ok(())
+}
+
+/// Creates the directory the link mounts at and the one holding it, and stages the intermediate
+/// path against the innermost repository.
+///
+/// A mount point the filesystem already holds is taken only as an empty directory: a file, or a
+/// directory with children, is something the link would displace.
+///
+/// One operation covers all of it: the mount point, the directory the link is placed in, the path
+/// staged against the innermost repository, and the mount directory itself are in the same
+/// filesystem.
+async fn create_link_mount(
+    operation: &Arc<InstanceOperationImpl>,
+    innermost: NodeMapping,
+    remainder_parent: RelativePathBuf,
+    clone_path: &RelativePath,
+) -> Result<(), LinkError> {
+    let mount_info = operation
+        .file_info(clone_path)
+        .await
+        .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?;
+    match mount_info {
+        FileInfo::NotExist => {}
+        FileInfo::Directory => {
+            let mut entries = operation
+                .read_directory(clone_path)
+                .await
+                .forward_with::<LinkError, _>(|| {
+                    format!("Failed to check link path {clone_path}")
+                })?;
+            if entries
+                .next()
+                .await
+                .transpose()
+                .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?
+                .is_some()
+            {
+                return Err(LinkError::internal(format!(
+                    "Link path already has children {clone_path}"
+                )));
+            }
+        }
+        FileInfo::File { .. } => {
+            return Err(LinkError::internal(format!(
+                "Link path is a file {clone_path}"
+            )));
+        }
+    }
+
+    let parent_path = clone_path.parent_path();
+    if !operation
+        .file_info(&parent_path)
+        .await
+        .is_ok_and(|info| info.exists())
+    {
+        lore_debug!("Creating directory {parent_path}");
+        operation
+            .create_dir_all(&parent_path)
+            .await
+            .forward_with::<LinkError, _>(|| format!("Failed to create directory {parent_path}"))?;
+    }
+
+    if !remainder_parent.is_empty() {
+        lore_debug!("Staging link parent path in innermost repository");
+        Box::pin(stage::stage_filesystem_path(
+            operation.clone(),
+            innermost,
+            remainder_parent.freeze(),
+            Arc::default(),
+            StageOptions {
+                no_children: true,
+                ..Default::default()
+            },
+            None, // No link tracking when adding links
+            None, // No layer mask
+            None, // Prefixes resolved for the outer repository do not apply
+            None, // Node ids here index the inner repository's own state
+        ))
+        .await
+        .forward::<LinkError>("Failed staging the link node")?;
+    }
+
+    if mount_info == FileInfo::NotExist {
+        lore_debug!("Creating directory {clone_path}");
+        operation
+            .create_dir_all(clone_path)
+            .await
+            .forward_with::<LinkError, _>(|| format!("Failed to create directory {clone_path}"))?;
+    }
 
     Ok(())
 }

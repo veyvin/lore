@@ -12,8 +12,13 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
+use crate::grpc::no_repository_access_status;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryMetadataGet` handler.
@@ -24,12 +29,13 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryMetadataGet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryMetadataGetRequest>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataGetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
@@ -45,8 +51,18 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            authorizer
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository_id.into(),
+                    Action::Read,
+                )
+                .await
+                .map_err(|_err| no_repository_access_status())?;
+
             let metadata_hash = repository::metadata_hash(repository)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| Status::not_found(err.to_string()))?;
 
             Ok(Response::new(RepositoryMetadataGetResponse {

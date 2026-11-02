@@ -8,8 +8,6 @@ use lore_error_set::prelude::*;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 
-use crate::compress::FRAGMENT_SIZE_THRESHOLD;
-
 /// Minimum fragment size for chunking (32 KiB).
 pub const FRAGMENT_SIZE_MINIMUM: usize = 32 * 1024;
 
@@ -20,19 +18,15 @@ pub const FILE_COUNT_LIMIT_DEFAULT: usize = 10000;
 
 // Fragment concurrency is budgeted in KiB units. The total budget allows ~4000
 // maximum-size (256 KiB) fragments in flight simultaneously (1 GiB total).
-// Each fragment acquires max(ceil(content_size / 1024), FRAGMENT_MINIMUM_COST_KIB)
-// permits, so small fragments are capped at FRAGMENT_MINIMUM_COST_KIB to also
-// bound the fragment count (~265k for tiny fragments).
+// Each fragment acquires ceil(content_size / 1024) permits, floored at
+// FRAGMENT_MINIMUM_COST_KIB so tiny fragments bound the fragment count as well as
+// the bytes (~265k of them).
 pub const FRAGMENT_BUDGET_KIB: usize = 1024 * 1024; // 1 GiB
 pub const FRAGMENT_MINIMUM_COST_KIB: u32 = 4;
-const FRAGMENT_MAXIMUM_COST_KIB: u32 = FRAGMENT_SIZE_THRESHOLD as u32;
 
 static FILE_COUNT_LIMITER: OnceLock<Semaphore> = OnceLock::<Semaphore>::new();
 static FRAGMENT_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static COMPRESS_LIMITER: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-
-/// When true, load operations enforce repository isolation.
-pub static LOCAL_ISOLATION: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// Configured file count limit. Set via [`configure`] before first use.
 static FILE_COUNT_LIMIT_CONFIG: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -73,6 +67,10 @@ fn compress_limiter() -> &'static Option<Arc<Semaphore>> {
 
 /// Acquire a permit from the compress limiter if one is configured.
 /// Returns `None` if no compress limit is active.
+///
+/// No limit is the default and not a missing bound: compression is synchronous on a core worker,
+/// so at most one runs per worker regardless, each holding one output buffer. The limiter reserves
+/// CPU for other work — a limit at the worker count would bound nothing.
 pub async fn compress_limit_acquire() -> Option<SemaphorePermit<'static>> {
     if let Some(semaphore) = compress_limiter().as_deref() {
         semaphore.acquire().await.ok()
@@ -134,113 +132,65 @@ pub async fn acquire_fragment_memory_permit(
         .ok()
 }
 
-/// Compute the number of semaphore permits a fragment of `content_size` bytes
-/// should acquire from the fragment limiter.
+/// Budget for a chunk buffer of `buffer_len` bytes, preferring a fresh permit from the
+/// fragment limiter and falling back to `reserved` — the one chunk the caller's chunker
+/// already paid for. `None` only if the limiter has been closed.
+///
+/// The two sources are one return value because they have one lifetime: whichever it is
+/// must be dropped where the buffer is, and the buffer's write may continue in a detached
+/// task long after the caller that acquired this has returned. Handing back a pair let a
+/// caller move the permit into that task and leave the reservation behind, which released
+/// it at dispatch and stopped accounting for bytes that were still resident — and since the
+/// reservation was then free again immediately, a file could stream its whole content into
+/// detached writes without the limiter charging any of it.
+///
+/// A failed `try_acquire` does **not** mean the budget is exhausted: tokio assigns
+/// released permits straight to queued waiters and only returns the remainder to the
+/// semaphore once the queue empties, so one waiter anywhere keeps `try_acquire`
+/// failing for every caller. Reading that as saturation is what made large files
+/// degrade to one chunk at a time whenever any other file is waiting.
+///
+/// If `reserved` is in use too this waits for whichever frees first, which cannot
+/// stall: the chunk holding `reserved` needs no budget to finish. What the caller
+/// must not do is wait on the limiter *alone* while holding a chunker window, since
+/// that is budget only it could release.
+pub async fn acquire_chunk_budget(
+    buffer_len: usize,
+    reserved: &Arc<Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    acquire_chunk_budget_from(fragment_limiter_arc(), buffer_len, reserved).await
+}
+
+#[lore_macro::test_pub]
+async fn acquire_chunk_budget_from(
+    limiter: &Arc<Semaphore>,
+    buffer_len: usize,
+    reserved: &Arc<Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permits = fragment_permit_count(buffer_len);
+    if let Ok(permit) = Arc::clone(limiter).try_acquire_many_owned(permits) {
+        return Some(permit);
+    }
+    if let Ok(slot) = Arc::clone(reserved).try_acquire_owned() {
+        return Some(slot);
+    }
+    tokio::select! {
+        permit = Arc::clone(limiter).acquire_many_owned(permits) => permit.ok(),
+        slot = Arc::clone(reserved).acquire_owned() => slot.ok(),
+    }
+}
+
+/// Permits a buffer of `content_size` bytes costs against the fragment limiter.
+///
+/// Capped at the limiter's own total: a larger request could never be satisfied, and one past
+/// `u32::MAX >> 3` panics inside tokio. Not capped at one fragment — the chunker charges whole
+/// windows here. A size taken from a fragment list is bounded before it arrives, by the tier
+/// check in `walk_leaf_level`.
 pub fn fragment_permit_count(content_size: usize) -> u32 {
-    // Clamp before casting to u32 to avoid overflow for content sizes >= 4 TiB
-    (content_size
+    content_size
         .div_ceil(1024)
-        .min(FRAGMENT_MAXIMUM_COST_KIB as usize) as u32)
-        .max(FRAGMENT_MINIMUM_COST_KIB)
+        .clamp(FRAGMENT_MINIMUM_COST_KIB as usize, FRAGMENT_BUDGET_KIB) as u32
 }
 
 #[error_set]
 pub enum SemaphoreError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fragment_permit_count_minimum() {
-        // Very small content should be clamped to FRAGMENT_MINIMUM_COST_KIB
-        assert_eq!(fragment_permit_count(0), FRAGMENT_MINIMUM_COST_KIB);
-        assert_eq!(fragment_permit_count(1), FRAGMENT_MINIMUM_COST_KIB);
-        assert_eq!(fragment_permit_count(1024), FRAGMENT_MINIMUM_COST_KIB);
-    }
-
-    #[test]
-    fn fragment_permit_count_maximum() {
-        // Very large content should be clamped to FRAGMENT_MAXIMUM_COST_KIB
-        let huge = 1024 * 1024 * 1024; // 1 GiB
-        assert_eq!(fragment_permit_count(huge), FRAGMENT_MAXIMUM_COST_KIB);
-    }
-
-    #[test]
-    fn fragment_permit_count_mid_range() {
-        // 100 KiB content -> ceil(100*1024/1024) = 100 permits
-        let size = 100 * 1024;
-        assert_eq!(fragment_permit_count(size), 100);
-    }
-
-    #[tokio::test]
-    async fn acquire_fragment_memory_permit_sizes_by_buffer() {
-        // Inspect the permit's own `num_permits()` so the test does not sample
-        // the global semaphore's available_permits (which other concurrent
-        // tests perturb).
-        let permit_small = acquire_fragment_memory_permit(1).await.expect("small");
-        assert_eq!(
-            permit_small.num_permits(),
-            FRAGMENT_MINIMUM_COST_KIB as usize,
-            "1-byte buffer should cost FRAGMENT_MINIMUM_COST_KIB permits"
-        );
-        drop(permit_small);
-
-        let permit_mid = acquire_fragment_memory_permit(100 * 1024)
-            .await
-            .expect("mid");
-        assert_eq!(
-            permit_mid.num_permits(),
-            100,
-            "100 KiB buffer should cost 100 permits"
-        );
-        drop(permit_mid);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fragment_memory_permit_saturation_does_not_deadlock() {
-        // Use a dedicated Arc<Semaphore> for this stress test so we don't
-        // perturb the global fragment_limiter (other tests sample it). The
-        // permit-sizing logic is the same function (fragment_permit_count),
-        // the only difference is which semaphore we acquire against.
-        let semaphore = Arc::new(Semaphore::new(16 * FRAGMENT_MINIMUM_COST_KIB as usize));
-
-        const N: usize = 100;
-        let mut handles = Vec::with_capacity(N);
-        for _ in 0..N {
-            let semaphore = Arc::clone(&semaphore);
-            handles.push(lore_base::lore_spawn!(async move {
-                let permit_count = fragment_permit_count(1);
-                let p = semaphore
-                    .acquire_many_owned(permit_count)
-                    .await
-                    .expect("acquire");
-                drop(p);
-            }));
-        }
-        for h in handles {
-            h.await.expect("join");
-        }
-
-        assert_eq!(
-            semaphore.available_permits(),
-            16 * FRAGMENT_MINIMUM_COST_KIB as usize,
-            "all permits must be released after the stress burst"
-        );
-    }
-
-    #[tokio::test]
-    async fn fragment_limiter_owned_shares_budget_with_borrowed() {
-        // The two handles MUST reference the same underlying Semaphore so
-        // permits acquired from one count against the other's budget. Assert
-        // pointer equality directly instead of sampling the budget (which
-        // other concurrent tests perturb).
-        let borrowed: *const Semaphore = fragment_limiter();
-        let owned_arc = fragment_limiter_owned();
-        let owned: *const Semaphore = Arc::as_ptr(&owned_arc);
-        assert_eq!(
-            borrowed, owned,
-            "fragment_limiter and fragment_limiter_owned must share the same semaphore"
-        );
-    }
-}

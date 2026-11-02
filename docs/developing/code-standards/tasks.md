@@ -36,9 +36,12 @@ Use `AbortOnDropHandle` (from `tokio_util`) for background tasks that shouldn't 
 `lore_spawn!` return value in `AbortOnDropHandle::new(...)` and the task is automatically aborted when the handle is
 dropped.
 
+Spawn tasks that must not stop part way, such as a request that is not cancel safe, into a `DetachingJoinSet` (from
+`lore_base::runtime`). Dropping it detaches its tasks, and each task's output is dropped when the task ends.
+
 ## Error handling
 
-Map `JoinError` (task panics/cancellations) to your error type via `emit_map_err`. Use `lore_drain_tasks!` as shorthand
+Map `JoinError` (task panics/cancellations) to your error type via `.internal("...")` — it is a foreign error. Use `lore_drain_tasks!` as shorthand
 for collecting the first error from a JoinSet while allowing all tasks to complete.
 
 ## Crate-specific patterns
@@ -74,4 +77,4 @@ originating request.
 3. **Prefer JoinSet** over individual `JoinHandle`s for multi-task coordination.
 4. **Use `lore_spawn_blocking!`** for CPU-bound work to avoid blocking the async runtime.
 5. **Use `.in_current_span()`** on all spawned tasks where the `tracing` crate is a dependency.
-6. **Handle JoinError** — Map task panics and cancellations to your error type via `emit_map_err`.
+6. **Handle JoinError** — Map task panics and cancellations to your error type via `.internal("...")`.

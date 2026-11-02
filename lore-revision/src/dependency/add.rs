@@ -47,7 +47,7 @@ pub async fn add_file_dependencies(
 ) -> Result<AddResult, DependencyError> {
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("deserializing current anchor")?;
+        .forward::<DependencyError>("deserializing current anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -56,7 +56,7 @@ pub async fn add_file_dependencies(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("deserializing state")?;
+        .forward::<DependencyError>("deserializing state")?;
 
     // Resolve all paths to NodeIDs upfront
     type ResolvedDep<'a> = (NodeID, Vec<&'a str>);
@@ -146,14 +146,7 @@ pub async fn add_file_dependencies(
     }
 
     // Serialize state if modified
-    flush_state(
-        &repository,
-        token,
-        &state,
-        current_revision,
-        staged_revision,
-    )
-    .await?;
+    flush_state(&repository, token, &state, current_revision).await?;
 
     Ok(AddResult { added })
 }
@@ -188,26 +181,20 @@ pub async fn resolve_path(
 pub(super) async fn flush_state(
     repository: &Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state: &State,
+    state: &Arc<State>,
     current_revision: Hash,
-    staged_revision: Hash,
 ) -> Result<(), DependencyError> {
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)
             .await
-            .internal("serializing state")?;
+            .forward::<DependencyError>("serializing state")?;
 
         crate::instance::store_staged_anchor(repository, signature)
             .await
-            .internal("flushing stores and serializing staged anchor")?;
+            .forward::<DependencyError>("flushing stores and serializing staged anchor")?;
     }
 
     Ok(())

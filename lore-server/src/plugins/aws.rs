@@ -38,6 +38,7 @@ use crate::plugins::MutableStorePluginFactory;
 use crate::plugins::PluginError;
 use crate::plugins::PluginRegistry;
 
+#[lore_macro::test_pub]
 const PLUGIN_NAME: &str = "aws";
 
 // =============================================================================
@@ -69,8 +70,27 @@ pub struct AwsImmutableStorePluginConfig {
     /// `DynamoDB` table name for storing fragment associations.
     pub dynamodb_fragments_table: String,
 
-    /// `DynamoDB` table name for storing fragment metadata.
-    pub dynamodb_metadata_table: String,
+    /// `DynamoDB` table name for storing fragment state, where a row's presence means the hash
+    /// exists.
+    ///
+    /// Required, and deliberately without an alias: this table is its own, distinct from the one
+    /// that held fragment metadata, and which table serves it is a decision rather than something
+    /// to inherit.
+    pub dynamodb_fragment_state_table: String,
+
+    /// Optional `DynamoDB` table to read fragments from for objects written before they moved onto
+    /// the S3 object.
+    ///
+    /// Accepts the older `dynamodb_metadata_table` spelling, which is what a configuration written
+    /// before that change already points at — that table holds fragment metadata, and reading it is
+    /// exactly what it is still needed for.
+    ///
+    /// Leaving it unset declares that no object predating the change exists, so an object carrying
+    /// no metadata of its own is reported as damaged rather than described from a row that cannot
+    /// be about it. Set it only where such objects may still exist; once a backfill has given them
+    /// all their own metadata, removing it retires the fallback read.
+    #[serde(default, alias = "dynamodb_metadata_table")]
+    pub dynamodb_fragment_metadata_table: Option<String>,
 
     /// Optional `DynamoDB` endpoint URL (for `LocalStack` or other `DynamoDB`-compatible services).
     #[serde(default)]
@@ -222,10 +242,13 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             plugin_name = plugin_name,
             s3_bucket = %plugin_config.s3_bucket,
             fragments_table = %plugin_config.dynamodb_fragments_table,
-            metadata_table = %plugin_config.dynamodb_metadata_table,
+            fragment_state_table = %plugin_config.dynamodb_fragment_state_table,
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
@@ -277,7 +300,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                 )
                 .dynamodb()
                 .ensure_table(&plugin_config.dynamodb_fragments_table)
-                .ensure_table(&plugin_config.dynamodb_metadata_table);
+                .ensure_table(&plugin_config.dynamodb_fragment_state_table);
 
                 let dynamodb_client =
                     Box::pin(dynamodb_client_builder.build())
@@ -304,7 +327,8 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
 
         let dynamodb_settings = DynamoDbImmutableStoreSettings {
             fragments_table_name: plugin_config.dynamodb_fragments_table,
-            metadata_table_name: plugin_config.dynamodb_metadata_table,
+            fragment_state_table_name: plugin_config.dynamodb_fragment_state_table,
+            fragment_metadata_table_name: plugin_config.dynamodb_fragment_metadata_table,
             endpoint_url: plugin_config.dynamodb_endpoint_url,
             region: plugin_config.dynamodb_region,
             slow_operation_threshold_millis: plugin_config.dynamodb_slow_operation_threshold_millis,
@@ -370,6 +394,9 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
             "Creating AWS mutable store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 let builder = Box::pin(
@@ -461,6 +488,9 @@ impl LockStorePluginFactory for AwsLockStorePluginFactory {
             "Creating DynamoDB lock store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(async {
                 let builder = Box::pin(
@@ -521,195 +551,3 @@ pub fn register(registry: &mut PluginRegistry) {
 // =============================================================================
 // Tests
 // =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use tokio::runtime::Handle;
-
-    use super::*;
-
-    #[test]
-    fn test_immutable_store_factory_name() {
-        let factory = AwsImmutableStorePluginFactory;
-        assert_eq!(factory.name(), PLUGIN_NAME);
-    }
-
-    #[test]
-    fn test_mutable_store_factory_name() {
-        let factory = AwsMutableStorePluginFactory;
-        assert_eq!(factory.name(), PLUGIN_NAME);
-    }
-
-    #[test]
-    fn test_lock_store_factory_name() {
-        let factory = AwsLockStorePluginFactory;
-        assert_eq!(factory.name(), PLUGIN_NAME);
-    }
-
-    #[tokio::test]
-    async fn test_register_adds_aws_resource_detector() {
-        let mut registry = PluginRegistry::new();
-        register(&mut registry);
-
-        // The module registers a single AWS resource detector, independent of
-        // its three store factories.
-        assert_eq!(registry.resource_detectors(Handle::current()).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_immutable_store_config_parsing_error() {
-        let factory = AwsImmutableStorePluginFactory;
-
-        // Invalid config - missing required fields
-        let config = toml::Value::Table(toml::map::Map::new());
-        let result = factory.validate_config(&config);
-
-        let err = result.expect_err("should fail");
-        let config_err = err
-            .as_plugin_config_error()
-            .expect("should be PluginConfigError");
-        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
-        assert!(config_err.message.contains("Failed to deserialize"));
-    }
-
-    #[tokio::test]
-    async fn test_mutable_store_config_parsing_error() {
-        let factory = AwsMutableStorePluginFactory;
-
-        // Invalid config - missing required fields
-        let config = toml::Value::Table(toml::map::Map::new());
-        let result = factory.validate_config(&config);
-
-        let err = result.expect_err("should fail");
-        let config_err = err
-            .as_plugin_config_error()
-            .expect("should be PluginConfigError");
-        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
-        assert!(config_err.message.contains("Failed to deserialize"));
-    }
-
-    #[tokio::test]
-    async fn test_lock_store_config_parsing_error() {
-        let factory = AwsLockStorePluginFactory;
-
-        // Invalid config - missing required fields
-        let config = toml::Value::Table(toml::map::Map::new());
-        let result = factory.validate_config(&config);
-
-        let err = result.expect_err("should fail");
-        let config_err = err
-            .as_plugin_config_error()
-            .expect("should be PluginConfigError");
-        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
-        assert!(config_err.message.contains("Failed to deserialize"));
-    }
-
-    #[tokio::test]
-    async fn test_register_adds_all_plugins() {
-        let mut registry = PluginRegistry::new();
-        register(&mut registry);
-
-        let immutable_plugins = registry.list_immutable_store_plugins();
-        assert!(
-            immutable_plugins.contains(&PLUGIN_NAME.to_string()),
-            "Expected 'aws' in immutable store plugins, found: {immutable_plugins:?}"
-        );
-
-        let mutable_plugins = registry.list_mutable_store_plugins();
-        assert!(
-            mutable_plugins.contains(&PLUGIN_NAME.to_string()),
-            "Expected 'aws' in mutable store plugins, found: {mutable_plugins:?}"
-        );
-
-        let lock_plugins = registry.list_lock_store_plugins();
-        assert!(
-            lock_plugins.contains(&PLUGIN_NAME.to_string()),
-            "Expected 'dynamodb' in lock store plugins, found: {lock_plugins:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_config_deserialization_with_all_fields() {
-        let config_str = r#"
-            s3_bucket = "test-bucket"
-            s3_endpoint_url = "http://localhost:4566"
-            s3_region = "us-east-1"
-            dynamodb_fragments_table = "fragments"
-            dynamodb_metadata_table = "metadata"
-            dynamodb_endpoint_url = "http://localhost:4566"
-            dynamodb_region = "us-east-1"
-            s3_slow_operation_threshold_millis = 1000
-            dynamodb_slow_operation_threshold_millis = 500
-            timeout_millis = 3000
-            force_write = true
-        "#;
-
-        let config: toml::Value = toml::from_str(config_str).unwrap();
-        let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
-
-        assert_eq!(plugin_config.s3_bucket, "test-bucket");
-        assert_eq!(
-            plugin_config.s3_endpoint_url,
-            Some("http://localhost:4566".to_string())
-        );
-        assert_eq!(plugin_config.s3_region, Some("us-east-1".to_string()));
-        assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
-        assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
-        assert_eq!(
-            plugin_config.dynamodb_endpoint_url,
-            Some("http://localhost:4566".to_string())
-        );
-        assert_eq!(plugin_config.dynamodb_region, Some("us-east-1".to_string()));
-        assert_eq!(plugin_config.s3_slow_operation_threshold_millis, 1000);
-        assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
-        assert_eq!(plugin_config.timeout_millis, 3000);
-        assert!(plugin_config.force_write);
-    }
-
-    #[tokio::test]
-    async fn test_config_deserialization_with_defaults() {
-        let config_str = r#"
-            s3_bucket = "test-bucket"
-            dynamodb_fragments_table = "fragments"
-            dynamodb_metadata_table = "metadata"
-        "#;
-
-        let config: toml::Value = toml::from_str(config_str).unwrap();
-        let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
-
-        assert_eq!(plugin_config.s3_bucket, "test-bucket");
-        assert!(plugin_config.s3_endpoint_url.is_none());
-        assert!(plugin_config.s3_region.is_none());
-        assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
-        assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
-        assert!(plugin_config.dynamodb_endpoint_url.is_none());
-        assert!(plugin_config.dynamodb_region.is_none());
-        assert_eq!(plugin_config.s3_slow_operation_threshold_millis, u64::MAX);
-        assert_eq!(
-            plugin_config.dynamodb_slow_operation_threshold_millis,
-            u64::MAX
-        );
-        assert_eq!(plugin_config.timeout_millis, 5000);
-        assert!(!plugin_config.force_write);
-    }
-
-    #[tokio::test]
-    async fn test_lock_store_config_error_includes_field_name() {
-        let factory = AwsLockStorePluginFactory;
-
-        // Empty config - missing required 'dynamodb_table' field
-        let config = toml::Value::Table(toml::map::Map::new());
-        let result = factory.validate_config(&config);
-
-        let err = result.expect_err("should fail");
-        let config_err = err
-            .as_plugin_config_error()
-            .expect("should be PluginConfigError");
-        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
-        assert!(
-            config_err.message.contains("dynamodb_table"),
-            "Error message should mention the missing field 'dynamodb_table', got: {}",
-            config_err.message
-        );
-    }
-}

@@ -6,19 +6,18 @@ use std::sync::Arc;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
-use lore::auth;
 use lore::auth::LoreAuthClearArgs;
 use lore::auth::LoreAuthListArgs;
 use lore::auth::LoreAuthLocalUserInfoArgs;
 use lore::auth::LoreAuthLogoutArgs;
 use lore::auth::LoreAuthUserInfoArgs;
+use lore::call_delegation::run_command;
 use lore::interface::LoreArray;
 use lore::interface::LoreAuthLoginInteractiveArgs;
 use lore::interface::LoreAuthLoginWithTokenArgs;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreString;
-use lore::runtime;
 use parking_lot::Mutex;
 
 #[derive(Clone)]
@@ -34,6 +33,7 @@ struct CollectedIdentity {
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
+use crate::cli::secret_from_flag_or_env;
 use crate::println;
 use crate::styling::CommonStyles;
 use crate::util;
@@ -49,9 +49,24 @@ pub struct AuthLoginArgs {
     /// Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
     #[clap(long = "token-type")]
     token_type: Option<String>,
-    /// Token value for non-interactive login (requires --token-type)
+    /// Token value for non-interactive login (requires --token-type). Read from
+    /// `LORE_TOKEN` when omitted. Unsafe: a value given here is visible to other users
+    /// in the process table and is kept in the shell history
     #[clap(long = "token")]
     token: Option<String>,
+    /// Log in as this confidential client registered with the identity provider,
+    /// authenticating with its client secret
+    #[clap(
+        long = "client-id",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with_all = ["token_type", "token"]
+    )]
+    client_id: Option<String>,
+    /// Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted.
+    /// Unsafe: a value given here is visible to other users in the process table and
+    /// is kept in the shell history
+    #[clap(long = "client-secret", requires = "client_id")]
+    client_secret: Option<String>,
     /// Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`).
     /// Required when logging in with `--token` outside a repository without a remote-url.
     #[clap(long = "auth-url")]
@@ -89,9 +104,12 @@ pub struct AuthInfoCliArgs {
     /// User IDs to resolve (omit for current user)
     #[clap(value_name = "user-id")]
     user_ids: Vec<String>,
-    /// Include cached tokens in the output
-    #[clap(long = "with-token")]
-    with_token: bool,
+    /// Include cached identity tokens in the output
+    #[clap(long = "with-identity-token", alias = "with-token")]
+    with_identity_token: bool,
+    /// Include the current repository's access token in the output
+    #[clap(long = "with-access-token")]
+    with_access_token: bool,
 }
 
 #[derive(Subcommand)]
@@ -112,6 +130,9 @@ pub enum AuthCommands {
     Clear,
 }
 
+pub const TOKEN_VAR: &str = "LORE_TOKEN";
+pub const CLIENT_SECRET_VAR: &str = "LORE_CLIENT_SECRET";
+
 pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8 {
     let remote_url = LoreString::from(&args.remote_url);
 
@@ -124,6 +145,9 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
                     data.url.as_str(),
                     anstyle::Reset
                 );
+                if !data.user_code.as_str().is_empty() {
+                    println!("Code: {}", data.user_code.as_str());
+                }
             }
             LoreEvent::Complete(data) if data.status == 0 => {
                 println!(
@@ -140,23 +164,49 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
             .with_defaults(),
     ));
 
-    if let (Some(token_type), Some(token)) = (args.token_type.as_deref(), args.token.as_deref()) {
+    if let Some(client_id) = args.client_id.as_deref() {
+        let Some(client_secret) = secret_from_flag_or_env(
+            "--client-secret",
+            args.client_secret.as_deref(),
+            CLIENT_SECRET_VAR,
+        ) else {
+            crate::eprintln!(
+                "--client-id requires a client secret: set {CLIENT_SECRET_VAR}, or pass --client-secret"
+            );
+            return 1;
+        };
+        let args = LoreAuthLoginWithTokenArgs {
+            remote_url,
+            token: LoreString::default(),
+            token_type: LoreString::default(),
+            auth_url: args.auth_url.as_deref().into(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+        };
+        run_command(globals, args.into(), callback) as u8
+    } else if let Some(token_type) = args.token_type.as_deref()
+        && let Some(token) = secret_from_flag_or_env("--token", args.token.as_deref(), TOKEN_VAR)
+    {
         let args = LoreAuthLoginWithTokenArgs {
             remote_url,
             token: token.into(),
             token_type: LoreString::from(token_type),
             auth_url: args.auth_url.as_deref().into(),
+            client_id: LoreString::default(),
+            client_secret: LoreString::default(),
         };
-        runtime().block_on(auth::login_with_token(globals, args, callback)) as u8
+        run_command(globals, args.into(), callback) as u8
     } else if args.token_type.is_some() || args.token.is_some() {
-        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
+        crate::eprintln!(
+            "Both --token-type and --token (or {TOKEN_VAR}) are required for non-interactive login"
+        );
         1
     } else {
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
             no_browser: if args.no_browser { 1 } else { 0 },
         };
-        runtime().block_on(auth::login_interactive(globals, args, callback)) as u8
+        run_command(globals, args.into(), callback) as u8
     }
 }
 
@@ -205,10 +255,11 @@ fn resolve_identity_names(
             user_ids: LoreArray::from_vec(
                 ids.iter().map(|s| LoreString::from(s.as_str())).collect(),
             ),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
 
-        runtime().block_on(auth::local_user_info(globals.clone(), args, callback));
+        run_command(globals.clone(), args.into(), callback);
 
         if let Ok(resolved) = Arc::try_unwrap(names_store) {
             for (id, name) in resolved.into_inner() {
@@ -228,7 +279,7 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
         let args = LoreAuthListArgs {
             with_token: u8::from(with_token),
         };
-        return runtime().block_on(auth::list(globals, args, callback)) as u8;
+        return run_command(globals, args.into(), callback) as u8;
     }
 
     // Collect identity events first so we can resolve names before printing
@@ -258,7 +309,7 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
     let args = LoreAuthListArgs {
         with_token: u8::from(with_token),
     };
-    let status = runtime().block_on(auth::list(globals.clone(), args, callback)) as u8;
+    let status = run_command(globals.clone(), args.into(), callback) as u8;
 
     let identities = collected.lock().clone();
     let names = resolve_identity_names(&globals, &identities);
@@ -346,7 +397,7 @@ pub fn handle_logout_command(globals: LoreGlobalArgs, args: &AuthLogoutCliArgs) 
         user_id: LoreString::from(&args.user_id),
     };
 
-    runtime().block_on(auth::logout(globals, api_args, callback)) as u8
+    run_command(globals, api_args.into(), callback) as u8
 }
 
 pub fn handle_clear_command(globals: LoreGlobalArgs) -> u8 {
@@ -369,7 +420,7 @@ pub fn handle_clear_command(globals: LoreGlobalArgs) -> u8 {
 
     let args = LoreAuthClearArgs::default();
 
-    runtime().block_on(auth::clear(globals, args, callback)) as u8
+    run_command(globals, args.into(), callback) as u8
 }
 
 pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u8 {
@@ -428,6 +479,14 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                     user_token.token.as_str()
                 );
             }
+            LoreEvent::AuthIdentity(data) => {
+                println!(
+                    "{}Access Token:{} {}",
+                    CommonStyles::HEADERS,
+                    anstyle::Reset,
+                    data.token.as_str()
+                );
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -445,10 +504,11 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 .map(|s| LoreString::from(s.as_str()))
                 .collect(),
         ),
-        with_token: u8::from(args.with_token),
+        with_identity_token: u8::from(args.with_identity_token),
+        with_access_token: u8::from(args.with_access_token),
     };
 
-    runtime().block_on(auth::local_user_info(globals, api_args, callback)) as u8
+    run_command(globals, api_args.into(), callback) as u8
 }
 
 pub fn handle_auth_commands(cmd: &AuthCommands, globals: LoreGlobalArgs) -> u8 {
@@ -486,11 +546,7 @@ pub fn resolve_user_ids(
             _ => (),
         })));
 
-    let result = runtime().block_on(auth::resolve_user_info(
-        globals.clone(),
-        auth_args,
-        callback,
-    )) as u8;
+    let result = run_command(globals.clone(), auth_args.into(), callback) as u8;
 
     if result != 0 {
         return HashMap::default();

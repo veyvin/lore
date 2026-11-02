@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod external_dir;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
-use lore_base::fs::lock::FSLock;
+use lore_base::env::GLOBAL_PATH_VAR;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::task::spawn_blocking;
 
+use crate::shared_store::suggested_shared_store_path_for_remote_url;
 use crate::util;
+use crate::util::config::SaveableConfig;
 use crate::util::url::normalize_remote_url;
 
 #[error_set]
@@ -28,10 +28,8 @@ fn make_path_if_nonexistent(path: &PathBuf) -> Result<(), GlobalConfigError> {
     Ok(())
 }
 
-const LORE_GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
-
 pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("config")
     } else {
         project_directory()
@@ -44,7 +42,7 @@ pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
 }
 
 pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("data")
     } else {
         project_directory()
@@ -58,15 +56,33 @@ pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
 
 pub const CONFIG: &str = "config.toml";
 
-fn global_config_toml_path() -> Result<PathBuf, GlobalConfigError> {
-    get_global_config_dir().map(|path| path.join(CONFIG))
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DefaultSharedStoreConfigValue {
     pub path_to_store: String,
 }
 
+/// Settings for the Lore service process, under `[service]`.
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct ServiceConfig {
+    /// Executable started as the service, and the one a service is expected to
+    /// run from.
+    ///
+    /// Naming it here is what makes the choice deliberate rather than a race
+    /// between whichever client happens to start a service first. Clients of
+    /// different versions can share a machine, so the version that serves them
+    /// is a decision to be made once and written down, not an accident of
+    /// ordering. Unset resolves the executable from the running program.
+    pub executable: Option<String>,
+    /// Whether commands are carried out by the service rather than in the
+    /// process that was run.
+    ///
+    /// This is what turns the service on for a machine and leaves it on, which
+    /// is most of the point of having one. Unset is off.
+    pub use_automatically: Option<bool>,
+}
+
+#[lore_macro::test_pub]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct GlobalConfig {
@@ -74,6 +90,7 @@ pub struct GlobalConfig {
     default_shared_stores: BTreeMap<String, DefaultSharedStoreConfigValue>,
     #[serde(alias = "use_global_store_automatically")]
     pub use_shared_store_automatically: Option<bool>,
+    pub service: ServiceConfig,
 }
 
 impl GlobalConfig {
@@ -91,7 +108,7 @@ impl GlobalConfig {
             Ok(util::path::make_absolute(&config.path_to_store)
                 .map_err(|_err| GlobalConfigError::internal("bad path"))?)
         } else {
-            Self::suggested_path_for_remote_url(remote_url)
+            suggested_shared_store_path_for_remote_url(remote_url)
         }
     }
     pub fn set_default_path_for_remote_url(
@@ -115,123 +132,39 @@ impl GlobalConfig {
     pub fn use_shared_store_automatically(&self) -> bool {
         self.use_shared_store_automatically.unwrap_or(false)
     }
-    pub fn suggested_path_for_remote_url(remote_url: &str) -> Result<PathBuf, GlobalConfigError> {
-        let data_dir = get_global_data_dir()?;
-        let normalized = normalize_remote_url(remote_url);
-        let new_path = data_dir.join(Self::escape_url_as_dirname(normalized));
-        if new_path.exists() {
-            return Ok(new_path);
-        }
-        // Fall back to legacy path that included the protocol prefix (e.g. "urcs___host")
-        // so existing shared stores created before protocol stripping are still found.
-        let legacy_path = data_dir.join(Self::escape_url_as_dirname(
-            remote_url.trim_end_matches('/'),
-        ));
-        if legacy_path.exists() {
-            return Ok(legacy_path);
-        }
-        // Neither exists — use the new normalized form for new stores.
-        Ok(new_path)
+
+    /// The executable named under `[service]`, if one is named. A blank value
+    /// reads as unset, so that clearing the field is a way to stop pinning one,
+    /// and surrounding space is not part of a path.
+    pub fn service_executable(&self) -> Option<&str> {
+        self.service
+            .executable
+            .as_deref()
+            .map(str::trim)
+            .filter(|executable| !executable.is_empty())
     }
 
-    /// The per-remote subdirectory name within a shared store base path. A base
-    /// path holds one such directory per remote URL so a single base can back
-    /// the stores of multiple endpoints at once.
-    pub fn shared_store_subdir_for_remote(remote_url: &str) -> String {
-        Self::escape_url_as_dirname(normalize_remote_url(remote_url))
+    /// Whether commands are carried out by the service. Unset is off.
+    pub fn use_service_automatically(&self) -> bool {
+        self.service.use_automatically.unwrap_or(false)
+    }
+}
+
+impl SaveableConfig for GlobalConfig {
+    type ErrorType = GlobalConfigError;
+
+    fn file_location() -> Result<PathBuf, Self::ErrorType> {
+        get_global_config_dir().map(|path| path.join(CONFIG))
     }
 
-    fn escape_url_as_dirname(url: &str) -> String {
-        url.chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                c if c.is_ascii_control() => '_',
-                c => c,
-            })
-            .collect()
-    }
-
-    pub async fn load() -> Result<Self, GlobalConfigError> {
-        let path = global_config_toml_path()?;
-        load_config(&path)
-            .await
-            .forward::<GlobalConfigError>("Loading global config")
-    }
-
-    pub async fn load_locked() -> Result<(Self, FSLock), GlobalConfigError> {
-        let path = global_config_toml_path()?;
-        let (mut config, lock) = load_config_with_lock::<Self>(&path)
-            .await
-            .forward::<GlobalConfigError>("Loading global config")?;
-        // Normalize stored keys to strip legacy protocol prefixes (e.g. "urc://host" -> "host").
-        let old = std::mem::take(&mut config.default_shared_stores);
+    fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
+        let old = std::mem::take(&mut self.default_shared_stores);
         for (key, value) in old {
             let normalized = normalize_remote_url(&key).to_owned();
-            config
-                .default_shared_stores
+            self.default_shared_stores
                 .entry(normalized)
                 .or_insert(value);
         }
-        Ok((config, lock))
+        Ok(self)
     }
-
-    pub async fn save(&self, lock: FSLock) -> Result<(), GlobalConfigError> {
-        let path = global_config_toml_path()?;
-        let result = save_config(self, &path).await;
-        drop(lock);
-        result.forward::<GlobalConfigError>("saving global config")
-    }
-}
-
-#[error_set]
-pub enum LoadConfigError {}
-
-pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
-    path: impl AsRef<Path> + Copy,
-) -> Result<(ConfigType, FSLock), LoadConfigError> {
-    let path_buf = path.as_ref().to_owned();
-    let lock = spawn_blocking(|| {
-        FSLock::acquire_file_lock(path_buf)
-            .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))
-    })
-    .await
-    .internal("Failed to acquire file lock")??;
-    let config = load_config(path).await?;
-    Ok((config, lock))
-}
-
-pub async fn load_config<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
-    path: impl AsRef<Path>,
-) -> Result<ConfigType, LoadConfigError> {
-    if let Ok(mut config_file) = OpenOptions::new().create(false).read(true).open(path).await {
-        let mut config = String::default();
-        config_file.read_to_string(&mut config).await.ok();
-        toml::from_str(config.as_str())
-            .map_err(|_err| LoadConfigError::internal("failed to parse config"))
-    } else {
-        Ok(ConfigType::default())
-    }
-}
-
-#[error_set]
-pub enum SaveConfigError {}
-
-pub async fn save_config<ConfigType: Serialize>(
-    config: &ConfigType,
-    path: impl AsRef<Path>,
-) -> Result<(), SaveConfigError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .internal("opening config file for save")?;
-    let config_string = toml::to_string_pretty(&config).internal("formatting config as TOML")?;
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("writing config file")?;
-    config_file.flush().await.internal("flushing config file")?;
-    Ok(())
 }

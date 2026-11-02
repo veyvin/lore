@@ -8,18 +8,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_transport::quic::client::CongestionAlgorithm;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::tls;
 use rustls::server::NoClientAuth;
 use rustls::server::danger::ClientCertVerifier;
 use tracing::info;
 
 use crate::quic::StreamHandlerFactory;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 
 pub struct QuinnConfig {
     // In observability, what is the label that distinguishes this Quinn
     // server from others?
     pub(crate) server_metrics_name: String,
     pub(crate) address: SocketAddr,
+    /// A UDP socket the caller bound itself, served on instead of binding `address` here.
+    pub(crate) socket: Option<std::net::UdpSocket>,
     pub(crate) alpns: Vec<String>,
     pub(crate) cert_file: PathBuf,
     pub(crate) pkey_file: PathBuf,
@@ -33,12 +38,16 @@ pub struct QuinnConfig {
     pub(crate) metrics_frequency: Duration,
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
+    pub(crate) congestion_algorithm: CongestionAlgorithm,
+    /// `None` leaves the window at quinn's own default.
+    pub(crate) initial_cwnd: Option<InitialCwndBytes>,
 }
 
 impl fmt::Debug for QuinnConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuinnConfig")
             .field("address", &self.address)
+            .field("socket", &self.socket.is_some())
             .field("alpns", &self.alpns)
             .field("cert_file", &self.cert_file)
             .field("pkey_file", &self.pkey_file)
@@ -54,6 +63,8 @@ impl fmt::Debug for QuinnConfig {
             .field("metrics_frequency", &self.metrics_frequency)
             .field("transport_bits_per_second", &self.transport_bits_per_second)
             .field("transport_rtt", &self.transport_rtt)
+            .field("congestion_algorithm", &self.congestion_algorithm)
+            .field("initial_cwnd", &self.initial_cwnd)
             .finish()
     }
 }
@@ -64,6 +75,7 @@ pub struct QuinnConfigBuilder {
     // server from others?
     pub(crate) server_metrics_name: String,
     pub(crate) address: Option<SocketAddr>,
+    pub(crate) socket: Option<std::net::UdpSocket>,
     pub(crate) cert_file: PathBuf,
     pub(crate) pkey_file: PathBuf,
     pub(crate) cert_chain: Option<PathBuf>,
@@ -76,11 +88,12 @@ pub struct QuinnConfigBuilder {
     pub(crate) metrics_frequency: Option<Duration>,
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
+    pub(crate) congestion_algorithm: Option<CongestionAlgorithm>,
+    pub(crate) initial_cwnd: Option<InitialCwndBytes>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_KEEP_ALIVE_MILLS: u64 = 500;
-const DEFAULT_BIDI_STREAMS: u64 = 8;
 const DEFAULT_LISTENERS_COUNT: u8 = 10;
 const DEFAULT_METRICS_FREQUENCY: Duration = Duration::from_millis(60_000);
 const DEFAULT_TRANSPORT_BITS_PER_SECOND: usize = 1_073_741_824; // 1gbit/s
@@ -93,6 +106,23 @@ impl QuinnConfigBuilder {
 
     pub fn server_metrics_name(mut self, name: &str) -> Self {
         self.server_metrics_name = name.into();
+        self
+    }
+
+    /// Serve on a UDP socket the caller has already bound, rather than binding [`Self::address`]
+    /// here. The socket's own address is then authoritative, so `address` need not be set.
+    ///
+    /// A `lore://` peer serves QUIC on UDP and gRPC on TCP at one port number, and it cannot get
+    /// that pair by choosing a number and binding twice: whichever bind goes second can find the
+    /// number taken, and the failure arrives after the first server is already running. Binding
+    /// both sockets first — retrying until one number is free on both — and handing them over is
+    /// what makes the pair atomic as far as the servers are concerned.
+    ///
+    /// Note that a socket bound by the caller carries whatever options the caller set, not the
+    /// `SO_REUSEADDR`/`SO_REUSEPORT` this applies to sockets it binds itself. A caller that wants a
+    /// port exclusively should set neither, so that a clash fails instead of silently sharing.
+    pub fn socket(mut self, socket: std::net::UdpSocket) -> Self {
+        self.socket = Some(socket);
         self
     }
 
@@ -164,6 +194,19 @@ impl QuinnConfigBuilder {
         self
     }
 
+    /// The congestion controller governing what this server sends. Defaults to BBR.
+    pub fn congestion_algorithm(mut self, congestion_algorithm: CongestionAlgorithm) -> Self {
+        self.congestion_algorithm = Some(congestion_algorithm);
+        self
+    }
+
+    /// The congestion window each accepted connection starts with. Defaults to quinn's own
+    /// initial window.
+    pub fn initial_cwnd(mut self, initial_cwnd: InitialCwndBytes) -> Self {
+        self.initial_cwnd = Some(initial_cwnd);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<QuinnConfig> {
         let stream_handler_factory = self
             .stream_handler_factory
@@ -174,9 +217,17 @@ impl QuinnConfigBuilder {
             return Err(anyhow!("No alpns provided"));
         };
 
+        // A caller-bound socket is the truth about where this serves; asking it beats trusting an
+        // `address` set alongside it, which could disagree.
+        let address = match &self.socket {
+            Some(socket) => socket.local_addr()?,
+            None => self.address.ok_or(anyhow!("Address was not set"))?,
+        };
+
         Ok(QuinnConfig {
             server_metrics_name: self.server_metrics_name,
-            address: self.address.ok_or(anyhow!("Address was not set"))?,
+            address,
+            socket: self.socket,
             alpns,
             cert_file: self.cert_file,
             pkey_file: self.pkey_file,
@@ -191,13 +242,17 @@ impl QuinnConfigBuilder {
             keep_alive: self
                 .keep_alive
                 .unwrap_or(Duration::from_millis(DEFAULT_KEEP_ALIVE_MILLS)),
-            max_bidi_streams: self.max_bidi_streams.unwrap_or(DEFAULT_BIDI_STREAMS),
+            max_bidi_streams: self.max_bidi_streams.unwrap_or(STREAM_COUNT as u64),
             num_listeners: self.num_listeners.unwrap_or(DEFAULT_LISTENERS_COUNT),
             metrics_frequency: self.metrics_frequency.unwrap_or(DEFAULT_METRICS_FREQUENCY),
             transport_bits_per_second: self
                 .transport_bits_per_second
                 .unwrap_or(DEFAULT_TRANSPORT_BITS_PER_SECOND),
             transport_rtt: self.transport_rtt.unwrap_or(DEFAULT_TRANSPORT_RTT),
+            congestion_algorithm: self
+                .congestion_algorithm
+                .unwrap_or(CongestionAlgorithm::Bbr),
+            initial_cwnd: self.initial_cwnd,
         })
     }
 }

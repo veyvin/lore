@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::types::LockData;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -21,6 +20,7 @@ use crate::interface::LoreString;
 use crate::lock;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
@@ -96,7 +96,7 @@ impl EventError for StatusError {
 
 /// Data for an event that marks the start of a lock status report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusBeginEventData {
     /// Number of status entries that follow.
@@ -105,7 +105,7 @@ pub struct LoreLockFileStatusBeginEventData {
 
 /// Data for an event reporting the lock status of a single path.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusEventData {
     /// Path the status applies to.
@@ -139,7 +139,7 @@ pub async fn status(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<StatusError>("Invalid branch")?;
         resolved.id
     };
 
@@ -219,25 +219,15 @@ pub async fn status(
     }
     task_error?;
 
-    let mut locks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            locks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut locks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources_count);
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to status {num_batch_failed} batch(es) out of {num_batches}");
-    }
 
-    if num_batch_success != num_batches {
-        return Err(StatusError::internal("Failed to fetch lock status"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| StatusError::internal("Failed to fetch lock status")));
     }
 
     locks.sort_by(|lock_a, lock_b| {

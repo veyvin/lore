@@ -3,36 +3,45 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use tokio::fs;
 
 use super::LinkError;
-use crate::error::LoreResultExt;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
+use crate::lore::execution_context;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::NodeID;
-use crate::repository::RepositoryContext;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util;
-use crate::util::path::RelativePath;
 
 pub(crate) async fn reset_staged_add_link(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = staged_link_node.linked_node().repository;
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
     // If the link replaced a committed directory, `link::add` staged that
-    // directory node for delete. Capture it so we can restore it.
+    // directory node for delete. Capture it so we can restore it. Resolve
+    // against the link node's path WITHIN its owning repository (not the full
+    // top-level `link_path`), so this works for a nested link whose owning
+    // state is a linked repo rather than the top-level one.
+    let owner_relative_path = state_staged
+        .node_path(repository.clone(), link_node_id)
+        .await
+        .unwrap_or_else(|_| link_path.as_str().to_string());
     let committed_directory_node = state_current
-        .find_node_link(repository.clone(), link_path.as_str())
+        .find_node_link(repository.clone(), &owner_relative_path)
         .await
         .ok()
         .filter(|node_link| node_link.is_valid())
@@ -43,21 +52,25 @@ pub(crate) async fn reset_staged_add_link(
         .await
         .forward::<LinkError>("Failed to remove link registry entry")?;
 
-    util::fs::unlink_recursive(absolute_path.as_path())
-        .await
-        .emit_map_err(LinkError::internal(
-            "Failed to remove realized link directory",
-        ))?;
+    // These write the working tree directly rather than through a filesystem operation, so
+    // they check the flag themselves.
+    let dry_run = execution_context().globals().dry_run();
+    if !dry_run {
+        util::fs::unlink_recursive(absolute_path.as_path())
+            .await
+            .internal("removing the realized link directory")?;
+    }
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
         // disk and clear the staged-delete on its node so it returns to its
         // clean committed state.
-        fs::create_dir_all(absolute_path.as_path())
-            .await
-            .emit_map_err(LinkError::internal(
-                "Failed to recreate placeholder directory",
-            ))?;
+        if !dry_run {
+            lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await
+                .internal("recreating the placeholder directory")?;
+        }
 
         let block_index = NodeBlock::index(committed_node_id);
         let node_index = Node::index(committed_node_id);
@@ -78,6 +91,10 @@ pub(crate) async fn reset_staged_add_link(
         return Ok(());
     }
 
+    if dry_run {
+        return Ok(());
+    }
+
     let mut current_buf = link_path.into_buf();
     loop {
         current_buf.pop();
@@ -85,7 +102,11 @@ pub(crate) async fn reset_staged_add_link(
             break;
         }
         let parent_abs = repository.require_path()?.join(current_buf.as_str());
-        if fs::remove_dir(parent_abs.as_path()).await.is_err() {
+        if lore_io::IoDriver::global()
+            .remove_dir(parent_abs.as_path())
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -93,20 +114,46 @@ pub(crate) async fn reset_staged_add_link(
     Ok(())
 }
 
+/// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
+/// at the mount.
+///
+/// Realizes through `operation`, the caller's: a filesystem holds one operation at a time and
+/// unstaging opens one for the whole walk.
 pub(crate) async fn reset_staged_remove_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
 
     let current_link_ref = state_current
         .link_find(repository.clone(), link_id, link_node_id)
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
+
+    let linked_repository = repository.to_link_context(link_id).await;
+
+    // A mount added while this removal was staged can overlap the one being
+    // restored.
+    let source_path = link::pinned_source_path(linked_repository.clone(), &current_link_node)
+        .await
+        .forward::<LinkError>("Failed resolving link source path")?;
+    link::check_source_path_overlap(
+        &state_staged,
+        repository.clone(),
+        linked_repository.clone(),
+        source_path,
+        link_node_id,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
 
     state_staged
         .link_add(
@@ -120,13 +167,13 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
-    fs::create_dir_all(absolute_path.as_path())
+    operation
+        .create_dir_all(&link_path)
         .await
-        .emit_map_err(LinkError::internal("Failed to recreate link directory"))?;
+        .forward::<LinkError>("Failed to recreate the link directory")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
-    link::realize_link_pin_change(
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,
@@ -139,15 +186,23 @@ pub(crate) async fn reset_staged_remove_link(
     Ok(())
 }
 
+/// Puts a link whose pin move was staged back to the pin the current revision holds, on disk and
+/// in the registry.
+///
+/// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
     let staged_pin = staged_link_node.address.hash;
     let current_pin = current_link_node.address.hash;
@@ -157,8 +212,9 @@ pub(crate) async fn reset_staged_update_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
-    link::realize_link_pin_change(
+    let linked_repository = repository.to_link_context(link_id).await;
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,

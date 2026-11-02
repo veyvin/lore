@@ -3,55 +3,66 @@
 //! `lore_storage_get` — read content-addressed buffers from a store.
 //!
 //! Per-item event sequence in single-buffer mode (`streaming=0`):
-//! - `GET_HEADER { id, address, size_content }`
-//! - `GET_DATA { id, address, offset: 0, bytes }` — the full reassembled payload in one event.
-//!   `LoreBytes` points into a `Bytes` buffer that the dispatcher keeps alive for the callback
-//!   invocation via `send_with_bytes`.
-//! - `GET_ITEM_COMPLETE { id, address, error_code }`.
+//! - `GET_HEADER { id, address, size_content }` — the size of the whole content, not of what
+//!   this read returns. A ranged read gets the same header as a whole read of the same address.
+//! - `GET_DATA { id, address, offset, bytes }` — the requested range in one event, `offset`
+//!   being where it starts in the content. `LoreBytes` points into a `Bytes` buffer that the
+//!   dispatcher keeps alive for the callback invocation via `send_with_bytes`.
+//! - `GET_ITEM_COMPLETE { id, address, error }`.
 //!
 //! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
-//! fragment carrying a running `offset`; the cumulative byte count is verified against the
-//! header `size_content` and a mismatch surfaces as `Internal`.
+//! fragment carrying a running `offset`. A failure partway through the tree ends the data early
+//! and reports its own code on `GET_ITEM_COMPLETE`; as a backstop the cumulative byte count is
+//! verified against the requested range and a shortfall surfaces as `Internal`. A streaming read
+//! therefore never reports success for content it delivered only part of.
+//!
+//! With `data_out` supplied the range lands in the caller's buffer instead: `GET_HEADER` then
+//! `GET_ITEM_COMPLETE`, no `GET_DATA`, and `streaming` ignored. A range exceeding the buffer's
+//! stated capacity fails the item with `Oversized`.
+//!
+//! Ranges: `offset` and `length` select part of the content, `length = 0` meaning "to the
+//! end". A zeroed pair is the whole content, so an item that sets neither reads exactly what
+//! it always did. Both modes fetch only the fragments the range covers. A range reaching past
+//! the end is clamped; a range *starting* past the end is `INVALID_ARGUMENTS`, because an
+//! empty answer would otherwise be indistinguishable from empty content.
 //!
 //! Short-circuits: `address.hash == Hash::default()` emits an empty buffer with
-//! `error_code = NONE`. Missing content yields `error_code = ADDRESS_NOT_FOUND`.
+//! an empty error detail, whatever range was asked for. Missing content yields
+//! the address-not-found error.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::event::EventError;
+use lore_macro::ValidateText;
 use lore_revision::event::LoreBytes;
-use lore_revision::event::LoreErrorCode;
+use lore_revision::event::LoreBytesMut;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::lore::execution_context;
 use lore_revision::store::event::LoreStorageGetDataEventData;
 use lore_revision::store::event::LoreStorageGetHeaderEventData;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::read::read;
 use lore_storage::read::read_stream;
-use serde::Deserialize;
-use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
+use crate::storage::offset_past_end;
 use crate::storage::store::StoreInternal;
 
-/// One get item — the `(partition, address)` to read.
+/// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -59,50 +70,52 @@ pub struct LoreStorageGetItem {
     pub partition: Partition,
     /// Content address to read; `hash == Hash::default()` short-circuits to an empty buffer
     pub address: Address,
-    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
+    /// First content byte to read, counted from the start of the decompressed content.
+    /// Past the end of the content rejects with `INVALID_ARGUMENTS`
+    pub offset: u64,
+    /// Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
+    /// end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
+    pub length: u64,
+    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer. A read
+    /// that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
+    /// with a success code
     pub streaming: u8,
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
+    /// Writable buffer receiving the requested range, `len` stating its capacity. Zero-initialized
+    /// selects `GET_DATA` delivery.
+    ///
+    /// The capacity is the limit: a range exceeding it fails the item with
+    /// `Oversized` rather than truncating. `GET_HEADER` reports the whole
+    /// content's size, which with `offset` and `length` gives the bytes written; no `GET_DATA`
+    /// follows, and `streaming` is ignored. The buffer holds unspecified bytes when the item fails.
+    #[bitcode(skip)]
+    pub data_out: LoreBytesMut,
 }
 
 impl core::fmt::Debug for LoreStorageGetItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoreStorageGetItem")
             .field("id", &self.id)
+            .field("offset", &self.offset)
+            .field("length", &self.length)
             .field("streaming", &self.streaming)
             .field("local_cache", &self.local_cache)
+            .field("data_out", &self.data_out)
             .finish()
     }
 }
 
 /// Arguments for `lore_storage_get`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(get_local)]
 pub struct LoreStorageGetArgs {
     /// Open storage handle
     pub handle: LoreStore,
     /// Addresses to read; each runs independently and emits its own event sequence
     pub items: LoreArray<LoreStorageGetItem>,
-}
-
-#[error_set]
-enum GetError {
-    InvalidArguments,
-}
-
-impl EventError for GetError {
-    fn translated(&self) -> LoreError {
-        match self {
-            GetError::InvalidArguments(_) => LoreError::InvalidArguments,
-            GetError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Read one or more content-addressed buffers.
@@ -128,47 +141,52 @@ async fn get_local(
         args,
         get,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), GetError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
-
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            let mut lent = crate::storage::lent::LentBuffers::default();
+
+            let result = crate::storage::fan_out_items!(items, "get", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    get_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "get")
+                let lender = lent.lender(&item.data_out);
+                async move { get_item(store, &item, effective, session, lender).await }
+            });
+            lent.returned().await;
+            result
         },
     )
     .await
 }
 
 /// Read one item and emit its `HEADER` / `DATA…` / `ITEM_COMPLETE`
-/// sequence. Returns the per-item `LoreErrorCode` for the call-level aggregator.
+/// sequence, into the item's `data_out` through `lender` when it supplies one. Returns the item's
+/// own error so the call-level reduction can pick the dominant failure.
 async fn get_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetItem,
+    item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
+    lender: Option<crate::storage::lent::ItemLender>,
+) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
-        emit_item_complete(&item, LoreErrorCode::InvalidArguments);
-        return LoreErrorCode::InvalidArguments;
+        return emit_item_complete(item, Err(invalid_item("item names the default partition")));
     }
 
     if item.address.hash == Hash::default() {
-        emit_header(&item, 0);
-        emit_data(&item, Bytes::new(), 0);
-        emit_item_complete(&item, LoreErrorCode::None);
-        return LoreErrorCode::None;
+        emit_header(item, 0);
+        // An item delivering into its own buffer receives no `GET_DATA`, empty or otherwise.
+        if !item.data_out.is_supplied() {
+            emit_data(item, Bytes::new(), 0);
+        }
+        return emit_item_complete(item, Ok(()));
+    }
+
+    if let Some(lender) = lender {
+        return get_item_into(store, item, effective, remote_session, lender).await;
     }
 
     if item.streaming != 0 {
@@ -184,39 +202,88 @@ async fn get_item(
         store.immutable.clone(),
         item.partition,
         item.address,
-        None,
+        crate::storage::item_content_range(item.offset, item.length),
         read_options,
         remote_session,
     )
     .await
     {
-        Ok(bytes) => {
-            let size = bytes.len() as u64;
-            emit_header(&item, size);
-            emit_data(&item, bytes, 0);
-            emit_item_complete(&item, LoreErrorCode::None);
-            LoreErrorCode::None
+        Ok((fragment, bytes)) => {
+            // Empty bytes here would be indistinguishable from content that is genuinely
+            // empty, so a start past the end is reported rather than clamped.
+            if item.offset > fragment.size_content {
+                return emit_item_complete(
+                    item,
+                    Err(offset_past_end(item.offset, fragment.size_content)),
+                );
+            }
+            emit_header(item, fragment.size_content);
+            emit_data(item, bytes, item.offset);
+            emit_item_complete(item, Ok(()))
         }
-        Err(err) => {
-            let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, code);
-            code
+        Err(err) => emit_item_complete(item, Err(err)),
+    }
+}
+
+/// Counterpart of [`get_item`] delivering the requested range into `data_out`. Emits `GET_HEADER`
+/// with the whole content's size, as the other modes do, then `GET_ITEM_COMPLETE`; a range
+/// exceeding the stated capacity fails the item rather than truncating.
+async fn get_item_into(
+    store: Arc<StoreInternal>,
+    item: &LoreStorageGetItem,
+    effective: crate::storage::store::EffectiveFlags,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: crate::storage::lent::ItemLender,
+) -> Result<(), StorageError> {
+    let mut dst = lender.lend(&item.data_out);
+    let mut read_options = effective.read_options(remote_session.is_some());
+    if item.local_cache != 0 {
+        read_options = read_options.with_cache();
+    }
+
+    match lore_storage::read_into_buffer(
+        store.immutable.clone(),
+        item.partition,
+        item.address,
+        crate::storage::item_content_range(item.offset, item.length),
+        &mut dst,
+        read_options,
+        remote_session,
+    )
+    .await
+    {
+        Ok((fragment, _written)) => {
+            // As in the buffered path: an empty delivery is indistinguishable from content that is
+            // genuinely empty, so a start past the end is reported rather than clamped.
+            if item.offset > fragment.size_content {
+                return emit_item_complete(
+                    item,
+                    Err(offset_past_end(item.offset, fragment.size_content)),
+                );
+            }
+            emit_header(item, fragment.size_content);
+            emit_item_complete(item, Ok(()))
         }
+        Err(err) => emit_item_complete(item, Err(err)),
     }
 }
 
 /// Streaming-mode read: emit one `GET_DATA` per leaf fragment with a running offset.
-/// `read_stream` returns `size_content` once the root fragment has loaded but before the leaf
-/// chunks finish flowing through the channel — we await that future first to learn the size,
-/// emit `GET_HEADER` ahead of any data, then drain the channel. The cumulative byte count is
-/// verified against the header — a mismatch surfaces as `Internal`.
+/// `read_stream` returns the whole content's fragment and the content range that will arrive
+/// once the root fragment has loaded but before the leaf chunks finish flowing through the
+/// channel — we await that future first, emit `GET_HEADER` ahead of any data, then drain the
+/// channel. The cumulative byte count is verified against the range — a mismatch surfaces as
+/// `Internal`.
+///
+/// A ranged stream fetches only the leaves the range touches, so the memory and the work are
+/// both proportional to the range rather than to the content.
 async fn get_item_streaming(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetItem,
+    item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+) -> Result<(), StorageError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
@@ -225,35 +292,51 @@ async fn get_item_streaming(
         store.immutable.clone(),
         item.partition,
         item.address,
+        crate::storage::item_content_range(item.offset, item.length),
         read_options,
         tx,
         remote_session,
     );
 
-    let size_content = match stream_future.await {
-        Ok(size) => size,
-        Err(err) => {
-            let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, code);
-            return code;
-        }
+    let (fragment, streamed) = match stream_future.await {
+        Ok(started) => started,
+        Err(err) => return emit_item_complete(item, Err(err)),
     };
 
-    emit_header(&item, size_content);
+    // As in the buffered path. Nothing was spawned for an empty range, so dropping the
+    // receiver here leaves no pipeline writing into a closed channel.
+    if item.offset > fragment.size_content {
+        return emit_item_complete(
+            item,
+            Err(offset_past_end(item.offset, fragment.size_content)),
+        );
+    }
 
-    let mut offset: u64 = 0;
+    emit_header(item, fragment.size_content);
+
+    let mut offset = streamed.start;
+    let mut result: Result<(), StorageError> = Ok(());
     while let Some(chunk) = rx.recv().await {
-        let len = chunk.len() as u64;
-        emit_data(&item, chunk, offset);
-        offset += len;
+        match chunk {
+            Ok(chunk) => {
+                let len = chunk.len() as u64;
+                emit_data(item, chunk, offset);
+                offset += len;
+            }
+            Err(err) => {
+                result = Err(err);
+                break;
+            }
+        }
     }
 
-    if offset != size_content {
-        emit_item_complete(&item, LoreErrorCode::Internal);
-        return LoreErrorCode::Internal;
+    if result.is_ok() && offset != streamed.end {
+        result = Err(StorageError::internal(format!(
+            "stream ended at {offset} with the range {}..{} requested",
+            streamed.start, streamed.end
+        )));
     }
-    emit_item_complete(&item, LoreErrorCode::None);
-    LoreErrorCode::None
+    emit_item_complete(item, result)
 }
 
 fn emit_header(item: &LoreStorageGetItem, size_content: u64) {
@@ -282,8 +365,12 @@ fn emit_data(item: &LoreStorageGetItem, bytes: Bytes, offset: u64) {
     execution_context().dispatcher.send_with_bytes(event, bytes);
 }
 
-fn emit_item_complete(item: &LoreStorageGetItem, error_code: LoreErrorCode) {
-    let address = if error_code == LoreErrorCode::None {
+/// Emit the item's terminal event and return the outcome that was sent.
+fn emit_item_complete(
+    item: &LoreStorageGetItem,
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let address = if result.is_ok() {
         item.address
     } else {
         Address::default()
@@ -291,7 +378,8 @@ fn emit_item_complete(item: &LoreStorageGetItem, error_code: LoreErrorCode) {
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
+    result
 }

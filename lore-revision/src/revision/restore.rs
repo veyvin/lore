@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
 use crate::branch::BranchLatestStatus;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -28,6 +26,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::metadata::MetadataInherit;
 use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
@@ -36,11 +35,12 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
+use crate::util::request_tracker::StoreRequestTracker;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileBeginEventData {
     /// Number of files to process.
@@ -49,7 +49,7 @@ pub struct LoreRevisionRestoreFileBeginEventData {
 
 /// Event data reported for a single file during a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEventData {
     /// Path of the file.
@@ -71,7 +71,7 @@ pub struct LoreRevisionRestoreFileEventData {
 
 /// Event data reported at the end of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEndEventData {
     /// Number of files processed.
@@ -80,7 +80,7 @@ pub struct LoreRevisionRestoreFileEndEventData {
 
 /// Event data reported at the start of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentBeginEventData {
     /// Number of fragments to transfer.
@@ -89,7 +89,7 @@ pub struct LoreRevisionRestoreFragmentBeginEventData {
 
 /// Event data reported on progress of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentProgressEventData {
     /// Number of fragments completed.
@@ -100,7 +100,7 @@ pub struct LoreRevisionRestoreFragmentProgressEventData {
 
 /// Event data reported at the end of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentEndEventData {
     /// Number of fragments transferred.
@@ -109,7 +109,7 @@ pub struct LoreRevisionRestoreFragmentEndEventData {
 
 /// Event data reported with the resulting revision of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreRevisionEventData {
     /// Resulting revision hash signature.
@@ -120,7 +120,7 @@ pub struct LoreRevisionRestoreRevisionEventData {
 
 /// Event data reported at the start of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncBeginEventData {
     /// Number of changes to apply.
@@ -129,7 +129,7 @@ pub struct LoreRevisionRestoreSyncBeginEventData {
 
 /// Event data reported at the end of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncEndEventData {
     /// Number of changes applied.
@@ -213,7 +213,7 @@ pub struct RestoreOptions {
     pub message: Option<String>,
 }
 
-pub async fn restore(
+pub(crate) async fn restore(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: RestoreOptions,
@@ -311,30 +311,32 @@ pub async fn restore(
             if change.action == change::FileAction::Delete {
                 let block = change
                     .from
+                    .mapping
                     .state
                     .block(
-                        change.from.repository.clone(),
-                        NodeBlock::index(change.from.node),
+                        change.from.mapping.repository.clone(),
+                        NodeBlock::index(change.from.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.from.node))
+                block.node(Node::index(change.from.mapping.node))
             } else {
                 let block = change
                     .to
+                    .mapping
                     .state
                     .block(
-                        change.to.repository.clone(),
-                        NodeBlock::index(change.to.node),
+                        change.to.mapping.repository.clone(),
+                        NodeBlock::index(change.to.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.to.node))
+                block.node(Node::index(change.to.mapping.node))
             }
         };
 
         LoreEvent::RevisionRestoreFile(LoreRevisionRestoreFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             action: change.action.into(),
             size: node.size,
             is_file: node.is_file() as u8,
@@ -383,12 +385,21 @@ pub async fn restore(
     })
     .send();
 
-    // Apply the metadata on the state
+    let restored_metadata_hash = current_state.metadata_hash();
+    let restored_metadata = if restored_metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), restored_metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing restored revision metadata")?
+    };
+
     branch::merge::merge_metadata(
         repository.clone(),
         Arc::new(changes.clone()),
         current_state.clone(),
         state_staged.clone(),
+        &MetadataInherit::All,
     )
     .await
     .forward::<RestoreError>("merging metadata on state")?;
@@ -396,15 +407,16 @@ pub async fn restore(
 
     // Get or create metadata chunk
     let metadata_hash = state_staged.metadata_hash();
-    if metadata_hash.is_zero() {
-        return Err(RestoreError::internal("Failed to deserialize metadata"));
-    }
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<RestoreError>("deserializing original metadata")?;
+    let original_metadata = if metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing original metadata")?
+    };
 
     let message = options.message.unwrap_or(
-        original_metadata
+        restored_metadata
             .get_string(metadata::MESSAGE)
             .forward::<RestoreError>("reading commit message from metadata")?
             .to_owned(),
@@ -426,25 +438,19 @@ pub async fn restore(
     .await
     .forward::<RestoreError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::prune_dirty_for_commit(state_staged.clone(), repository.clone())
+        .await
+        .forward::<RestoreError>("pruning dirty nodes before rehash")?;
+
+    let modified_times = commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
         metadata.clone(),
-        None,
-        std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
-        rehash_tracker.clone(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<RestoreError>("rehashing state")?;
-    drain_result.forward::<RestoreError>("draining rehash tracker")?;
+    .await
+    .forward::<RestoreError>("rehashing state")?;
     lore_debug!("Rehashed state");
 
     let new_state = state_staged;
@@ -459,9 +465,13 @@ pub async fn restore(
             .forward::<RestoreError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), new_state.clone())
-        .await
-        .forward::<RestoreError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        new_state.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<RestoreError>("weaving history")?;
 
     let signature = new_state
         .serialize(repository.clone(), token)
@@ -479,6 +489,7 @@ pub async fn restore(
         head_state.clone(),
         new_state.clone(),
         true, /* Ignore already durably stored fragments */
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<RestoreError>("collecting new fragments")?;
@@ -487,7 +498,7 @@ pub async fn restore(
     let mut revision_number = new_state.revision_number();
     let mut remote_pushed = false;
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::RevisionRestoreFragmentBegin(LoreRevisionRestoreFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -508,6 +519,7 @@ pub async fn restore(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<RestoreError>("querying missing fragments from server")?;
@@ -523,8 +535,8 @@ pub async fn restore(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::RevisionRestoreFragmentProgress(LoreRevisionRestoreFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -535,7 +547,7 @@ pub async fn restore(
         result.forward::<RestoreError>("pushing fragments to remote")?;
 
         LoreEvent::RevisionRestoreFragmentEnd(LoreRevisionRestoreFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 
@@ -566,6 +578,8 @@ pub async fn restore(
         .await
         .forward::<RestoreError>("storing current revision anchor")?;
 
+    modified_times.store(repository.clone()).await;
+
     let _ = crate::instance::delete_staged_anchor(&repository).await;
 
     // When the new revision was pushed to remote, it is on the remote history line.
@@ -577,9 +591,18 @@ pub async fn restore(
         BranchLatestStatus::Divergent
     };
 
-    branch::store_latest(repository.clone(), current_branch, revision, status)
+    let stored_latest = branch::load_latest(repository.clone(), current_branch)
         .await
-        .forward::<RestoreError>("storing branch head")?;
+        .unwrap_or_default();
+    branch::store_latest(
+        repository.clone(),
+        current_branch,
+        stored_latest,
+        revision,
+        status,
+    )
+    .await
+    .forward::<RestoreError>("storing branch head")?;
 
     if remote_pushed {
         branch::store_last_sync(repository.clone(), current_branch, revision).await;
@@ -592,4 +615,13 @@ pub async fn restore(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`restore`] for cross-crate use.
+pub fn restore_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: RestoreOptions,
+) -> crate::BoxFuture<'_, Result<(), RestoreError>> {
+    Box::pin(restore(repository, token, options))
 }
